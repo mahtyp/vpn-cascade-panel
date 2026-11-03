@@ -1,0 +1,4 @@
+paramiko>=3.4
+keyring>=24
+pystray>=0.19
+pillow>=10

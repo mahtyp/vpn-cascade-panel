@@ -1,0 +1,17 @@
+# Всё, что относится к вашим серверам, остаётся только на компьютере
+servers.json
+servers.tmp
+known_hosts
+history.db
+history.db-*
+checks.log
+dash-run.log
+backups/
+__pycache__/
+*.pyc
+jobs/
+secrets/
+addrcheck.json
+addrcheck.tmp
+dash.pid
+*.png

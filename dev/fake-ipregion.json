@@ -1,0 +1,213 @@
+{
+ "version": 1,
+ "ipv4": "203.0.113.7",
+ "ipv6": null,
+ "results": {
+  "primary": [
+   {
+    "service": "maxmind.com",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "rdap.db.ripe.net",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ipinfo.io",
+    "ipv4": "DE",
+    "ipv6": null
+   },
+   {
+    "service": "cloudflare.com",
+    "ipv4": "DE",
+    "ipv6": null
+   },
+   {
+    "service": "ipregistry.co",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ipapi.co",
+    "ipv4": "Rate-limit",
+    "ipv6": null
+   },
+   {
+    "service": "ifconfig.co",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ip2location.io",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "iplocation.com",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "country.is",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "geoapify.com",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "geojs.io",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ipapi.is",
+    "ipv4": null,
+    "ipv6": null
+   },
+   {
+    "service": "ipbase.com",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ipquery.io",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ipwho.is",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ip-api.com",
+    "ipv4": "NL",
+    "ipv6": null
+   }
+  ],
+  "custom": [
+   {
+    "service": "Google",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "YouTube",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Twitch",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "ChatGPT",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Netflix",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Spotify",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Reddit",
+    "ipv4": "Denied",
+    "ipv6": null
+   },
+   {
+    "service": "Disney+",
+    "ipv4": "N/A",
+    "ipv6": null
+   },
+   {
+    "service": "Gemini Supported",
+    "ipv4": "Yes",
+    "ipv6": null
+   },
+   {
+    "service": "Reddit (Guest Access)",
+    "ipv4": "No",
+    "ipv6": null
+   },
+   {
+    "service": "YouTube Premium",
+    "ipv4": "Yes",
+    "ipv6": null
+   },
+   {
+    "service": "Spotify Signup",
+    "ipv4": "Yes",
+    "ipv6": null
+   },
+   {
+    "service": "Disney+ Access",
+    "ipv4": "No",
+    "ipv6": null
+   },
+   {
+    "service": "Apple",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Steam",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Tiktok",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Ookla Speedtest",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "JetBrains",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "PlayStation",
+    "ipv4": "NL",
+    "ipv6": null
+   },
+   {
+    "service": "Microsoft",
+    "ipv4": "NL",
+    "ipv6": null
+   }
+  ],
+  "cdn": [
+   {
+    "service": "Cloudflare CDN",
+    "ipv4": "NL (AMS)",
+    "ipv6": null
+   },
+   {
+    "service": "YouTube CDN",
+    "ipv4": "DE (FRA)",
+    "ipv6": null
+   },
+   {
+    "service": "Netflix CDN",
+    "ipv4": "NL",
+    "ipv6": null
+   }
+  ]
+ }
+}

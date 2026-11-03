@@ -1,0 +1,2 @@
+{"ai": {"ChatGPT": {"ok": true, "code": 200}, "Claude": {"ok": true, "code": 401}, "Copilot": {"ok": true, "code": 200}, "Grok": {"ok": null, "code": 403}},
+ "net": {"ipapi": {"code": 200, "hosting": true}, "proxycheck": {"code": 200, "proxy": "yes", "type": "VPN", "provider": "Example Hosting LLC"}, "ipinfo": {"code": 200, "type": "hosting", "flags": []}}}

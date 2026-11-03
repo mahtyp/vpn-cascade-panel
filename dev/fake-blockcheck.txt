@@ -1,0 +1,61 @@
+* curl_test_https_tls13 ipv4 www.youtube.com
+- checking without DPI bypass
+  curl: (28) Operation timed out after 3001 milliseconds with 0 bytes received
+  UNAVAILABLE code=28
+- curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5
+[attempt 1] AVAILABLE
+[attempt 2] AVAILABLE
+[attempt 3] AVAILABLE
+!!!!! AVAILABLE !!!!!
+- curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 --payload=tls_client_hello --lua-desync=multisplit:pos=2
+[attempt 1] AVAILABLE
+UNAVAILABLE code=28
+- curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 --payload=tls_client_hello --lua-desync=multisplit:pos=1,midsld
+[attempt 1] AVAILABLE
+[attempt 2] AVAILABLE
+[attempt 3] AVAILABLE
+!!!!! AVAILABLE !!!!!
+- curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld
+[attempt 1] AVAILABLE
+[attempt 2] AVAILABLE
+[attempt 3] AVAILABLE
+!!!!! AVAILABLE !!!!!
+
+* curl_test_https_tls13 ipv4 redirector.googlevideo.com
+- checking without DPI bypass
+  UNAVAILABLE code=28
+- curl_test_https_tls13 ipv4 redirector.googlevideo.com : nfqws2 --payload=tls_client_hello --lua-desync=multisplit:pos=1,midsld
+[attempt 1] AVAILABLE
+[attempt 2] AVAILABLE
+[attempt 3] AVAILABLE
+!!!!! AVAILABLE !!!!!
+- curl_test_https_tls13 ipv4 redirector.googlevideo.com : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld
+[attempt 1] AVAILABLE
+[attempt 2] AVAILABLE
+[attempt 3] AVAILABLE
+!!!!! AVAILABLE !!!!!
+
+* curl_test_https_tls13 ipv4 i.ytimg.com
+- checking without DPI bypass
+[attempt 1] AVAILABLE
+[attempt 2] AVAILABLE
+[attempt 3] AVAILABLE
+!!!!! AVAILABLE !!!!!
+
+* SUMMARY
+curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5
+curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 --payload=tls_client_hello --lua-desync=multisplit:pos=1,midsld
+curl_test_https_tls13 ipv4 www.youtube.com : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld
+curl_test_https_tls13 ipv4 redirector.googlevideo.com : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld
+curl_test_https_tls13 ipv4 redirector.googlevideo.com : nfqws2 --payload=tls_client_hello --lua-desync=multisplit:pos=1,midsld
+curl_test_https_tls13 ipv4 i.ytimg.com : working without bypass
+
+* COMMON
+curl_test_https_tls13 ipv4 : nfqws2 --payload=tls_client_hello --lua-desync=multisplit:pos=1,midsld
+
+* COVERAGE
+2 curl_test_https_tls13 ipv4 : nfqws2 --payload=tls_client_hello --lua-desync=multisplit:pos=1,midsld
+2 curl_test_https_tls13 ipv4 : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld
+1 curl_test_https_tls13 ipv4 : nfqws2 --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5
+
+Please note this SUMMARY does not guarantee a magic pill for you to copy/paste and be happy.

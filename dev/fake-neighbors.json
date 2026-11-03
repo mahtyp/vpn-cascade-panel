@@ -1,0 +1,318 @@
+{
+"ip": "203.0.113.7",
+"net": "203.0.113.0/24",
+"total": 254,
+"secs": 18.4,
+"hosts": [
+{
+"ip": "203.0.113.11",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.google.com"
+],
+"san": [
+"www.google.com"
+],
+"issuer": [
+"Google Trust Services"
+],
+"own": []
+},
+{
+"ip": "203.0.113.14",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.google.com"
+],
+"san": [
+"www.google.com"
+],
+"issuer": [
+"Google Trust Services"
+],
+"own": []
+},
+{
+"ip": "203.0.113.23",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"dl.google.com"
+],
+"san": [
+"dl.google.com"
+],
+"issuer": [
+"Google Trust Services"
+],
+"own": []
+},
+{
+"ip": "203.0.113.31",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.youtube.com"
+],
+"san": [
+"www.youtube.com"
+],
+"issuer": [
+"Google Trust Services"
+],
+"own": []
+},
+{
+"ip": "203.0.113.40",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.google.com"
+],
+"san": [
+"www.google.com"
+],
+"issuer": [
+"Google Trust Services"
+],
+"own": []
+},
+{
+"ip": "203.0.113.57",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.gstatic.com"
+],
+"san": [
+"www.gstatic.com"
+],
+"issuer": [
+"Google Trust Services"
+],
+"own": []
+},
+{
+"ip": "203.0.113.62",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.microsoft.com"
+],
+"san": [
+"www.microsoft.com"
+],
+"issuer": [
+"Microsoft Azure RSA TLS Issuing CA 03"
+],
+"own": []
+},
+{
+"ip": "203.0.113.77",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"update.microsoft.com"
+],
+"san": [
+"update.microsoft.com"
+],
+"issuer": [
+"Microsoft Azure RSA TLS Issuing CA 03"
+],
+"own": []
+},
+{
+"ip": "203.0.113.81",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.bing.com"
+],
+"san": [
+"www.bing.com"
+],
+"issuer": [
+"Microsoft Azure RSA TLS Issuing CA 03"
+],
+"own": []
+},
+{
+"ip": "203.0.113.90",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"max.ru"
+],
+"san": [
+"max.ru"
+],
+"issuer": [
+"GlobalSign"
+],
+"own": []
+},
+{
+"ip": "203.0.113.91",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"web.max.ru"
+],
+"san": [
+"web.max.ru"
+],
+"issuer": [
+"GlobalSign"
+],
+"own": []
+},
+{
+"ip": "203.0.113.104",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"vk.com"
+],
+"san": [
+"vk.com"
+],
+"issuer": [
+"GlobalSign"
+],
+"own": []
+},
+{
+"ip": "203.0.113.112",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"www.samsung.com"
+],
+"san": [
+"www.samsung.com"
+],
+"issuer": [
+"DigiCert"
+],
+"own": []
+},
+{
+"ip": "203.0.113.120",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"shop.example-neighbor.nl"
+],
+"san": [
+"shop.example-neighbor.nl",
+"www.shop.example-neighbor.nl"
+],
+"issuer": [
+"Let's Encrypt"
+],
+"own": [
+"shop.example-neighbor.nl"
+],
+"fit": {
+"name": "shop.example-neighbor.nl",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"ok": true
+}
+},
+{
+"ip": "203.0.113.133",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"blog.example-host.nl"
+],
+"san": [
+"blog.example-host.nl"
+],
+"issuer": [
+"Let's Encrypt"
+],
+"own": [
+"blog.example-host.nl"
+],
+"fit": {
+"name": "blog.example-host.nl",
+"tls": "TLSv1.3",
+"alpn": "http/1.1",
+"ok": false
+}
+},
+{
+"ip": "203.0.113.141",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"cn": [
+"cloud.example-files.nl"
+],
+"san": [
+"cloud.example-files.nl"
+],
+"issuer": [
+"Let's Encrypt"
+],
+"own": [
+"cloud.example-files.nl"
+],
+"fit": {
+"name": "cloud.example-files.nl",
+"tls": "TLSv1.3",
+"alpn": "h2",
+"ok": true
+}
+},
+{
+"ip": "203.0.113.150",
+"tls": "TLSv1.2",
+"alpn": null,
+"cn": [
+"localhost"
+],
+"san": [
+"localhost"
+],
+"issuer": [
+"localhost"
+],
+"own": []
+},
+{
+"ip": "203.0.113.166",
+"tls": "TLSv1.3",
+"alpn": null,
+"cn": [],
+"san": [],
+"issuer": [
+"3X-UI"
+],
+"own": []
+},
+{
+"ip": "203.0.113.170",
+"err": "SSLError"
+},
+{
+"ip": "203.0.113.181",
+"tls": "TLSv1.2",
+"alpn": "http/1.1",
+"cn": [
+"mail.example-corp.nl"
+],
+"san": [
+"mail.example-corp.nl"
+],
+"issuer": [
+"Let's Encrypt"
+],
+"own": []
+}
+]
+}

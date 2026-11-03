@@ -1,0 +1,236 @@
+{
+"*": {
+"resolvers": [
+{
+"name": "Cloudflare",
+"ip": "1.1.1.1",
+"udp": "ok",
+"doh": "ok",
+"dot": "ok"
+},
+{
+"name": "Google",
+"ip": "8.8.8.8",
+"udp": "ok",
+"doh": "ok",
+"dot": "ok"
+},
+{
+"name": "Quad9",
+"ip": "9.9.9.9",
+"udp": "ok",
+"doh": "ok",
+"dot": "ok"
+},
+{
+"name": "AdGuard",
+"ip": "94.140.14.14",
+"udp": "ok",
+"doh": "ok",
+"dot": "ok"
+},
+{
+"name": "Яндекс",
+"ip": "77.88.8.8",
+"udp": "ok",
+"doh": "ok",
+"dot": "ok"
+}
+],
+"system": {
+"ns": [
+"127.0.0.53"
+],
+"upstream": [
+"203.0.113.53"
+]
+},
+"ref": "Cloudflare",
+"ref_ips": {
+"rutracker.org": [
+"192.0.2.10",
+"192.0.2.11"
+],
+"flibusta.is": [
+"192.0.2.12"
+],
+"linkedin.com": [
+"192.0.2.13"
+]
+},
+"answers": {
+"system": {
+"rutracker.org": {
+"rcode": 0,
+"ips": [
+"192.0.2.10"
+]
+},
+"flibusta.is": {
+"rcode": 0,
+"ips": [
+"192.0.2.12"
+]
+},
+"linkedin.com": {
+"rcode": 0,
+"ips": [
+"192.0.2.13"
+]
+}
+},
+"udp:1.1.1.1": {
+"rutracker.org": {
+"rcode": 0,
+"ips": [
+"192.0.2.10"
+]
+},
+"flibusta.is": {
+"rcode": 0,
+"ips": [
+"192.0.2.12"
+]
+},
+"linkedin.com": {
+"rcode": 0,
+"ips": [
+"192.0.2.13"
+]
+}
+},
+"udp:8.8.8.8": {
+"rutracker.org": {
+"rcode": 0,
+"ips": [
+"192.0.2.10"
+]
+},
+"flibusta.is": {
+"rcode": 0,
+"ips": [
+"192.0.2.12"
+]
+},
+"linkedin.com": {
+"rcode": 0,
+"ips": [
+"192.0.2.13"
+]
+}
+}
+},
+"secs": 6.2
+},
+"127.0.0.2": {
+"resolvers": [
+{
+"name": "Cloudflare",
+"ip": "1.1.1.1",
+"udp": "ok",
+"doh": "ok",
+"dot": "blocked"
+},
+{
+"name": "Google",
+"ip": "8.8.8.8",
+"udp": "ok",
+"doh": "ok",
+"dot": "blocked"
+},
+{
+"name": "Quad9",
+"ip": "9.9.9.9",
+"udp": "ok",
+"doh": "blocked",
+"dot": "blocked"
+},
+{
+"name": "AdGuard",
+"ip": "94.140.14.14",
+"udp": "ok",
+"doh": "ok",
+"dot": "blocked"
+},
+{
+"name": "Яндекс",
+"ip": "77.88.8.8",
+"udp": "ok",
+"doh": "ok",
+"dot": "blocked"
+}
+],
+"system": {
+"ns": [
+"127.0.0.53"
+],
+"upstream": [
+"198.51.100.1"
+]
+},
+"ref": "Cloudflare",
+"ref_ips": {
+"rutracker.org": [
+"192.0.2.10",
+"192.0.2.11"
+],
+"flibusta.is": [
+"192.0.2.12"
+],
+"linkedin.com": [
+"192.0.2.13"
+]
+},
+"answers": {
+"system": {
+"rutracker.org": {
+"rcode": 0,
+"ips": [
+"198.51.100.250"
+]
+},
+"flibusta.is": {
+"rcode": 0,
+"ips": [
+"198.51.100.250"
+]
+},
+"linkedin.com": {
+"rcode": 0,
+"ips": [
+"198.51.100.250"
+]
+}
+},
+"udp:1.1.1.1": {
+"rutracker.org": {
+"rcode": 3,
+"ips": []
+},
+"flibusta.is": {
+"rcode": 3,
+"ips": []
+},
+"linkedin.com": {
+"rcode": 3,
+"ips": []
+}
+},
+"udp:8.8.8.8": {
+"rutracker.org": {
+"rcode": 3,
+"ips": []
+},
+"flibusta.is": {
+"rcode": 3,
+"ips": []
+},
+"linkedin.com": {
+"rcode": 3,
+"ips": []
+}
+}
+},
+"secs": 6.2
+}
+}
