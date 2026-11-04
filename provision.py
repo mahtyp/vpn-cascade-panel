@@ -18,7 +18,7 @@ import threading
 import time
 import traceback
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import zapret as zapret_mod
 
@@ -640,10 +640,12 @@ class Provisioner:
             sftp.putfo(io.BytesIO(data), remote)
             sftp.chmod(remote, mode)
             # vpn-exit-setup.sh и vpn-restore.sh берут общие функции AmneziaWG из vpn-awg-common.sh рядом
-            if not isinstance(local_or_bytes, bytes) and Path(remote).name in ("vpn-exit-setup.sh", "vpn-restore.sh"):
+            # путь на сервере — всегда через «/»: на Windows Path() сделал бы из него «\root\…»
+            rp = PurePosixPath(remote)
+            if not isinstance(local_or_bytes, bytes) and rp.name in ("vpn-exit-setup.sh", "vpn-restore.sh"):
                 common = Path(local_or_bytes).with_name("vpn-awg-common.sh")
                 if common.exists():
-                    dst = str(Path(remote).with_name("vpn-awg-common.sh"))
+                    dst = str(rp.with_name("vpn-awg-common.sh"))
                     sftp.putfo(io.BytesIO(common.read_bytes()), dst)
                     sftp.chmod(dst, 0o644)
         finally:
