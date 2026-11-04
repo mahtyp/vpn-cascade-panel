@@ -52,6 +52,7 @@ CFG_FILE = APP / "servers.json"
 KNOWN_HOSTS = APP / "known_hosts"
 LOG_FILE = APP / "checks.log"
 HIST_FILE = APP / "history.db"
+GOV_FILE = APP / "govblock.json"        # «Сети госорганов»: последний скачанный список (только адреса сетей)
 ADDR_FILE = APP / "addrcheck.json"      # «Качество»: последние «как видят» и «соседи» по серверам (адреса — только здесь)
 BACKUP_DIR = APP / "backups"
 BACKUP_SCRIPT = APP / "server-scripts" / "vpn-backup.sh"
@@ -120,6 +121,10 @@ SETTINGS = [
                    "Германия · FAU | https://ftp.fau.de/ubuntu-releases/24.04/ubuntu-24.04.5-live-server-amd64.iso",
      "urllist", None, None, "Замер скорости", "Откуда качать при замере нового сервера",
      "По строке: название | адрес большого файла (от 100 МБ). Каждый качается 15 секунд. Если файл пропал с зеркала — замените адрес."),
+    ("gov_hours", 24, "int", 0, 168, "Сети госорганов", "Обновлять список раз в, ч (0 — не обновлять)",
+     "Свежий список скачивается этим компьютером; на входах, где включено, он ставится с тем же замером и «ремнём», что и при включении."),
+    ("gov_keep", "", "iplist", None, None, "Сети госорганов", "Свои адреса, которые не блокировать",
+     "IP или сети через пробел или по строке — например, рабочий адрес, если он вдруг попал в список. Адрес этого компьютера добавляется сам."),
     ("drift_auto", True, "bool", None, None, "Сверка резервов", "Сверять при каждой полной проверке",
      "Основной вход (первый в списке серверов) сравнивается с каждым резервным. Иначе — только по кнопке «Сверить»."),
     ("backup_server", "", "entry", None, None, "Бэкап", "Чей бэкап делать", "Пусто — первый вход в списке серверов."),
@@ -185,6 +190,12 @@ def clean_setting(key, val, cfg=None):
         if not lst:
             raise ValueError("«%s»: ни одной строки вида «Название | https://адрес»" % label)
         return "\n".join("%s | %s" % x for x in lst)
+    if typ == "iplist":
+        import govblock
+        bad = [x for x in re.split(r"[\s,;]+", str(val or "")) if x and not govblock.keep_list(x)]
+        if bad:
+            raise ValueError("«%s»: не адрес — %s" % (label, ", ".join(bad[:3])))
+        return "\n".join(govblock.keep_list(val))
     if typ == "entry":
         v = str(val or "")
         if v and cfg and not cfg.by_id(v):
@@ -798,6 +809,11 @@ class Dash:
         self.pkg_count = {}     # sid -> {at, n}: сколько обновлений поставится (считается редко)
         self.fw = {}            # sid -> {at, ok, error, plan}: проверка для фаервола (только чтение)
         self.fwjob = {}         # sid -> {at, do, steps: [[уровень, текст]], ok, done}: включение/выключение фаервола
+        self.govjob = {}        # sid -> то же для «сетей госорганов»
+        try:
+            self.gov = json.loads(GOV_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.gov = {}       # {at, sha, v4, v6, bad, error, tried}: список сетей госорганов (govblock.fetch)
         self.xui_web = {}       # sid -> {port, path, https, domain, listen}: веб-панель 3X-UI (путь — только здесь, не на странице)
         self.geo = {}           # sid -> итог «как видят адрес» (ipcheck.summarize + at)
         self.nb = {}            # sid -> итог «шумные соседи» (neighbors.summarize + at)
@@ -1268,6 +1284,169 @@ class Dash:
             job.update(ok=ok, done=True)
             self.note("ok" if ok else "bad", "%s: фаервол — %s" % (srv["name"], text))
             self.check_fw(sid)
+
+    # --- «Сети госорганов» на входах (govblock.py): не пускать новые подключения из их подсетей
+
+    def gov_fetch(self):
+        """Скачать список с GitHub этим компьютером и проверить. Не вышло — остаётся прежний."""
+        import govblock
+        import urllib.request
+
+        def get(url):
+            if os.environ.get("VPN_DASH_STAND") == "1":     # стенд: готовый список (сеть стенда до GitHub не всегда достаёт)
+                return Path("/etc/testbed-govblock-%s.txt" % ("v6" if url.endswith("v6.txt") else "v4")).read_text()
+            rq = urllib.request.Request(url, headers={"User-Agent": "vpn-dash"})
+            with urllib.request.urlopen(rq, timeout=30) as f:
+                return f.read(5_000_000).decode("utf-8", "replace")
+        self.gov["tried"] = now()
+        try:
+            g = govblock.fetch(get, local_ok=os.environ.get("VPN_DASH_STAND") == "1")
+        except Exception as e:  # noqa: BLE001
+            self.gov["error"] = str(e)[:200]
+            self._gov_save()
+            raise CheckError("список сетей госорганов не скачался: %s" % self.gov["error"])
+        g["tried"] = g["at"]
+        with self.lock:
+            self.gov = g
+        self._gov_save()
+        return g
+
+    def _gov_save(self):
+        try:
+            tmp = GOV_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.gov), encoding="utf-8")
+            os.replace(tmp, GOV_FILE)
+        except OSError:
+            pass
+
+    def gov_view(self):
+        g = self.gov
+        return {"at": g.get("at"), "sha": g.get("sha"), "n4": len(g.get("v4") or []), "n6": len(g.get("v6") or []),
+                "error": g.get("error") if (g.get("tried") or 0) > (g.get("at") or 0) else None}
+
+    def _gov_run(self, srv, P, timeout=120):
+        import govblock
+        rc, out, err = self.ssh.run(srv, "python3 -", stdin="P = %s\n" % json.dumps(P) + govblock.GOV_PY, timeout=timeout)
+        lines = out.strip().splitlines()
+        if not lines:
+            raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:300])
+        return json.loads(lines[-1])
+
+    def gov_apply(self, sid, auto=False):
+        """Включить (или обновить список) на входе: свои адреса — в исключения, замер до и после, «ремень» на 5 минут."""
+        import govblock
+        srv = self.cfg.by_id(sid)
+        job = {"at": now(), "do": "update" if auto else "enable", "steps": [], "ok": None, "done": False}
+        self.govjob[sid] = job
+
+        def step(level, text):
+            job["steps"].append([level, text])
+
+        def finish(ok, text):
+            step("ok" if ok else "bad", text)
+            job.update(ok=ok, done=True)
+            self.note("ok" if ok else "bad", "%s: сети госорганов — %s" % (srv["name"], text))
+            return ok
+
+        with self.busy("govon:" + sid):
+            g = self.gov
+            if not g.get("v4") or now() - (g.get("at") or 0) > 24 * 3600:
+                step("info", "скачиваю список с GitHub")
+                try:
+                    g = self.gov_fetch()
+                except CheckError as e:
+                    if not g.get("v4"):
+                        return finish(False, str(e))
+                    step("warn", "%s — беру прежний от %s" % (e, time.strftime("%d.%m", time.localtime(g["at"]))))
+            x = ((self.status.get(sid) or {}).get("data") or {}).get("entry") or {}
+            ports = [ib["port"] for ib in ((x.get("xui") or {}).get("inbounds") or []) if ib.get("enable")]
+            try:
+                who = self._gov_run(srv, {"do": "who", "ports": ports}, timeout=60)
+            except CheckError as e:
+                return finish(False, "сервер не ответил: %s" % e)
+            nets = g["v4"] + g["v6"]
+            keep = govblock.keep_list(self.cfg.settings.get("gov_keep"))
+            mine = [a for a in [who.get("me")] if a]
+            for a, n in govblock.hits(nets, mine):
+                step("warn", "адрес этого компьютера %s есть в списке (сеть %s) — оставляю его открытым" % (a, n))
+            peers = govblock.hits(nets, who.get("peers") or [])
+            for a, n in peers:
+                step("warn", "к входу сейчас подключён %s из сети %s — оставляю открытым (если это не ваш, уберите в «Настройках»)" % (a, n))
+            keep = sorted(set(keep + [a for a, _ in govblock.hits(nets, mine)] + [a for a, _ in peers]))
+            chans = self._fw_channels(sid)
+            step("info", "замеряю, как всё работает сейчас: SSH, %d каналов, порты входа с этого компьютера" % len(chans))
+            ssh0, ch0, ports0 = self._fw_probe(srv, chans)
+            meta = {"date": time.strftime("%Y-%m-%d", time.localtime(g["at"])), "sha": g["sha"], "n4": len(g["v4"]),
+                    "n6": len(g["v6"]), "keep": keep, "at": now()}
+            try:
+                step("info", "ставлю таблицу nftables: %d сетей IPv4, %d IPv6; «ремень» — всё вернётся само через 5 минут"
+                     % (len(g["v4"]), len(g["v6"])))
+                res = self._gov_run(srv, {"do": "apply", "nft": govblock.nft_script(g["v4"], g["v6"], keep), "meta": meta,
+                                          "undo_s": 300}, timeout=600)
+            except CheckError as e:
+                return finish(False, "не дошло до сервера: %s — если успело включиться, через 5 минут вернётся само" % e)
+            if not res.get("ok"):
+                return finish(False, res.get("msg") or "не вышло")
+            job["undo_at"] = now() + 300
+            step("info", "включено — проверяю снова")
+            time.sleep(2)
+            ssh1, ch1, ports1 = self._fw_probe(srv, chans)
+            broke = ([] if ssh1 or not ssh0 else ["SSH не пускает"]) + \
+                ["канал %s" % k[1] for k, was in ch0.items() if was and not ch1.get(k)] + \
+                ["порт %s (%s) не открывается с этого компьютера" % k for k, was in ports0.items() if was and not ports1.get(k)]
+            if broke:
+                step("bad", "сломалось: " + "; ".join(broke))
+                try:
+                    self._gov_run(srv, {"do": "undo"})
+                    job["undo_at"] = None
+                    return finish(False, "вернул как было")
+                except CheckError:
+                    return finish(False, "до сервера не достучаться — через 5 минут вернётся само")
+            try:
+                self._gov_run(srv, {"do": "confirm"})
+            except CheckError as e:
+                return finish(False, "не смог подтвердить (%s) — через 5 минут вернётся как было" % e)
+            job["undo_at"] = None
+            self.check_server(sid)
+            return finish(True, ("список обновлён (от %s)" if auto else "включено: список от %s, всё работает как раньше")
+                          % time.strftime("%d.%m", time.localtime(g["at"])))
+
+    def gov_off(self, sid):
+        srv = self.cfg.by_id(sid)
+        job = {"at": now(), "do": "off", "steps": [["info", "убираю таблицу nftables"]], "ok": None, "done": False}
+        self.govjob[sid] = job
+        with self.busy("govon:" + sid):
+            try:
+                r = self._gov_run(srv, {"do": "off"})
+                ok, text = r.get("ok"), r.get("msg")
+            except CheckError as e:
+                ok, text = False, str(e)
+            job["steps"].append(["ok" if ok else "bad", text])
+            job.update(ok=ok, done=True)
+            self.note("ok" if ok else "bad", "%s: сети госорганов — %s" % (srv["name"], text))
+            self.check_server(sid)
+
+    def gov_auto(self):
+        """Раз в gov_hours: свежий список; где включено и список поменялся — обновить (с тем же замером и «ремнём»)."""
+        with self.busy("govauto"):
+            old = self.gov.get("sha")
+            try:
+                g = self.gov_fetch()
+            except CheckError as e:
+                self.note("warn", str(e))
+                return
+            for s in self.cfg.servers:
+                gi = ((self.status.get(s["id"]) or {}).get("data") or {}).get("gov") or {}
+                if s["role"] != "entry" or not gi.get("on") or not self.cfg.get_pw(s["id"]):
+                    continue
+                if (gi.get("meta") or {}).get("sha") == g["sha"] and old == g["sha"]:
+                    continue
+                if any(k.startswith("govon:") or k.startswith("fwon:") for k in self.running):
+                    continue
+                try:
+                    self.gov_apply(s["id"], auto=True)
+                except Exception as e:  # noqa: BLE001
+                    self.note("bad", "%s: обновление списка сетей госорганов — ошибка панели: %s" % (s["name"], e))
 
     def xui_dups(self):
         """У каких серверов путь 3X-UI такой же, как у сервера выше в списке (входы из одного бэкапа)."""
@@ -1832,6 +2011,9 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                     with self.busy("zapmon"):
                         self.zapret.monitor()
                 self.pool.submit(zapmon)
+            gh = int(st.get("gov_hours") or 0)
+            if has_pw and gh and now() - (self.gov.get("tried") or 0) >= gh * 3600 and "govauto" not in self.running:
+                self.pool.submit(self.gov_auto)
             bs = (self.backup_target() or {}).get("id")
             if has_pw and self.cfg.get_pw(bs or "") and self.backup_due():
                 self.pool.submit(self.do_backup, bs)
@@ -1978,7 +2160,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                 "schema": [dict(zip(("key", "default", "type", "min", "max", "group", "label", "help"), x)) for x in SETTINGS],
                 "platform": os.name, "port_now": PORT, "boot": BOOT_ID, "can_restart": bool(self.on_restart),
                 "version": self.version, "git": self.git,
-                "hist": self.hist.summary(), "drift": self.drift_view(), "fw": self.fw, "fwjob": self.fwjob, "bypasses": self.sites.view(),
+                "hist": self.hist.summary(), "drift": self.drift_view(), "fw": self.fw, "fwjob": self.fwjob, "gov": self.gov_view(), "govjob": self.govjob, "bypasses": self.sites.view(),
                 "quality": self.quality, "geo": self.geo, "nb": self.nb, "dns": self.dns, "dpi": self.dpi,
                 "addrjobs": [{"id": j.id, "kind": j.kind, "sid": j.params.get("sid"), "status": j.status, "error": j.error,
                               "finished": j.finished}
@@ -2665,6 +2847,28 @@ class Handler(BaseHTTPRequestHandler):
                     j["steps"].append(["bad", "ошибка панели: %s: %s — если ufw успел включиться, он выключится сам через 5 минут" % (type(e).__name__, e)])
                     j.update(ok=False, done=True)
             D.pool.submit(job)
+            return self._send(200, {"ok": True})
+        if p == "/api/gov":                     # «сети госорганов» на входе: enable | off | fetch
+            do = str(body.get("do") or "")
+            if do == "fetch":
+                try:
+                    D.gov_fetch()
+                    return self._send(200, {"ok": True, "gov": D.gov_view()})
+                except CheckError as e:
+                    return self._send(200, {"error": str(e)})
+            srv = D.cfg.by_id(str(body.get("id") or ""))
+            if not srv or srv["role"] != "entry":
+                return self._send(404, {"error": "это не вход — список нужен только на входах"})
+            if any(k.startswith(("govon:", "fwon:")) for k in D.running):
+                return self._send(409, {"error": "уже идёт включение на другом сервере — по одному"})
+            def gjob(f=D.gov_apply if do == "enable" else D.gov_off, sid=srv["id"]):
+                try:
+                    f(sid)
+                except Exception as e:          # чтобы окно не крутилось вечно
+                    j = D.govjob.setdefault(sid, {"steps": []})
+                    j["steps"].append(["bad", "ошибка панели: %s: %s — если успело включиться, через 5 минут вернётся само" % (type(e).__name__, e)])
+                    j.update(ok=False, done=True)
+            D.pool.submit(gjob)
             return self._send(200, {"ok": True})
         if p == "/api/acme":
             return self._send(200, D.acme_open(str(body.get("id") or "")))

@@ -15,3 +15,5 @@ addrcheck.json
 addrcheck.tmp
 dash.pid
 *.png
+govblock.json
+govblock.tmp

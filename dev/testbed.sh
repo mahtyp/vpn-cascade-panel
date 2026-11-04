@@ -215,6 +215,7 @@ S
   pgrep -x x-ui-web >/dev/null || cp "$(readlink -f "$(command -v python3)")" /usr/local/x-ui/x-ui-web
   cp "$HERE/fake-xui-web.py" /usr/local/x-ui/fake-web.py
   cp "$HERE/fake-ipregion.json" /etc/testbed-ipregion.json; cp "$HERE/fake-ipregion-mm.json" /etc/testbed-ipregion-mm.json; cp "$HERE/fake-ipregion-rep.json" /etc/testbed-ipregion-rep.json; cp "$HERE/fake-ipregion-ai.json" /etc/testbed-ipregion-ai.json; cp "$HERE/fake-neighbors.json" /etc/testbed-neighbors.json; cp "$HERE/fake-dns.json" /etc/testbed-dns.json   # «как видят адрес»
+  cp "$HERE/fake-govblock-v4.txt" /etc/testbed-govblock-v4.txt; cp "$HERE/fake-govblock-v6.txt" /etc/testbed-govblock-v6.txt   # «сети госорганов»
   rm -f /etc/testbed-units
   cp "$HERE/fake-ufw.py" /usr/local/sbin/ufw && chmod +x /usr/local/sbin/ufw && rm -f /etc/testbed-ufw.json /etc/testbed-ufw-break
   if ! pgrep -x x-ui-web >/dev/null; then
@@ -255,6 +256,7 @@ down() {
   rm -f /etc/testbed-units
   rm -f /usr/local/sbin/awg /usr/local/sbin/curl /usr/local/sbin/systemctl /usr/local/sbin/ufw /usr/local/sbin/docker /usr/local/sbin/ping /etc/testbed-quality.json /etc/testbed-ipregion.json /etc/testbed-ipregion-mm.json /etc/testbed-ipregion-rep.json /etc/testbed-ipregion-ai.json /etc/testbed-neighbors.json /etc/testbed-dns.json /etc/testbed-awg-mimic-bad /etc/testbed-sites.json /etc/testbed-ufw.json /etc/testbed-ufw-break /etc/testbed-docker.json /etc/testbed-mtproto.json /etc/testbed-dpi.json /etc/testbed-blockcheck.txt /etc/testbed-blockcheck-pace /etc/testbed-zapret-bad /etc/testbed-zapret-nohelp
   rm -rf /opt/zapret2 /etc/systemd/system/zapret2.service /root/vpn-zapret.sh
+  nft delete table inet vpn_dash_gov 2>/dev/null; rm -rf /etc/vpn-dash /etc/systemd/system/vpn-dash-govblock.service /etc/testbed-govblock-v4.txt /etc/testbed-govblock-v6.txt /root/.vpn-dash-gov-undo*
   pkill -x sshd || true
   for n in 0 1 2; do ip addr del "10.8.$n.1/32" dev lo 2>/dev/null; done
   sshopen all >/dev/null

@@ -727,7 +727,7 @@ function renderSettings() {
   const st = S.settings, groups = [];
   for (const f of S.schema) { let g = groups.find((x) => x.name === f.group); if (!g) groups.push(g = { name: f.group, items: [] }); g.items.push(f); }
   const fmtD = (f) => f.type === "bool" ? (f.default ? "вкл" : "выкл") : f.type === "entry" ? (f.default ? (S.servers.find((x) => x.id === f.default) || { name: f.default }).name : "авто")
-    : f.type === "dclist" || f.type === "urllist" ? String(f.default).split("\n").join(" · ") : f.type === "float" ? String(f.default).replace(".", ",") : String(f.default);
+    : f.type === "iplist" ? (f.default || "пусто") : f.type === "dclist" || f.type === "urllist" ? String(f.default).split("\n").join(" · ") : f.type === "float" ? String(f.default).replace(".", ",") : String(f.default);
   let h = `<div class="row"><h1>Настройки</h1><div style="flex-grow:1"></div>
     <button class="btn" data-act="reset-settings">Вернуть стандартные</button><button class="btn primary" data-act="save-settings">Сохранить</button></div>
     <div class="muted">Всё хранится в servers.json рядом с панелью и действует сразу после «Сохранить», кроме порта.</div>
@@ -749,8 +749,8 @@ function renderSettings() {
         h += `<label class="chk"><span class="row" style="gap:10px;flex-wrap:nowrap"><input type="checkbox" id="${id}" data-key="${f.key}" ${v ? "checked" : ""} ${dis ? "disabled" : ""}><span>${esc(f.label)}</span></span>${hint}${dis ? `<span class="sm dim">Только в Windows.</span>` : ""}</label>`;
       } else if (f.type === "entry") {
         h += `<label>${esc(f.label)}<select id="${id}" data-key="${f.key}">${f.default === "" ? `<option value="">авто</option>` : ""}${entriesOf().map((e) => `<option value="${esc(e.id)}" ${e.id === v ? "selected" : ""}>${esc(e.name)}</option>`).join("")}</select>${hint}</label>`;
-      } else if (f.type === "dclist" || f.type === "urllist") {
-        h += `<label class="wide">${esc(f.label)}<textarea id="${id}" data-key="${f.key}" rows="5" class="mono">${esc(v)}</textarea>${hint}</label>`;
+      } else if (f.type === "dclist" || f.type === "urllist" || f.type === "iplist") {
+        h += `<label class="wide">${esc(f.label)}<textarea id="${id}" data-key="${f.key}" rows="${f.type === "iplist" ? 3 : 5}" class="mono">${esc(v)}</textarea>${hint}</label>`;
       } else if (f.type === "url") {
         h += `<label class="wide">${esc(f.label)}<input id="${id}" data-key="${f.key}" class="mono" value="${esc(v)}">${hint}</label>`;
       } else {
@@ -2217,6 +2217,18 @@ function renderFw() {
   let h = `<div class="row"><h1>Фаервол</h1><div style="flex-grow:1"></div>
     <button class="btn primary" data-act="fw-check" ${any ? "disabled" : ""}>${spinIcon(any)}${any ? "Проверяю…" : "Проверить все серверы"}</button></div>
     <div class="muted">«Проверить» только смотрит: что слушает каждый сервер и что останется открытым, когда включим фаервол (ufw). «Включить фаервол» — по одному серверу: панель замерит, как всё работает, включит ufw и проверит снова; если что-то перестанет работать — сразу выключит обратно, а если потеряет связь с сервером — ufw выключится сам через 5 минут. Начните с резервного входа, потом выход, основной вход — последним.</div>`;
+  const G = S.gov || {}, gBusy = S.running.some((k) => k.startsWith("govon:") || k.startsWith("fwon:"));
+  h += `<section class="card"><div class="head"><h3>Сети госорганов на входах</h3><span class="sm muted">не пускать к входу РКН и ведомства</span><div style="flex-grow:1"></div>
+      <button class="btn sm" style="min-height:30px" data-act="gov-fetch">Скачать список заново</button></div>
+    <div style="padding:12px 18px 14px;display:flex;flex-direction:column;gap:6px;font-size:14px">
+      <div>Входы видны из России, и их сканируют — в том числе адреса РКН и ведомств проверяют, что на порту VLESS. Эта защита отбрасывает
+      <b>новые подключения</b> из их подсетей к входу: сканер просто не получает ответа. Всё, что вход открывает сам (сайты «напрямую», Госуслуги
+      и т. п.), работает как раньше. Блокировки и замедления по дороге это не убирает — только сканеры.</div>
+      <div class="sm muted">Список — <a href="https://github.com/C24Be/AS_Network_List" target="_blank" rel="noopener">C24Be/AS_Network_List</a>
+      ${G.at ? `от ${esc(new Date(G.at * 1000).toLocaleDateString("ru-RU"))}: ${G.n4} сетей IPv4, ${G.n6} IPv6` : "ещё не скачан"}.
+      Обновляется этим компьютером раз в ${S.settings.gov_hours ? S.settings.gov_hours + " ч" : "— выключено"} и сам ставится туда, где включено (с тем же замером и откатом).
+      Адрес этого компьютера и тех, кто сейчас подключён к входу, остаётся открытым всегда; свои адреса — в <a href="#/settings">«Настройках»</a>.</div>
+      ${G.error ? `<div class="sm" style="color:var(--warn)">Последний раз не скачался: ${esc(G.error)}</div>` : ""}</div></section>`;
   const busyAny = S.running.some((k) => k.startsWith("fwon:"));
   for (const s of S.servers) {
     const r = (S.fw || {})[s.id], run = isRun("fw:" + s.id), p = r && r.ok ? r.plan : null;
@@ -2227,6 +2239,19 @@ function renderFw() {
       <button class="btn sm" style="min-height:30px" data-act="fw-check" data-id="${esc(s.id)}" ${run || isRun("fwon:" + s.id) ? "disabled" : ""}>${spinIcon(run)}${run ? "проверяю" : "проверить"}</button>
       ${p && p.state !== "on" && !p.notes.some((n) => n.level === "bad") ? `<button class="btn primary sm" style="min-height:30px" data-act="fw-on" data-id="${esc(s.id)}" ${busyAny || run ? "disabled" : ""}>Включить фаервол</button>` : ""}
       ${p && p.state === "on" ? `<button class="btn sm" style="min-height:30px" data-act="fw-off" data-id="${esc(s.id)}" ${busyAny || run ? "disabled" : ""}>Выключить</button>` : ""}</div>`;
+    if (s.role === "entry") {
+      const gi = (((s.state || {}).data || {}).gov) || null, gm = (gi && gi.meta) || {}, grun = isRun("govon:" + s.id);
+      const txt = gi && gi.on ? `<span class="pill ok sm">не пускаются</span> <span class="sm muted">список от ${esc((gm.date || "?").split("-").reverse().join("."))} · ${gm.n4 || 0} сетей · отсечено подключений: ${gi.drops || 0}${gi.boot ? "" : " · <span style='color:var(--warn)'>после перезагрузки не включится</span>"}${gi.undo ? " · ждёт подтверждения" : ""}</span>`
+        : `<span class="pill sm">пускаются</span>`;
+      h += `<div class="list-row" style="padding:10px 18px;gap:10px;align-items:center;border-bottom:1px solid var(--border)"><b style="font-weight:500">Сети госорганов:</b> ${txt}<div style="flex-grow:1"></div>
+        ${gi && gi.on ? `<button class="btn sm" style="min-height:30px" data-act="gov-off" data-id="${esc(s.id)}" ${gBusy ? "disabled" : ""}>Пускать снова</button>`
+          : `<button class="btn primary sm" style="min-height:30px" data-act="gov-on" data-id="${esc(s.id)}" ${gBusy || !G.at && G.error ? "disabled" : ""}>${grun ? spinIcon(true) : ""}Не пускать</button>`}</div>`;
+      const gj = (S.govjob || {})[s.id];
+      if (gj && (!gj.done || S.now - gj.at < 1800)) h += `<div style="padding:12px 18px;display:flex;flex-direction:column;gap:4px;background:#121a26;border-bottom:1px solid var(--border)">
+        <b style="font-size:14px">${gj.do === "off" ? "Сети госорганов: выключение" : gj.do === "update" ? "Сети госорганов: новый список" : "Сети госорганов: включение"}${gj.done ? "" : " " + spinIcon(true)}</b>
+        ${gj.steps.map(([lv, t]) => `<div class="sm" style="color:${lv === "ok" ? "var(--ok)" : lv === "bad" ? "var(--bad)" : lv === "warn" ? "var(--warn)" : "var(--soft)"}">${lv === "ok" ? "✓" : lv === "bad" ? "✕" : lv === "warn" ? "!" : "•"} ${esc(t)}</div>`).join("")}
+        ${gj.undo_at && gj.undo_at > S.now ? `<div class="sm" style="color:var(--warn)">⏱ «ремень»: если панель не подтвердит, всё вернётся само через ${Math.floor((gj.undo_at - S.now) / 60)}:${String(Math.floor((gj.undo_at - S.now) % 60)).padStart(2, "0")}</div>` : ""}</div>`;
+    }
     const j = (S.fwjob || {})[s.id];
     if (j && (!j.done || S.now - j.at < 1800)) h += `<div style="padding:12px 18px;display:flex;flex-direction:column;gap:4px;background:#121a26;border-bottom:1px solid var(--border)">
       <b style="font-size:14px">${j.do === "enable" ? "Включение фаервола" : "Выключение фаервола"}${j.done ? "" : " " + spinIcon(true)}</b>
@@ -2415,6 +2440,23 @@ document.addEventListener("click", async (ev) => {
     S = await api("/api/state"); renderAddr(); schedule(1500); return;
   }
   if (a === "addr-log") { openJob(b.dataset.job, b.dataset.title); return; }
+  if (a === "gov-fetch") {
+    b.disabled = true; const r = await api("/api/gov", { do: "fetch" }); b.disabled = false;
+    if (r.error) alert(r.error);
+    S = await api("/api/state"); renderFw(); return;
+  }
+  if (a === "gov-on" || a === "gov-off") {
+    const sv = S.servers.find((x) => x.id === id);
+    if (!confirm(a === "gov-on" ? "Не пускать сети госорганов к «" + sv.name + "»?\n\n"
+      + "1. Панель запомнит адрес этого компьютера и тех, кто сейчас подключён к входу, — они останутся открытыми.\n"
+      + "2. Замерит, как всё работает: SSH, каналы, порты входа с этого компьютера.\n"
+      + "3. Поставит на сервере отдельную таблицу nftables (если нужно — пакет nftables). ufw, fail2ban и Docker она не трогает.\n"
+      + "4. Замерит снова. Что-то сломалось — сразу вернёт как было; связь пропала — вернётся само через 5 минут.\n\nVPN при этом не прерывается."
+      : "Снова пускать сети госорганов к «" + sv.name + "»? Таблица nftables удалится, больше ничего не меняется.")) return;
+    const r = await api("/api/gov", { id, do: a === "gov-on" ? "enable" : "off" });
+    if (r.error) { alert(r.error); return; }
+    S = await api("/api/state"); renderFw(); schedule(1500); return;
+  }
   if (a === "fw-on" || a === "fw-off") {
     const sv = S.servers.find((x) => x.id === id), p = S.fw[id].plan, keep = p.rows.filter((x) => x.verdict === "keep").map((x) => x.port + "/" + x.proto);
     if (!confirm(a === "fw-on" ? "Включить фаервол на «" + sv.name + "»?\n\nОстанутся открытыми: " + keep.join(", ") + ". Всё остальное снаружи закроется.\n\nПанель замерит, как всё работает сейчас, включит ufw и проверит снова: SSH, каналы" + (sv.role === "entry" ? ", порты входа с этого компьютера" : "") + ". Если что-то перестанет работать — сразу выключит обратно. Если панель потеряет связь с сервером — ufw выключится сам через 5 минут.\n\nУже открытые подключения обычно не рвутся. Займёт 1–3 минуты."

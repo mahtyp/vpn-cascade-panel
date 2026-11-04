@@ -479,6 +479,22 @@ def web_listen_addrs(port):
     return out
 
 
+def gov_info():
+    """«Сети госорганов» (govblock.py): включено ли, сколько сетей, от какого числа список, сколько подключений отброшено."""
+    meta = read("/etc/vpn-dash/govblock.json")
+    if not meta and not os.path.exists("/etc/vpn-dash/govblock.nft"):
+        return None
+    try:
+        m = json.loads(meta) if meta else {}
+    except ValueError:
+        m = {}
+    out = sh("nft list chain inet vpn_dash_gov input 2>/dev/null")
+    drops = sum(int(x) for x in re.findall(r"counter packets (\d+)", out))
+    return {"on": bool(out.strip()), "boot": unit_active("vpn-dash-govblock") or
+            sh("systemctl is-enabled vpn-dash-govblock 2>/dev/null").strip() == "enabled",
+            "undo": os.path.exists("/root/.vpn-dash-gov-undo"), "drops": drops, "meta": m}
+
+
 def web_info():
     """Где слушает веб-панель 3X-UI. Путь панели нужен нашей панели, чтобы открыть её через SSH; на страницу он не уходит."""
     if not os.path.exists("/etc/x-ui/x-ui.db"):
@@ -1205,6 +1221,7 @@ else:
     if glob.glob(AWG_DIR + "/wg*.conf") or os.path.exists("/etc/x-ui/x-ui.db") and not data["exit"].get("awg"):
         data["entry"] = {"awg": awg_clients(), "xui": xui()}
     data["web"] = web_info()
+    data["gov"] = gov_info()
     data["sw"] = sw_versions()
     if data.get("entry"):
         data["zapret"] = zapret_info()

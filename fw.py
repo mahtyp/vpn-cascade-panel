@@ -66,6 +66,10 @@ def plan(srv, a):
                      why="Docker открывает свои порты сам, ufw их не касается")
         elif proto == "udp" and port in (68, 546):
             r.update(verdict="auto", what="DHCP", why="служебное, ufw пропускает сам")
+        elif proc.startswith("xray") and proto == "udp" and port >= 32768:
+            r.update(verdict="auto", what="Xray, временный UDP",
+                     why="так Xray сам отправляет UDP наружу (QUIC, звонки, DNS — например, «напрямую» с входа); номер каждый раз "
+                         "новый, ответы проходят и при включённом фаерволе — открывать не нужно")
         elif proc.startswith("xray"):
             r.update(what="Xray", why="порт не от включённого входящего 3X-UI")
         else:
