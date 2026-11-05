@@ -293,12 +293,21 @@ class SSHPool:
         self.cfg = cfg
         self.clients = {}
         self.locks = {}
+        self.sems = {}          # sid -> сколько команд одновременно на одном соединении (см. MAX_SESS)
         self.glock = threading.Lock()
         self.route = None       # (srv, id входа) → (вход, адрес, порт, как) — консоль «через вход»; ставит Dash
 
     def _lock(self, sid):
         with self.glock:
             return self.locks.setdefault(sid, threading.Lock())
+
+    # sshd по умолчанию пускает не больше 10 сессий на одно соединение (MaxSessions). Каналов у входа бывает 10 и больше,
+    # проверки идут параллельно — лишняя сессия получала отказ, панель рвала соединение, и падали все каналы разом.
+    MAX_SESS = 6
+
+    def _sem(self, sid):
+        with self.glock:
+            return self.sems.setdefault(sid, threading.BoundedSemaphore(self.MAX_SESS))
 
     def drop(self, sid):
         c = self.clients.pop(sid, None)
@@ -503,22 +512,38 @@ while True:
         return b
 
     def run(self, srv, cmd, stdin=None, timeout=60):
-        for attempt in (1, 2):
-            try:
-                c = self.client(srv)
-                si, so, se = c.exec_command(cmd, timeout=timeout)
-                if stdin is not None:
-                    si.write(stdin)
-                    si.channel.shutdown_write()
-                out = so.read().decode("utf-8", "replace")
-                err = se.read().decode("utf-8", "replace")
-                return so.channel.recv_exit_status(), out, err
-            except CheckError:
-                raise
-            except (paramiko.SSHException, OSError, EOFError) as e:
-                self.drop(srv["id"])
-                if attempt == 2:
-                    raise CheckError("SSH: %s" % (e or type(e).__name__))
+        with self._sem(srv["id"]):
+            for attempt in (1, 2, 3):
+                c = None
+                try:
+                    c = self.client(srv)
+                    si, so, se = c.exec_command(cmd, timeout=timeout)
+                    if stdin is not None:
+                        si.write(stdin)
+                        si.channel.shutdown_write()
+                    out = so.read().decode("utf-8", "replace")
+                    err = se.read().decode("utf-8", "replace")
+                    rc = so.channel.recv_exit_status()
+                    if rc == -1 and not out and attempt < 3:    # канал закрылся без кода — соединение оборвалось, ещё раз
+                        continue
+                    return rc, out, err
+                except CheckError:
+                    raise
+                except (paramiko.ChannelException, paramiko.SSHException) as e:
+                    if not isinstance(e, paramiko.ChannelException) and "open channel" not in str(e).lower() \
+                            or not (c and c.get_transport() and c.get_transport().is_active()):
+                        self.drop(srv["id"])
+                        if attempt == 3:
+                            raise CheckError("SSH: %s" % (e or type(e).__name__))
+                        continue
+                    # сервер не дал ещё одну сессию (MaxSessions) — соединение живо, не рвём: подождать и ещё раз
+                    if attempt == 3:
+                        raise CheckError("SSH: сервер не открыл ещё один канал (%s)" % e)
+                    time.sleep(1.5)
+                except (OSError, EOFError) as e:
+                    self.drop(srv["id"])
+                    if attempt == 3:
+                        raise CheckError("SSH: %s" % (e or type(e).__name__))
 
 
 # ------------------------------------------------------------------ история
