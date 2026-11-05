@@ -316,6 +316,11 @@ def summarize(raw):
                 continue        # ipregion не отработал — про Gemini не знаем
             gv = str(svc.get("Gemini Supported") or "").lower()
             ok = True if gv == "yes" else False if gv == "no" else None
+            # ipregion сверяет страну Google со списком Gemini по названиям, которые качает с jsdelivr и countries.dev;
+            # не скачались — выходит «нет» и для разрешённых стран (так было с AU). «Нет» верим только для стран из AI_BLOCKED
+            gc = cc(svc.get("Google"))
+            if ok is False and gc and gc not in AI_BLOCKED:
+                ok = None
             ai.append((name, ok, None))
         elif name in ai_raw:
             x = ai_raw[name] or {}
