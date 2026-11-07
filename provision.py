@@ -305,14 +305,19 @@ class Provisioner:
         srv = self.d.cfg.by_id(job.params["sid"])
         if not srv:
             raise Stop("сервера больше нет в панели")
-        job.plan([("mask", "Под какой сайт маскируется Reality (база 3X-UI, только чтение)", srv["name"]),
+        job.plan([("mask", "Под какой сайт маскируется Reality и открывается ли он с сервера (только чтение)", srv["name"]),
                   ("scan", "Соседи по подсети /24 — с этого компьютера, порт 443", "")])
         job.begin("mask")
         reality = []
         try:
-            rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.REALITY_PY, timeout=40)
+            rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.reality_script(), timeout=90)
             reality = (neighbors.parse(out) or {}).get("reality") or []
-            job.end("mask", "ok", ", ".join("порт %s → %s" % (r["port"], ", ".join(r["names"]) or r["dest"] or "?") for r in reality)
+            for r in reality:      # как имя видит весь мир (DoH 1.1.1.1 с этого ПК) — сервер-то спрашивает DNS своего хостера
+                if r.get("sni") and not STAND:
+                    r["pub_ips"] = neighbors._resolve(r["sni"])
+            dead = [r for r in reality if r.get("ok") is False]
+            job.end("mask", "warn" if dead else "ok", ", ".join("порт %s → %s%s" % (r["port"], ", ".join(r["names"]) or r["dest"] or "?",
+                                                                     " (не открывается!)" if r.get("ok") is False else "") for r in reality)
                     or "Reality на сервере нет")
         except (Stop, ValueError) as e:
             job.end("mask", "warn", "не прочитал: %s" % e)

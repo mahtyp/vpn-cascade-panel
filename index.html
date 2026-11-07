@@ -324,6 +324,17 @@ function serverIssues(s) {
       } else if (c.cert_days < S.settings.cert_days) out.push(["сертификат: " + Math.max(0, c.cert_days) + " дн", c.cert_days < 0 ? "bad" : "warn"]);
     }
   }
+  for (const m of (e && e.mask) || []) {     // сайт, под который маскируется Reality: как его видит сканер со стороны
+    if (m.skip) continue;
+    const tip = "Reality на порту " + m.port + " маскируется под " + m.sni + " (target " + m.dest + "). Чужому, кто постучится на этот порт "
+      + "(сканер, проверка ТСПУ), Xray показывает этот сайт. Нажмите — раздел «Качество»: там соседи, под которых можно маскироваться вместо него.";
+    if (!m.ok) out.push(["маскировка: " + m.sni + " — " + (MASK_ERR[m.err] || "не открывается"), "bad", "mask",
+      tip + (m.why ? " Ошибка: " + m.why + "." : "") + " Сейчас проверка увидит ошибку вместо сайта — поменяйте target и SNI в 3X-UI на живой сайт."]);
+    else if (m.tls !== "TLSv1.3" || m.alpn !== "h2") out.push(["маскировка: у " + m.sni + " нет " + (m.tls !== "TLSv1.3" ? "TLS 1.3" : "h2"), "warn", "mask",
+      tip + " Reality нужен сайт с TLS 1.3 и h2, иначе маскировка выдаёт себя."]);
+    else if (m.days != null && m.days < 7) out.push(["маскировка: у " + m.sni + " сертификат на " + Math.max(0, m.days) + " дн", "warn", "mask",
+      tip + " Если сайт не продлит сертификат, маскировка сломается."]);
+  }
   const sw = d.sw || {};
   const aw = sw.awg;
   if (aw) {
@@ -348,6 +359,8 @@ function serverIssues(s) {
   return out;
 }
 // версии: «v1.19.31» новее «1.19.30»?
+const MASK_ERR = { dns: "имени нет в DNS", timeout: "сайт не отвечает", refused: "сайт не принимает подключения",
+  cert: "сертификат не тот или просрочен", tls: "ошибка TLS", net: "нет связи с сайтом" };
 // AmneziaWG: версия программы (модуль ядра, иначе пакет) и протокол по конфигам (1.0 / 1.5 / 2.0)
 function awgVer(d) {
   const a = ((d.sw || {}).awg) || {}, p = a.pkg || {};
@@ -2394,6 +2407,8 @@ document.addEventListener("click", async (ev) => {
   if (a === "term-go") { closeTermMenu(); openTerm(id, b.dataset.via); return; }
   if (a === "close-term") { closeTerm(); return; }
   if (a === "pkgs") { openPkgs(id); return; }
+  if (a === "mask") { ADDR_FOCUS = id; location.hash = "#/addr"; return; }
+  if (a === "mask") { ADDR_FOCUS = id; location.hash = "#/addr"; return; }
   if (a === "close-job") { closeJob(); return; }
   if (a === "awg-migrate") {
     const sv = S.servers.find((x) => x.id === id);

@@ -83,8 +83,11 @@
 - Раздел «Качество» (`#/addr`, `renderAddr`): у каждого сервера «как видят» (geo) и «соседи» (nb), итоги `Dash.geo`/`Dash.nb`
   хранятся в `addrcheck.json` (.gitignore), в снимке `geo`, `nb`, `addrjobs`. `neighbors.py` — «шумные соседи»: /24 сервера
   сканируется С ЭТОГО ПК (`scan`: 443 без SNI, сертификат через `ssl._ssl._test_decode_cert`/свой DER, DoH 1.1.1.1 — настоящий
-  ли сайт, для своих — TLS 1.3+h2 с проверкой сертификата), с сервера только `REALITY_PY` (serverNames/target из x-ui.db).
-  `summarize`: чужие (BRANDS) / настоящие / прочее, шум, наша маскировка. Задача `nb` (`start_nb`, `/api/nb`). На стенде —
+  ли сайт, для своих — TLS 1.3+h2 с проверкой сертификата), с сервера только `reality_script` (serverNames/target из x-ui.db и проверка сайта маскировки).
+  `summarize`: чужие (BRANDS) / настоящие / прочее, шум, наша маскировка. Сайт маскировки: probe `reality_mask()` (в статусе входа
+  `entry.mask`: TLS к target с SNI, проверка сертификата, TLS 1.3/h2, срок) → метка у сервера «маскировка: …» (ведёт в «Качество»);
+  тот же код уходит в задачу nb (`neighbors.reality_script`): мёртвый сайт — note bad, живой не в /24 — warn. На стенде — `dev/fake-mask-site.py`
+  (mask.testbed → 127.0.1.20:443, свой CA в системных), `/etc/testbed-mask-dead` — «сайт пропал». Задача `nb` (`start_nb`, `/api/nb`). На стенде —
   `/etc/testbed-neighbors.json` вместо скана.
   «DNS» (dns): `dnscheck.py` — `DNS_PY` на сервере (свои пакеты DNS: UDP 53, DoT 853 и DoH POST на IP с SNI и проверкой
   сертификата имени сервиса; подмена — ответы системного DNS и UDP 1.1.1.1/8.8.8.8 по TEST_DOMAINS против первого рабочего DoH),

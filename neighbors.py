@@ -6,31 +6,20 @@
 больше, тем «шумнее» подсеть: ТСПУ такие замечает и может закрыть её целиком.
 Настоящий сайт соседа — когда DNS его имени (через DoH 1.1.1.1) указывает именно на этот адрес. Такие с TLS 1.3 и
 h2 — лучшие кандидаты для маскировки Reality: сайт по соседству, а не «гугл у хостера».
-С сервера только читается, под какой сайт маскируется Reality (база 3X-UI, REALITY_PY). Ничего не меняет.
+С сервера только читается, под какой сайт маскируется Reality (база 3X-UI), и открывается ли этот сайт оттуда
+(reality_script → probe.reality_mask). Ничего не меняет.
 """
 import json
 import re
 from jsonline import last_json
 
-REALITY_PY = r"""
-import json, sqlite3
-res = []
-try:
-    db = sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True, timeout=5)
-    for port, remark, ss in db.execute("select port, remark, stream_settings from inbounds where enable=1"):
-        try:
-            st = json.loads(ss or "{}")
-        except ValueError:
-            continue
-        if st.get("security") != "reality":
-            continue
-        r = st.get("realitySettings") or {}
-        res.append({"port": port, "remark": remark, "names": [n for n in r.get("serverNames") or [] if n],
-                    "dest": str(r.get("target") or r.get("dest") or "")})
-except Exception:
-    pass
-print(json.dumps({"reality": res}, ensure_ascii=False))
-"""
+def reality_script():
+    """Скрипт для сервера: под какой сайт маскируется Reality и открывается ли он оттуда (probe.reality_mask)."""
+    from pathlib import Path
+    src = (Path(__file__).with_name("probe.py")).read_text(encoding="utf-8")
+    m = re.search(r"^def reality_mask\(.*?(?=^\S)", src, re.M | re.S)
+    return ("import json, re, socket, sqlite3, time\n" + m.group(0).rstrip()
+            + "\n\nprint(json.dumps({'reality': reality_mask()}, ensure_ascii=False))\n")
 
 
 def _der_len(b, i):
@@ -263,13 +252,53 @@ def summarize(raw):
         note("ok", "чужих сертификатов в подсети нет — по этому признаку подсеть тихая")
     fit = [r for r in genuine if r.get("fit") and not WILDCARD_DNS.search(r["name"] or "")]
     # наша маскировка
+    import ipaddress
     mine = []
+    try:
+        net = ipaddress.ip_network(raw.get("net") or "", strict=False)
+    except ValueError:
+        net = None
+    fit_txt = (" Подойдёт сайт соседа: " + ", ".join(r["name"] for r in fit[:3])) if fit else ""
     for rl in raw.get("reality") or []:
+        if rl.get("skip"):
+            continue
         names = [n.lower() for n in rl.get("names") or []] or ([rl["dest"].rsplit(":", 1)[0].lower()] if rl.get("dest") else [])
+        inside = False
+        if "ok" in rl:      # сервер сам попробовал открыть сайт маскировки (как его откроет Xray для чужих)
+            sni = rl.get("sni") or (names or ["?"])[0]
+            if not rl["ok"]:
+                why = {"dns": "имени больше нет в DNS", "timeout": "сайт не отвечает", "refused": "сайт не принимает подключения",
+                       "cert": "сертификат не на это имя или просрочен", "tls": "ошибка TLS", "net": "нет связи"}.get(rl.get("err"), "не открывается")
+                note("bad", "Reality на порту %s маскируется под %s, но с сервера этот сайт сейчас не открывается (%s) — кто постучится "
+                            "на порт, увидит ошибку вместо сайта, маскировки нет. Поменяйте в 3X-UI target и SNI на живой сайт.%s"
+                     % (rl.get("port"), sni, why, fit_txt))
+                mine.append({"port": rl.get("port"), "remark": rl.get("remark"), "name": sni, "dead": True, "err": rl.get("err")})
+                continue
+            if rl.get("tls") != "TLSv1.3" or rl.get("alpn") != "h2":
+                note("warn", "Reality на порту %s маскируется под %s, а у него нет %s — Reality нужен сайт с TLS 1.3 и h2.%s"
+                     % (rl.get("port"), sni, "TLS 1.3" if rl.get("tls") != "TLSv1.3" else "h2", fit_txt))
+            try:
+                inside = bool(net and rl.get("ip") and ipaddress.ip_address(rl["ip"]) in net)
+            except ValueError:
+                inside = False
+            pub = rl.get("pub_ips")
+            if pub is not None and rl.get("ip") and rl["ip"] not in pub:
+                # сервер (через DNS хостера) ходит на один адрес, а весь мир видит имя на другом — сайт переехал или DNS подменён
+                inside = False
+                note("warn", "Reality на порту %s маскируется под %s — сайт открывается, но %s. Сервер (через DNS хостера) ходит "
+                             "на %s, где пока отвечает его сертификат; маскировка работает, пока тот адрес жив, а проверка со стороны "
+                             "по общему DNS увидит, что имя указывает не туда.%s"
+                     % (rl.get("port"), sni, ("по общему DNS (1.1.1.1) его имя теперь указывает на %s" % ", ".join(pub[:3])) if pub
+                        else "в общем DNS (1.1.1.1) этого имени больше нет", rl["ip"], fit_txt or " Спокойнее сменить на сайт соседа."))
+                rl = dict(rl, _moved=True)
+            if not inside and not brand_of(sni) and not rl.get("_moved"):
+                note("warn", "Reality на порту %s маскируется под %s — сайт живой, но он не в вашей подсети (сейчас %s). "
+                             "Проверка со стороны увидит, что сертификат %s показывает не его сервер.%s"
+                     % (rl.get("port"), sni, rl.get("ip") or "?", sni, fit_txt or " Спокойнее — сайт соседа по подсети."))
         for n in names[:3]:
             b = brand_of(n)
             same = sum(1 for r in foreign if any(x == n or x.lstrip("*.") == n.split(".", 1)[-1] for x in r["names"]))
-            near = any(n in r["names"] or n == r["name"] for r in genuine)
+            near = inside or any(n in r["names"] or n == r["name"] for r in genuine)
             m = {"port": rl.get("port"), "remark": rl.get("remark"), "name": n, "brand": b, "same": same, "near": near}
             mine.append(m)
             if near:

@@ -46,7 +46,7 @@ for k, v in [("xrayTemplateConfig", json.dumps(tpl)), ("webPort", "15263"), ("su
     db.execute("insert into settings(key, value) values(?, ?)", (k, v))
 db.execute("insert into inbounds values(1,1,0,0,0,'vless',1,0,'',1935,'vless',?,?,'inbound-1935','{}')",
            (json.dumps({"clients": [{"id": "uuid-1", "email": "phone"}], "decryption": "none"}),
-            json.dumps({"network": "tcp", "security": "reality", "realitySettings": {"dest": "www.example.com:443", "privateKey": "TEST", "shortIds": ["ab"]}})))
+            json.dumps({"network": "tcp", "security": "reality", "realitySettings": {"dest": "mask.testbed:443", "serverNames": ["mask.testbed"], "privateKey": "TEST", "shortIds": ["ab"]}})))
 for i, e in enumerate(["phone", "laptop", "tablet"], 1):
     db.execute("insert into clients values(?,?,?,?,1,0,0,'xtls-rprx-vision')", (i, e, "uuid-%d" % i, "sub%d" % i))
     db.execute("insert into client_inbounds values(?,1)", (i,))
@@ -234,6 +234,20 @@ S
   # адреса выходов внутри туннелей (10.8.N.1 — как .1 у awg0 на выходе): SSH «через вход» идёт на них
   for n in 0 1 2; do ip addr show dev lo | grep -q "10.8.$n.1/32" || ip addr add "10.8.$n.1/32" dev lo; done
   # «DC Telegram» 127.0.1.1…5:443 с настоящим первым шагом MTProto; DC5 молчит
+  # «сайт маскировки» Reality: свой CA стенда в системных сертификатах, mask.testbed → 127.0.1.20:443 (TLS 1.3, h2)
+  if [ ! -f /etc/testbed-mask/site.crt ]; then
+    mkdir -p /etc/testbed-mask && cd /etc/testbed-mask
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 3650 -subj "/CN=testbed CA" \
+      -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+    openssl req -newkey rsa:2048 -nodes -keyout site.key -out site.csr -subj "/CN=mask.testbed" 2>/dev/null
+    printf 'subjectAltName=DNS:mask.testbed\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' > san.ext
+    openssl x509 -req -in site.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out site.crt -days 3650 -extfile san.ext 2>/dev/null
+    cp ca.crt /usr/local/share/ca-certificates/testbed-mask.crt && update-ca-certificates >/dev/null 2>&1; cd - >/dev/null
+  fi
+  grep -q 'mask.testbed' /etc/hosts || echo '127.0.1.20 mask.testbed' >> /etc/hosts
+  if ! { [ -f /run/testbed-mask.pid ] && kill -0 "$(cat /run/testbed-mask.pid)" 2>/dev/null; }; then
+    nohup python3 "$HERE/fake-mask-site.py" </dev/null >/dev/null 2>&1 & echo $! > /run/testbed-mask.pid
+  fi
   [ -f /etc/testbed-mtproto.json ] || echo '{"127.0.1.5": "silent"}' > /etc/testbed-mtproto.json
   if ! { [ -f /run/testbed-mtproto.pid ] && kill -0 "$(cat /run/testbed-mtproto.pid)" 2>/dev/null; }; then
     nohup python3 "$HERE/fake-mtproto.py" </dev/null >/dev/null 2>&1 & echo $! > /run/testbed-mtproto.pid
@@ -252,9 +266,9 @@ stop() { [ -f "$ST/app/dash.pid" ] && kill "$(cat "$ST/app/dash.pid")" 2>/dev/nu
 
 down() {
   stop >/dev/null
-  [ -f /run/testbed-mtproto.pid ] && kill "$(cat /run/testbed-mtproto.pid)" 2>/dev/null; rm -f /run/testbed-mtproto.pid
+  for u in mtproto mask; do [ -f /run/testbed-$u.pid ] && kill "$(cat /run/testbed-$u.pid)" 2>/dev/null; rm -f /run/testbed-$u.pid; done
   rm -f /etc/testbed-units
-  rm -f /usr/local/sbin/awg /usr/local/sbin/curl /usr/local/sbin/systemctl /usr/local/sbin/ufw /usr/local/sbin/docker /usr/local/sbin/ping /etc/testbed-quality.json /etc/testbed-ipregion.json /etc/testbed-ipregion-mm.json /etc/testbed-ipregion-rep.json /etc/testbed-ipregion-ai.json /etc/testbed-neighbors.json /etc/testbed-dns.json /etc/testbed-awg-mimic-bad /etc/testbed-sites.json /etc/testbed-ufw.json /etc/testbed-ufw-break /etc/testbed-docker.json /etc/testbed-mtproto.json /etc/testbed-dpi.json /etc/testbed-blockcheck.txt /etc/testbed-blockcheck-pace /etc/testbed-zapret-bad /etc/testbed-zapret-nohelp
+  rm -f /usr/local/sbin/awg /usr/local/sbin/curl /usr/local/sbin/systemctl /usr/local/sbin/ufw /usr/local/sbin/docker /usr/local/sbin/ping /etc/testbed-quality.json /etc/testbed-ipregion.json /etc/testbed-ipregion-mm.json /etc/testbed-ipregion-rep.json /etc/testbed-ipregion-ai.json /etc/testbed-neighbors.json /etc/testbed-dns.json /etc/testbed-awg-mimic-bad /etc/testbed-sites.json /etc/testbed-ufw.json /etc/testbed-ufw-break /etc/testbed-docker.json /etc/testbed-mtproto.json /etc/testbed-dpi.json /etc/testbed-blockcheck.txt /etc/testbed-blockcheck-pace /etc/testbed-zapret-bad /etc/testbed-zapret-nohelp /etc/testbed-mask-dead
   rm -rf /opt/zapret2 /etc/systemd/system/zapret2.service /root/vpn-zapret.sh
   nft delete table inet vpn_dash_gov 2>/dev/null; rm -rf /etc/vpn-dash /etc/systemd/system/vpn-dash-govblock.service /etc/testbed-govblock-v4.txt /etc/testbed-govblock-v6.txt /root/.vpn-dash-gov-undo*
   pkill -x sshd || true

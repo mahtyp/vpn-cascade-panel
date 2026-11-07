@@ -495,6 +495,61 @@ def gov_info():
             "undo": os.path.exists("/root/.vpn-dash-gov-undo"), "drops": drops, "meta": m}
 
 
+def reality_mask():
+    """Под какой сайт маскируется Reality и открывается ли он С ЭТОГО СЕРВЕРА так, как его будет открывать Xray для
+    чужих (проверка со стороны, сканер ТСПУ): TLS 1.3, h2, настоящий сертификат на имя из serverNames.
+    Сайт пропал или сертификат не тот — Reality остаётся без «прикрытия», проверка увидит ошибку вместо сайта."""
+    import ssl
+    out = []
+    try:
+        db = sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True, timeout=5)
+        rows = db.execute("select port, remark, stream_settings from inbounds where enable=1").fetchall()
+    except Exception:
+        return out
+    for port, remark, ss in rows:
+        try:
+            st = json.loads(ss or "{}")
+        except ValueError:
+            continue
+        if st.get("security") != "reality":
+            continue
+        r = st.get("realitySettings") or {}
+        names = [n for n in r.get("serverNames") or [] if n]
+        dest = str(r.get("target") or r.get("dest") or "").strip()
+        m = re.match(r"^\[?([^\]]+?)\]?(?::(\d+))?$", dest)
+        if not dest or dest.startswith(("/", "@")) or not m:
+            out.append({"port": port, "remark": remark, "names": names, "dest": dest, "skip": True})
+            continue
+        host, dport = m.group(1), int(m.group(2) or 443)
+        sni = names[0] if names else host
+        it = {"port": port, "remark": remark, "names": names, "dest": dest, "sni": sni}
+        t0 = time.time()
+        try:
+            ctx = ssl.create_default_context()
+            ctx.set_alpn_protocols(["h2", "http/1.1"])
+            with socket.create_connection((host, dport), timeout=5) as sock:
+                sock.settimeout(6)
+                with ctx.wrap_socket(sock, server_hostname=sni) as t:
+                    na = (t.getpeercert() or {}).get("notAfter")
+                    it.update(ok=True, tls=t.version(), alpn=t.selected_alpn_protocol(), ip=t.getpeername()[0],
+                              ms=int((time.time() - t0) * 1000),
+                              days=int((ssl.cert_time_to_seconds(na) - time.time()) // 86400) if na else None)
+        except ssl.SSLCertVerificationError as e:
+            it.update(ok=False, err="cert", why=str(getattr(e, "verify_message", "") or e)[:120])
+        except socket.gaierror:
+            it.update(ok=False, err="dns")
+        except socket.timeout:
+            it.update(ok=False, err="timeout")
+        except ConnectionRefusedError:
+            it.update(ok=False, err="refused")
+        except ssl.SSLError as e:
+            it.update(ok=False, err="tls", why=str(e)[:120])
+        except OSError as e:
+            it.update(ok=False, err="net", why=str(e)[:120])
+        out.append(it)
+    return out[:6]
+
+
 def web_info():
     """Где слушает веб-панель 3X-UI. Путь панели нужен нашей панели, чтобы открыть её через SSH; на страницу он не уходит."""
     if not os.path.exists("/etc/x-ui/x-ui.db"):
@@ -1219,7 +1274,7 @@ else:
     data["exit"] = exit_info()
     # вход — туннели до выходов или 3X-UI на сервере, который сам не выход AmneziaWG
     if glob.glob(AWG_DIR + "/wg*.conf") or os.path.exists("/etc/x-ui/x-ui.db") and not data["exit"].get("awg"):
-        data["entry"] = {"awg": awg_clients(), "xui": xui()}
+        data["entry"] = {"awg": awg_clients(), "xui": xui(), "mask": reality_mask()}
     data["web"] = web_info()
     data["gov"] = gov_info()
     data["sw"] = sw_versions()
