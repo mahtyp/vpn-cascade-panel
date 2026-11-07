@@ -78,7 +78,7 @@
 - `ipcheck.py` — «как видят адрес»: на сервер шлётся `RUNNER` с base64 копии `server-scripts/third_party/ipregion.sh`
   (vernette/ipregion, проверенный коммит — см. README там; обновлять только прочитав diff), запуск `runuser -u nobody --json -4`,
   заменители `column`/`nslookup`, владелец сети — MaxMind. `summarize()` → пометки. ИИ (ChatGPT/Claude/Copilot/Grok — коды ответов API без ключа, Gemini — из ipregion) и
-  хостинг/VPN (ip-api demo, ipinfo widget, proxycheck) — свой код в `RUNNER` по образцу XaksFlaX/ipregion-fixed, `ai`/`net`. Задача `geo` (`start_geo`, `/api/geo`; в мастере —
+  хостинг/VPN (ip-api demo, ipinfo widget, proxycheck) — свой код в `RUNNER` по образцу XaksFlaX/ipregion-fixed, `ai`/`net`. AbuseIPDB — только с ПК по API с ключом (`ipcheck.abuse_api`, keyring `_abuseipdb_key`, «Настройки» → `/api/abusekey`; без ключа строки нет; стенд — `/etc/testbed-abuseipdb.json`). Задача `geo` (`start_geo`, `/api/geo`; в мастере —
   `/api/prov/start` kind geo), итог в `Dash.geo` → снимок `geo`. На стенде — готовый ответ `/etc/testbed-ipregion*.json` (ИИ и хостинг/VPN — `-ai.json`). Без jq: `mv /usr/bin/jq /usr/bin/jq.testbed-off` — кнопка установки на стенде его возвращает.
 - Раздел «Качество» (`#/addr`, `renderAddr`): у каждого сервера «как видят» (geo) и «соседи» (nb), итоги `Dash.geo`/`Dash.nb`
   хранятся в `addrcheck.json` (.gitignore), в снимке `geo`, `nb`, `addrjobs`. `neighbors.py` — «шумные соседи»: /24 сервера
@@ -111,7 +111,7 @@
   `vpn-exit-setup.sh` и `vpn-restore.sh`: `Provision.put` кладёт его рядом сам. `vpn-pin-chain.sh` берёт из `vpn-add-exit.sh`
   `xui_db_backup` / `xui_start_or_rollback` (копия базы 3X-UI и откат, если Xray не поднялся).
 - Общее без повторов: `jsonline.last_json` — итог скрипта с сервера (последняя строка JSON) для ipcheck/neighbors/dnscheck;
-  `ipcheck.abuse_parse` (её текст уходит и в RUNNER); `quality.run_bg`; `provision.first_steps`; `dash.probe_func(имя)` — текст функции из probe.py для маленьких скриптов на сервер.
+  `quality.run_bg`; `provision.first_steps`; `dash.probe_func(имя)` — текст функции из probe.py для маленьких скриптов на сервер.
 
 Каскад: устройство → вход (3X-UI/Xray, VLESS Reality) → выходы через AmneziaWG (wg0, wg1, …, исходящие
 `AWG-ИМЯ` — freedom с sockopt.interface); цепочка резерва — балансировщики 3X-UI с fallbackTag

@@ -916,6 +916,27 @@ class Dash:
                 return
             threading.Thread(target=self.remote_srv.serve_forever, daemon=True).start()
 
+    def abuse_key(self, body):
+        """Сохранить/удалить ключ AbuseIPDB. Перед сохранением — пробный запрос (1 из 1000 в сутки)."""
+        import ipcheck
+        if body.get("action") == "clear":
+            self.cfg.set_pw(ipcheck.ABUSE_KEY, "")
+            return {"ok": True, "msg": "Ключ удалён — строки AbuseIPDB в «Качестве» больше не будет."}
+        key = str(body.get("key") or "").strip()
+        if not re.match(r"^[A-Za-z0-9]{32,128}$", key):
+            return {"error": "Это не похоже на ключ AbuseIPDB: там длинная строка из латинских букв и цифр, без пробелов."}
+        stand = os.environ.get("VPN_DASH_STAND") == "1"
+        r = ipcheck.abuse_api("1.1.1.1", key, "/etc/testbed-abuseipdb.json" if stand else "")
+        if r.get("code") in (401, 403):
+            return {"error": "AbuseIPDB не принял ключ (ответ %s) — проверь, что скопировал его целиком." % r["code"]}
+        where = self.cfg.set_pw(ipcheck.ABUSE_KEY, key)
+        msg = ("Ключ работает и сохранён." if r.get("code") == 200
+               else "Ключ сохранён, но на сегодня лимит запросов уже исчерпан — заработает завтра." if r.get("code") == 429
+               else "Ключ сохранён, но проверить его не получилось (AbuseIPDB не ответил) — станет видно при следующей проверке «как видят».")
+        if where != "keyring":
+            msg += " Хранилища паролей нет — ключ забудется после перезапуска панели."
+        return {"ok": True, "msg": msg + " Обнови «как видят» в «Качестве»."}
+
     def remote_api(self, body):
         a = body.get("action")
         rc = self.remote_cfg()
@@ -2181,6 +2202,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                 "reach": list(self.reach.values()), "running": sorted(self.running),
                 "log": self.log[-60:][::-1], "settings": self.cfg.settings,
                 "keyring": bool(keyring), "slow_s": float(self.cfg.settings.get("slow_s") or 2),
+                "abuse_key": bool(self.cfg.get_pw("_abuseipdb_key")),
                 "hs_stale_s": 60 * int(self.cfg.settings.get("hs_stale_min") or 5),
                 "schema": [dict(zip(("key", "default", "type", "min", "max", "group", "label", "help"), x)) for x in SETTINGS],
                 "platform": os.name, "port_now": PORT, "boot": BOOT_ID, "can_restart": bool(self.on_restart),
@@ -2951,6 +2973,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send(409, {"error": str(e)})
             return self._send(200, {"ok": True, "job": jid})
+        if p == "/api/abusekey":                 # ключ AbuseIPDB для «Качества» — только в keyring, на страницу не уходит
+            return self._send(200, D.abuse_key(body))
         if p == "/api/remote":
             if self.remote:
                 return self._send(403, {"error": "удалённый доступ настраивается только на домашнем компьютере"})

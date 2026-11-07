@@ -754,6 +754,17 @@ function renderSettings() {
       : `<span class="muted">Панель установлена из архива, не из GitHub — обновлять её можно только новым архивом. Как перейти на обновления из GitHub — в README.</span>`}
     <div id="upd-msg" class="sm"></div></div></section>`;
   h += `<section class="card" id="remote-box"><div class="head"><h3>Удалённый доступ</h3><span class="sm muted">через Tailscale — с работы или телефона</span></div><div class="empty">Загружаю…</div></section>`;
+  h += `<section class="card"><div class="head"><h3>AbuseIPDB</h3><span class="sm muted">жалобы на адреса серверов — в «Качестве»</span></div>
+    <div style="padding:12px 18px 16px;display:flex;flex-direction:column;gap:10px">
+    <span class="sm">AbuseIPDB показывает, жаловались ли на адрес сервера (спам, взломы, сканирование). Сам сайт защищён Cloudflare и скрипты не пускает,
+      поэтому панель спрашивает его официальный API — нужен бесплатный ключ (1000 проверок в сутки, панели хватит с запасом):
+      зарегистрируйся на <a href="https://www.abuseipdb.com/register" target="_blank" rel="noopener noreferrer">abuseipdb.com</a>, потом в аккаунте
+      <b>API</b> → <b>Create Key</b> и вставь ключ сюда. Он хранится в Диспетчере учётных данных Windows, как пароли серверов, и уходит только в AbuseIPDB.</span>
+    <span class="sm">${S.abuse_key ? '<b style="color:var(--ok)">Ключ сохранён.</b>' : '<span class="dim">Ключа нет — строки AbuseIPDB в «Качестве» не будет.</span>'}</span>
+    <div class="row" style="gap:8px"><input id="abuse-key" type="password" autocomplete="off" spellcheck="false" class="mono" style="flex:1;min-width:220px"
+      placeholder="${S.abuse_key ? "новый ключ, если хочешь заменить" : "вставь ключ"}" aria-label="Ключ AbuseIPDB">
+      <button class="btn primary" data-act="abuse-key-save">Сохранить ключ</button>${S.abuse_key ? '<button class="btn" data-act="abuse-key-clear">Удалить ключ</button>' : ""}</div>
+    <div class="msg" id="abuse-msg" style="padding:0"></div></div></section>`;
   if (st.port !== S.port_now) h += `<div class="banner">Панель сейчас работает на порту ${S.port_now}, в настройках — ${esc(st.port)}. Чтобы перейти: меню значка в трее → «Выход», потом start.bat.</div>`;
   for (const g of groups) {
     h += `<section class="card"><div class="head"><h3>${esc(g.name)}</h3></div><div class="form setform">`;
@@ -1285,9 +1296,11 @@ function geoView(g, at, fold) {
     ${g.rep ? (() => {
       const ab = g.rep.abuse || {}, sc = g.rep.scam || {}, lv = (v, w, b) => v == null ? "var(--dim)" : v >= b ? "var(--bad)" : v >= w ? "var(--warn)" : "var(--ok)";
       const why = (x) => x.code === 403 || x.code === 429 ? "сайт не пустил сервер (" + x.code + ")" : x.code && x.code !== 200 ? "ответ " + x.code : x.code === 0 ? "не открылся" : "не разобрал ответ";
+      const abWhy = (x) => x.code === 401 || x.code === 403 ? "ключ не подходит — проверь в «Настройках»" : x.code === 429 ? "лимит запросов на сегодня исчерпан" : x.code === 0 ? "не ответил" : why(x);
+      const abTip = "AbuseIPDB: жалобы на адрес за 90 дней (спам, взломы, сканирование) и уверенность, что он вредный" + (ab.last ? ". Последняя жалоба " + ab.last : "") + (ab.usage ? ". Тип: " + ab.usage : "") + (ab.isp ? ", " + ab.isp : "");
       const riskRu = { low: "низкий", medium: "средний", high: "высокий", "very high": "очень высокий" };
       return `<div class="row" style="gap:6px 18px;font-size:13px"><span>Репутация адреса:</span>
-        <span title="AbuseIPDB: жалобы на адрес (спам, взломы) и уверенность, что он вредный">AbuseIPDB — ${ab.conf != null ? `<b style="color:${lv(ab.conf, 25, 75)}">${ab.reports != null ? "жалоб " + ab.reports + ", " : ""}вредный на ${ab.conf}%</b>${ab.pc ? ' <span class="dim" title="Сервер AbuseIPDB не пустил — спросили с этого компьютера">(с этого ПК)</span>' : ""}` : `<span class="dim">${esc(why(ab))}</span>`}</span>
+        ${g.rep.abuse ? `<span title="${esc(abTip)}">AbuseIPDB — ${ab.conf != null ? `<b style="color:${lv(ab.conf, 25, 75)}">${ab.reports ? "жалоб " + ab.reports + (ab.users ? " от " + ab.users + " чел." : "") + ", вредный на " + ab.conf + "%" : ab.conf ? "вредный на " + ab.conf + "%" : "жалоб нет"}</b>` : `<span class="dim">${esc(abWhy(ab))}</span>`}</span>` : ""}
         ${g.rep.sfs && g.rep.sfs.code === 200 && g.rep.sfs.appears != null ? `<span title="StopForumSpam: база адресов, с которых спамили на форумах и в регистрациях">StopForumSpam — ${g.rep.sfs.appears ? `<b style="color:var(--warn)">есть, записей ${g.rep.sfs.freq}${g.rep.sfs.last ? ", последняя " + esc(g.rep.sfs.last) : ""}</b>` : `<b style="color:var(--ok)">нет в базе</b>`}</span>` : ""}
         <span title="Scamalytics: оценка риска мошенничества с этого адреса, 0–100">Scamalytics — ${sc.score != null ? `<b style="color:${lv(sc.score, 25, 75)}">риск ${sc.score}/100${sc.risk ? " (" + esc(riskRu[sc.risk] || sc.risk) + ")" : ""}</b>` : `<span class="dim">${esc(why(sc))}</span>`}</span></div>`;
     })() : ""}
@@ -2527,6 +2540,16 @@ document.addEventListener("click", async (ev) => {
     const p1 = $("#rm-pw1").value, p2 = $("#rm-pw2").value, m = $("#rm-msg");
     if (p1 !== p2) { m.className = "msg bad"; m.textContent = "Пароли не совпадают."; return; }
     await remoteLoad("set_pw", { password: p1 }); return;
+  }
+  if (a === "abuse-key-save" || a === "abuse-key-clear") {
+    const inp = $("#abuse-key"), m = $("#abuse-msg");
+    if (a === "abuse-key-clear" && !confirm("Удалить ключ AbuseIPDB из панели?")) return;
+    m.className = "msg"; m.textContent = a === "abuse-key-save" ? "Проверяю ключ…" : "";
+    const r = await api("/api/abusekey", a === "abuse-key-save" ? { action: "set", key: inp.value } : { action: "clear" });
+    if (r.error) { m.className = "msg bad"; m.textContent = r.error; return; }
+    S = await api("/api/state"); renderSettings();
+    const m2 = $("#abuse-msg"); m2.className = "msg ok"; m2.textContent = r.msg;
+    return;
   }
   if (a === "rm-totp") { await remoteLoad("totp_new"); return; }
   if (a === "rm-test") { await remoteLoad("test", { password: $("#rm-t-pw").value, code: $("#rm-t-code").value }); return; }

@@ -199,11 +199,12 @@ class Provisioner:
             raw = None
         if not raw:
             raise Stop("проверка не ответила: %s" % ((err.strip().splitlines() or ["код %s" % rc])[-1][:200]))
-        ab = (raw.get("rep") or {}).get("abuse") or {}
-        if raw.get("rep") is not None and ab.get("conf") is None and not STAND:   # сервер не пустили — спросим с этого ПК
-            pc = ipcheck.abuse_from_pc(((raw.get("ipr") or {}).get("ipv4")) or (raw.get("mm") or {}).get("ip"))
-            if pc and pc.get("conf") is not None:
-                raw["rep"]["abuse"] = pc
+        if raw.get("rep") is not None:     # AbuseIPDB — с этого ПК по ключу из «Настроек»; без ключа строки нет
+            raw["rep"].pop("abuse", None)
+            key = self.d.cfg.get_pw(ipcheck.ABUSE_KEY)
+            if key:
+                raw["rep"]["abuse"] = ipcheck.abuse_api(((raw.get("ipr") or {}).get("ipv4")) or (raw.get("mm") or {}).get("ip"), key,
+                                                        "/etc/testbed-abuseipdb.json" if STAND else "")
         sm = ipcheck.summarize(raw)
         job.result = {"geo": sm}
         if sm.get("error"):

@@ -9,6 +9,7 @@
 по образцу XaksFlaX/ipregion-fixed (MIT), написаны здесь же, в RUNNER; Gemini — из ipregion.
 """
 import base64
+import json
 import re
 from pathlib import Path
 from jsonline import last_json
@@ -77,7 +78,7 @@ try:
                          "ip": tr.get("ip_address")}
     except Exception as e:
         out["mm"] = {"error": str(e)[:120]}
-    # репутация адреса: открытые страницы AbuseIPDB (жалобы) и Scamalytics (оценка мошенничества)
+    # репутация адреса: Scamalytics (оценка мошенничества) и StopForumSpam; AbuseIPDB — с ПК по ключу (abuse_api)
     import re
     ip = ((out.get("ipr") or {}).get("ipv4")) or (out.get("mm") or {}).get("ip")
     rep = out["rep"] = {}
@@ -97,8 +98,6 @@ try:
                 return e.code, ""
             except Exception as e:
                 return 0, str(e)[:100]
-        code, html = page("https://www.abuseipdb.com/check/" + ip)
-        rep["abuse"] = dict(abuse_parse(html), code=code)
         code, html = page("https://scamalytics.com/ip/" + ip)
         sc = {"code": code}
         m = re.search(r'"score"\s*:\s*"?(\d+)', html) or re.search(r"Fraud Score:?\s*(?:<[^>]+>\s*)*(\d+)", html, re.I)
@@ -214,27 +213,10 @@ print(json.dumps(out, ensure_ascii=False))
 '''
 
 
-def abuse_parse(html):
-    """Страница AbuseIPDB → {reports, conf}. Та же функция работает и на сервере: её текст уходит в RUNNER."""
-    import re
-    txt = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html or ""))
-    if re.search(r"was not found in our database", txt, re.I):
-        return {"reports": 0, "conf": 0}
-    a = {}
-    m = re.search(r"reported (?:a total of )?([\d,]+) times?", txt, re.I)
-    c = re.search(r"Confidence of Abuse is ?(\d+) ?%", txt, re.I)
-    if m:
-        a["reports"] = int(m.group(1).replace(",", ""))
-    if c:
-        a["conf"] = int(c.group(1))
-    return a
-
-
 def runner(fake=""):
     """Текст для python3 - на сервере. fake — путь к готовому ответу (стенд)."""
     data = base64.b64encode(IPR_FILE.read_bytes()).decode()
-    import inspect
-    return "IPR = %r\nFAKE = %r\n" % (data, fake) + inspect.getsource(abuse_parse) + RUNNER
+    return "IPR = %r\nFAKE = %r\n" % (data, fake) + RUNNER
 
 
 # программы для ipregion → пакеты Debian/Ubuntu (ставятся только по кнопке с подтверждением)
@@ -374,7 +356,7 @@ def summarize(raw):
     if sfs.get("appears"):
         note("warn" if (sfs.get("conf") or 0) < 50 else "bad", "адрес есть в базе спамеров StopForumSpam: %d записей, последняя %s — "
              "форумы и регистрации могут его не пускать" % (sfs.get("freq") or 0, sfs.get("last") or "?"))
-    reput = {"abuse": ab, "scam": scm, "sfs": sfs} if rp else None
+    reput = dict({"abuse": ab} if "abuse" in rp else {}, scam=scm, sfs=sfs) if rp else None   # abuse — только с ключом
     shown = [k for k in KEY_SERVICES if k in svc and k != "Gemini Supported"]   # Gemini — в строке «ИИ»
     return {"ip": ipr.get("ipv4") or mm.get("ip"), "registered": reg, "rep": reput, "asn": mm.get("asn"), "org": mm.get("org"),
             "country": main, "votes": order, "geo": geo, "cdn": cdn, "ai": ai, "net": net,
@@ -382,26 +364,37 @@ def summarize(raw):
             "notes": notes, "warn": raw.get("error"), "miss": raw.get("miss") or []}
 
 
-def abuse_from_pc(ip):
-    """AbuseIPDB за Cloudflare часто не пускает запросы из датацентров — тогда спрашиваем с этого компьютера."""
+ABUSE_API = "https://api.abuseipdb.com/api/v2/check"
+ABUSE_KEY = "_abuseipdb_key"      # имя в keyring (Диспетчер учётных данных Windows)
+
+
+def abuse_api(ip, key, fake=""):
+    """AbuseIPDB по официальному API — с этого компьютера, с бесплатным ключом (страница сайта за Cloudflare
+    серверы и скрипты не пускает). fake — готовый ответ API (стенд). → {code, conf, reports, users, last, usage, isp}"""
     import urllib.error
+    import urllib.parse
     import urllib.request
     if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip or ""):
-        return None
-    rq = urllib.request.Request("https://www.abuseipdb.com/check/" + ip, headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
-        "Accept": "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.8"})
-    a = {"pc": True}
+        return {"code": 0}
+    a = {}
     try:
-        with urllib.request.urlopen(rq, timeout=15) as f:
-            a["code"], html = f.status, f.read(600000).decode("utf-8", "replace")
+        if fake:
+            j = json.loads(open(fake, encoding="utf-8").read())
+            a["code"] = int(j.pop("_code", 200))
+        else:
+            rq = urllib.request.Request(ABUSE_API + "?" + urllib.parse.urlencode({"ipAddress": ip, "maxAgeInDays": 90}),
+                                        headers={"Key": key, "Accept": "application/json", "User-Agent": "vpn-dash"})
+            with urllib.request.urlopen(rq, timeout=15) as f:
+                a["code"], j = f.status, json.loads(f.read(200000).decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
-        a["code"] = e.code
-        return a
+        return {"code": e.code}
     except Exception:  # noqa: BLE001
-        a["code"] = 0
-        return a
-    a.update(abuse_parse(html))
+        return {"code": 0}
+    d = (j.get("data") or {}) if a["code"] == 200 else {}
+    if d.get("abuseConfidenceScore") is not None:
+        a.update(conf=int(d["abuseConfidenceScore"]), reports=int(d.get("totalReports") or 0),
+                 users=int(d.get("numDistinctUsers") or 0), last=(d.get("lastReportedAt") or "")[:10],
+                 usage=str(d.get("usageType") or "")[:60], isp=str(d.get("isp") or "")[:80])
     return a
 
 
