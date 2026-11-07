@@ -312,9 +312,11 @@ class Provisioner:
         try:
             rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.reality_script(), timeout=90)
             reality = (neighbors.parse(out) or {}).get("reality") or []
-            for r in reality:      # как имя видит весь мир (DoH 1.1.1.1 с этого ПК) — сервер-то спрашивает DNS своего хостера
+            for r in reality:      # как имя видят публичные DNS (DoH Яндекса/Google/Cloudflare с этого ПК) — сервер спрашивает DNS хостера
                 if r.get("sni") and not STAND:
-                    r["pub_ips"] = neighbors._resolve(r["sni"])
+                    got = neighbors.doh_ips(r["sni"])
+                    if got:            # никто не ответил — не сравниваем
+                        r["pub_ips"], r["pub_by"] = sorted(set().union(*got.values())), list(got)
             dead = [r for r in reality if r.get("ok") is False]
             job.end("mask", "warn" if dead else "ok", ", ".join("порт %s → %s%s" % (r["port"], ", ".join(r["names"]) or r["dest"] or "?",
                                                                      " (не открывается!)" if r.get("ok") is False else "") for r in reality)

@@ -4,12 +4,11 @@
 как сканеры ТСПУ) — и смотрит, на какие имена выдан сертификат. Сертификат известного сайта (Google, Microsoft, VK, Max…) на адресе
 хостера — почти наверняка VLESS Reality, который маскируется под этот сайт: такой же VPN, как наш. Чем их
 больше, тем «шумнее» подсеть: ТСПУ такие замечает и может закрыть её целиком.
-Настоящий сайт соседа — когда DNS его имени (через DoH 1.1.1.1) указывает именно на этот адрес. Такие с TLS 1.3 и
+Настоящий сайт соседа — когда DNS его имени (DoH Яндекса, Google или Cloudflare) указывает именно на этот адрес. Такие с TLS 1.3 и
 h2 — лучшие кандидаты для маскировки Reality: сайт по соседству, а не «гугл у хостера».
 С сервера только читается, под какой сайт маскируется Reality (база 3X-UI), и открывается ли этот сайт оттуда
 (reality_script → probe.reality_mask). Ничего не меняет.
 """
-import json
 import re
 from jsonline import last_json
 
@@ -116,17 +115,64 @@ def _scan_one(ip):
     return h
 
 
-def _resolve(name):
-    """A-записи имени: DoH 1.1.1.1 (как видит мир), иначе DNS этого компьютера."""
+DOH = [("Яндекс", "https://common.dot.dns.yandex.net/dns-query"),   # как имя видят в России и за её пределами
+       ("Google", "https://dns.google/dns-query"),
+       ("Cloudflare", "https://cloudflare-dns.com/dns-query")]
+
+
+def _doh_a(url, name):
+    """A-записи имени через DoH (RFC 8484, POST). → [адреса] ([] — имени нет) или None — сервис не ответил."""
     import socket
+    import struct
     import urllib.request
     try:
-        rq = urllib.request.Request("https://1.1.1.1/dns-query?name=%s&type=A" % name, headers={"Accept": "application/dns-json"})
-        j = json.loads(urllib.request.urlopen(rq, timeout=6).read().decode())
-        if j.get("Status") == 0:
-            return [a["data"] for a in j.get("Answer") or [] if a.get("type") == 1]
+        q = b"".join(bytes([len(p)]) + p.encode("idna") for p in name.rstrip(".").split(".")) + b"\0"
+        rq = urllib.request.Request(url, data=struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1),
+                                    headers={"Content-Type": "application/dns-message", "Accept": "application/dns-message"})
+        b = urllib.request.urlopen(rq, timeout=6).read()
+
+        def skip(i):
+            while b[i]:
+                if b[i] & 0xC0 == 0xC0:
+                    return i + 2
+                i += b[i] + 1
+            return i + 1
+        fl, qd, an = struct.unpack(">HHH", b[2:8])
+        if fl & 0xF == 3:          # NXDOMAIN — имени нет
+            return []
+        if fl & 0xF:
+            return None
+        i = 12
+        for _ in range(qd):
+            i = skip(i) + 4
+        ips = []
+        for _ in range(an):
+            i = skip(i)
+            t, _c, _ttl, ln = struct.unpack(">HHIH", b[i:i + 10])
+            i += 10
+            if t == 1 and ln == 4:
+                ips.append(socket.inet_ntoa(b[i:i + 4]))
+            i += ln
+        return ips
     except Exception:  # noqa: BLE001
-        pass
+        return None
+
+
+def doh_ips(name):
+    """Как имя видят Яндекс, Google и Cloudflare (DoH с этого компьютера). → {сервис: [адреса]} только по ответившим."""
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(len(DOH)) as ex:
+        got = dict(zip([k for k, _ in DOH], ex.map(lambda d: _doh_a(d[1], name), DOH)))
+    return {k: v for k, v in got.items() if v is not None}
+
+
+def _resolve(name):
+    """A-записи имени: всё, что ответили DoH Яндекса/Google/Cloudflare (у сайтов на CDN адреса зависят от того, кто
+    спрашивает), иначе DNS этого компьютера."""
+    import socket
+    got = doh_ips(name)
+    if got:
+        return sorted(set().union(*got.values()))
     try:
         return sorted({a[4][0] for a in socket.getaddrinfo(name, 443, socket.AF_INET)})
     except Exception:  # noqa: BLE001
@@ -282,14 +328,19 @@ def summarize(raw):
             except ValueError:
                 inside = False
             pub = rl.get("pub_ips")
-            if pub is not None and rl.get("ip") and rl["ip"] not in pub:
-                # сервер (через DNS хостера) ходит на один адрес, а весь мир видит имя на другом — сайт переехал или DNS подменён
+            try:     # у сайтов на CDN адрес зависит от того, кто спрашивает: «не туда» — только если и подсеть другая
+                near_pub = any(ipaddress.ip_address(rl["ip"]) in ipaddress.ip_network(a + "/24", strict=False) for a in pub or [])
+            except (ValueError, KeyError, TypeError):
+                near_pub = False
+            if pub is not None and rl.get("ip") and not near_pub:
+                # сервер (через DNS хостера) ходит на один адрес, а публичные DNS дают имя совсем в другом месте
                 inside = False
+                by = "/".join(rl.get("pub_by") or ["Яндекс", "Google", "Cloudflare"])
                 note("warn", "Reality на порту %s маскируется под %s — сайт открывается, но %s. Сервер (через DNS хостера) ходит "
-                             "на %s, где пока отвечает его сертификат; маскировка работает, пока тот адрес жив, а проверка со стороны "
-                             "по общему DNS увидит, что имя указывает не туда.%s"
-                     % (rl.get("port"), sni, ("по общему DNS (1.1.1.1) его имя теперь указывает на %s" % ", ".join(pub[:3])) if pub
-                        else "в общем DNS (1.1.1.1) этого имени больше нет", rl["ip"], fit_txt or " Спокойнее сменить на сайт соседа."))
+                             "на %s, где пока отвечает его сертификат; маскировка работает, пока тот адрес жив, но похоже, что "
+                             "сайт переехал, и проверка со стороны увидит, что имя указывает не туда.%s"
+                     % (rl.get("port"), sni, ("по публичным DNS (%s) его имя указывает на %s" % (by, ", ".join(pub[:3]))) if pub
+                        else "в публичных DNS (%s) этого имени нет" % by, rl["ip"], fit_txt or " Спокойнее сменить на сайт соседа."))
                 rl = dict(rl, _moved=True)
             if not inside and not brand_of(sni) and not rl.get("_moved"):
                 note("warn", "Reality на порту %s маскируется под %s — сайт живой, но он не в вашей подсети (сейчас %s). "
