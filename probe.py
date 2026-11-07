@@ -1031,6 +1031,8 @@ def site_check(urls, channels, diag=False):
     def curl(u, ch, resolve=None):
         a = ["curl", "-4", "-s", "-m", "10", "-o", "/dev/null", "-A", "Mozilla/5.0",
              "-w", "%{http_code} %{time_total} %{remote_ip}"]
+        if u.startswith("https://api.anthropic.com/v1/"):   # API без ключа: 401 — пускает, 403 — не пускает по стране
+            a += ["-X", "POST", "-H", "anthropic-version: 2023-06-01", "-H", "content-type: application/json", "-d", "{}"]
         if ch.get("iface"):
             a += ["--interface", ch["iface"]]
             if not resolve:

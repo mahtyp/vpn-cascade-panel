@@ -10,7 +10,8 @@ import re
 import time
 
 # Готовые сервисы: что проверять и каким правилом пускать в обход.
-#   urls: (адрес, что считать успехом): "page" — страница (<400, 403/451 — «не пускает»), "reach" — любой ответ
+#   urls: (адрес, что считать успехом): "page" — страница (<400, 403/451 — «не пускает»), "reach" — любой ответ,
+#   "api" — API без ключа (POST, см. probe: 401/400 — пускает, 403/451 — «не пускает» по стране)
 SERVICES = {
     "youtube": {"title": "YouTube", "code": "YT",
                 "urls": [("https://www.youtube.com/", "page"), ("https://redirector.googlevideo.com/generate_204", "reach"),
@@ -32,7 +33,9 @@ SERVICES = {
                  "parts": ["сайт", "веб-версия"],
                  "match": {"domain": ["domain:whatsapp.com", "domain:whatsapp.net", "domain:wa.me"]}},
     "claude": {"title": "Claude", "code": "CLAUDE",
-               "urls": [("https://claude.ai/", "page"), ("https://api.anthropic.com/", "reach")],
+               # claude.ai за защитой Cloudflare: curl'у отдаёт 403 из любой страны — сайт проверяем только на «открывается»,
+               # а пускает ли по стране — по API без ключа (как в «как видят»): 401 — пускает, 403 «Request not allowed» — нет
+               "urls": [("https://claude.ai/", "reach"), ("https://api.anthropic.com/v1/messages", "api")],
                "parts": ["сайт", "API"],
                "match": {"domain": ["domain:claude.ai", "domain:claude.com", "domain:anthropic.com",
                                     "domain:claudeusercontent.com"]}},
@@ -76,8 +79,10 @@ def judge(r, need):
     c, t = r.get("code") or 0, r.get("t") or 0
     if not c:
         return "bad", "нет ответа"
-    if need == "page" and c in (403, 451):
+    if need in ("page", "api") and c in (403, 451):
         return "denied", "%d не пускает" % c
+    if need == "api" and c not in (200, 400, 401, 404, 405, 429):
+        return "warn", "ответ %d" % c
     if need == "page" and c >= 500:
         return "warn", "ответ %d" % c
     return ("ok" if t < 2 else "slow"), ("%.1f с" % t).replace(".", ",")
