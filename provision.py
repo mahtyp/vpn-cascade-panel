@@ -967,7 +967,12 @@ class Provisioner:
             link = {"a": an, "b": b["name"], "down": float(dm.group(1)) if dm else None, "up": float(um.group(1)) if um else None}
             res["links"].append(link)
             f = lambda v: "%.0f Мбит/с" % v if v is not None else "—"   # noqa: E731
-            job.end(key, "ok" if dm and um else "warn", "%s → %s %s, %s → %s %s" % (b["name"], an, f(link["down"]), an, b["name"], f(link["up"])))
+            stall = re.search(r"^UP .*STALL", tail, re.M)
+            link["stall"] = bool(stall)
+            job.end(key, "ok" if dm and um and not stall else "warn", "%s → %s %s, %s → %s %s%s" % (
+                b["name"], an, f(link["down"]), an, b["name"], f(link["up"]),
+                ": поток в эту сторону завис — так бывает, когда ТСПУ режет TCP до зарубежных хостеров; туннель AWG идёт по UDP, "
+                "его это может не задевать — проверьте канал после установки" if stall else ""))
 
     # ------------------------------------------------------------ установка выхода
     def _install(self, job, password):
@@ -1335,8 +1340,18 @@ for i in 1 2 3; do
 done
 t0=$(date +%%s.%%N); n=$(timeout 90 $S 'head -c 52428800 /dev/zero' | wc -c); t1=$(date +%%s.%%N)
 python3 -c "t=$t1-$t0; d=max(t-$h, t/2, 0.05); print('DOWN %%.1f  (%%d МБ за %%.1f с)' %% ($n*8/d/1e6, $n/1048576, d))"
-t0=$(date +%%s.%%N); head -c 26214400 /dev/zero | timeout 90 $S 'cat > /dev/null'; t1=$(date +%%s.%%N)
-python3 -c "t=$t1-$t0; d=max(t-$h, t/2, 0.05); print('UP %%.1f  (25 МБ за %%.1f с)' %% (26214400*8/d/1e6, d))"
+# «обратно» считает сам второй сервер: сколько байт реально дошло за 80 с (если поток завис — видно, сколько успело)
+t0=$(date +%%s.%%N); r=$(head -c 26214400 /dev/zero | timeout 95 $S 'python3 -c "
+import os, select, time
+n, e = 0, time.time() + 80
+while True:
+    if not select.select([0], [], [], max(0, e - time.time()))[0]: break
+    b = os.read(0, 65536)
+    if not b: break
+    n += len(b)
+print(n)
+"' 2>/dev/null); t1=$(date +%%s.%%N)
+python3 -c "n=int('${r:-0}'.strip() or 0); t=$t1-$t0; d=max(t-$h, t/2, 0.05); print('UP %%.1f  (%%.1f МБ за %%.1f с)%%s' %% (n*8/d/1e6, n/1048576, d, '' if n >= 26214400 else ' STALL'))"
 """
 
 # Скрипт замера скачиваем с таймаутом: с сайта автора, а если он не открывается (из РФ бывает) —
@@ -1361,8 +1376,26 @@ rm -f "$f"
 exit $rc
 """
 
+GRUB_FIX_SH = r"""# grub-pc: в образах хостеров в debconf часто записан диск шаблона (/dev/disk/by-id/…), которого на этой машине нет, —
+# тогда обновление grub-pc падает («does not exist, so cannot grub-install to it»). Если записанного диска нет —
+# указываем настоящий диск, с которого загружается система, и доделываем недоустановленные пакеты.
+if dpkg -s grub-pc >/dev/null 2>&1; then
+  cur=$(debconf-show grub-pc 2>/dev/null | sed -n 's/^[* ]*grub-pc\/install_devices: //p' | tr ',' ' ')
+  ok=1; [ -z "$cur" ] && ok=0; for d in $cur; do [ -e "$d" ] || ok=0; done
+  if [ $ok = 0 ]; then
+    src=$(findmnt -no SOURCE /boot 2>/dev/null || findmnt -no SOURCE /)
+    disk=$(lsblk -rsno NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1; exit}')
+    if [ -n "$disk" ] && [ -b "/dev/$disk" ]; then
+      echo "grub-pc grub-pc/install_devices multiselect /dev/$disk" | debconf-set-selections
+      echo "GRUB: загрузчик ставим на /dev/$disk (в образе хостера был записан ${cur:-пустой диск})"
+    fi
+  fi
+fi
+dpkg --configure -a || true
+"""
+
 UPGRADE_SH = r"""export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a LC_ALL=C
-apt-get update -q -o DPkg::Lock::Timeout=1200
+""" + GRUB_FIX_SH + r"""apt-get update -q -o DPkg::Lock::Timeout=1200
 apt-get -y -q -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=1200 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
 rc=$?
 # обновление openssh-server на Ubuntu 24.04 останавливает ssh — поднимаем сами
@@ -1372,8 +1405,8 @@ systemctl is-active --quiet ssh || systemctl start ssh >/dev/null 2>&1 || system
 exit $rc
 """
 
-UPDATE_SH = r"""set -e
-export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+UPDATE_SH = r"""export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+""" + GRUB_FIX_SH + r"""set -e
 apt-get update -q
 apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
 apt-get -y -q autoremove

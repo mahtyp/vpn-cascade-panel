@@ -826,6 +826,7 @@ class Dash:
         self.on_restart = None      # как остановить текущий (ставит значок в трее)
         self.lock = threading.RLock()
         self.status = {}        # sid -> {at, ok, error, data}
+        self.mask_fail = {}     # (sid, порт) -> сколько проверок подряд сайт маскировки не открывается с сервера
         self.channels = {}      # entry sid -> [channel]
         self.results = {}       # "entry:key" -> {status, ip, ms, at, error}
         self.dc = {}            # exit sid -> {at, cells|error}
@@ -1610,6 +1611,12 @@ class Dash:
                 st = {"at": now(), "ok": True, "data": data}
                 if srv["role"] == "entry":
                     self._build_channels(srv, data)
+                    for m in (data.get("entry") or {}).get("mask") or []:   # Reality не пустит клиентов, если target недоступен
+                        if m.get("skip"):
+                            continue
+                        k = (sid, m.get("port"))
+                        self.mask_fail[k] = 0 if m.get("ok") else self.mask_fail.get(k, 0) + 1
+                        m["fails"] = self.mask_fail[k]
             except CheckError as e:
                 st = {"at": now(), "ok": False, "error": str(e)}
             except Exception as e:
@@ -2088,6 +2095,9 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
         for s in servers:
             if s["role"] != "entry" or not (status.get(s["id"]) or {}).get("ok"):
                 continue
+            for m in ((status[s["id"]].get("data") or {}).get("entry") or {}).get("mask") or []:
+                if not m.get("skip") and not m.get("ok") and m.get("fails", 0) >= 2:     # одна неудача — может быть случайность
+                    bad.append("%s: сайт маскировки %s не открывается — клиенты через этот вход не подключатся" % (s["name"], m.get("sni")))
             rs = [(c, results.get("%s:%s" % (s["id"], c["key"]))) for c in chans.get(s["id"], [])]
             rs = [(c, r) for c, r in rs if r]
             if not rs:

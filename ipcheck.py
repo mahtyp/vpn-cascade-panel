@@ -29,6 +29,13 @@ try:
     b = os.path.join(d, "bin"); os.mkdir(b); os.chmod(b, 0o755)
     shims = {"column": "#!/bin/sh\ncat\n",                                   # нужен скрипту только для таблицы
              "nslookup": "#!/bin/sh\nfor a; do d=$a; done\ngetent ahostsv4 \"$d\" >/dev/null\n"}   # «DNS работает?»
+    # «есть ли IPv4»: скрипт пингует 8.8.8.8 и др. от nobody; в закрученных образах (Астра/Русоникс) ping без root
+    # запрещён — тогда ipregion решает, что IPv4 нет, и падает. Сначала настоящий ping, не вышел — TCP к 53/443
+    real_ping = shutil.which("ping") or "false"
+    with open(os.path.join(b, "ping"), "w") as f:
+        f.write("#!/bin/bash\nfor a; do h=$a; done\n%s \"$@\" >/dev/null 2>&1 && exit 0\n"
+                "timeout 3 bash -c \"</dev/tcp/$h/53\" 2>/dev/null || timeout 3 bash -c \"</dev/tcp/$h/443\" 2>/dev/null\n" % real_ping)
+    os.chmod(os.path.join(b, "ping"), 0o755)
     for name, body in shims.items():
         if not shutil.which(name):
             with open(os.path.join(b, name), "w") as f:
@@ -239,7 +246,18 @@ SANCTION = {"RU", "BY", "IR", "KP", "SY", "CU"}
 NAMES = {"RU": "Россия", "SE": "Швеция", "FI": "Финляндия", "FR": "Франция", "DE": "Германия", "ES": "Испания",
          "NL": "Нидерланды", "GB": "Великобритания", "US": "США", "BY": "Беларусь", "KZ": "Казахстан", "PL": "Польша",
          "LV": "Латвия", "LT": "Литва", "EE": "Эстония", "CH": "Швейцария", "AT": "Австрия", "IT": "Италия",
-         "CZ": "Чехия", "TR": "Турция", "AE": "ОАЭ", "SG": "Сингапур", "JP": "Япония", "HK": "Гонконг", "CN": "Китай"}
+         "CZ": "Чехия", "TR": "Турция", "AE": "ОАЭ", "SG": "Сингапур", "JP": "Япония", "HK": "Гонконг", "CN": "Китай",
+         "AU": "Австралия"}
+# «в какой стране» — для фраз «для адреса в России»; нет в списке — «в стране XX»
+NAMES_IN = {"RU": "России", "SE": "Швеции", "FI": "Финляндии", "FR": "Франции", "DE": "Германии", "ES": "Испании",
+            "NL": "Нидерландах", "GB": "Великобритании", "US": "США", "BY": "Беларуси", "KZ": "Казахстане", "PL": "Польше",
+            "LV": "Латвии", "LT": "Литве", "EE": "Эстонии", "CH": "Швейцарии", "AT": "Австрии", "IT": "Италии",
+            "CZ": "Чехии", "TR": "Турции", "AE": "ОАЭ", "SG": "Сингапуре", "JP": "Японии", "HK": "Гонконге", "CN": "Китае",
+            "AU": "Австралии"}
+
+
+def in_country(code):
+    return "в " + NAMES_IN[code] if code in NAMES_IN else "в стране %s" % NAMES.get(code, code)
 KEY_SERVICES = ["YouTube", "Google", "YouTube Premium", "ChatGPT", "Gemini Supported", "Netflix", "Spotify", "Apple",
                 "Microsoft", "Twitch", "Tiktok", "Steam", "Reddit", "Disney+"]
 
@@ -312,7 +330,7 @@ def summarize(raw):
     if closed:
         expected = main in AI_BLOCKED   # российский вход: так и должно быть
         note("info" if expected else "bad", "не пускают ИИ: %s — %s" % (", ".join(closed),
-             "для адреса в %s это ожидаемо" % NAMES.get(main, main) if expected else
+             "для адреса %s это ожидаемо" % in_country(main) if expected else
              "сервис считает, что адрес в стране, где он не работает (смотрите, какую страну видят Google и ChatGPT)"))
     elif gpt in AI_BLOCKED and "ChatGPT" not in ai_raw:
         note("bad", "ChatGPT видит %s — там он не работает" % NAMES.get(gpt, gpt))

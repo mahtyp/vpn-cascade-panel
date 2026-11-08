@@ -304,20 +304,30 @@ def summarize(raw):
         net = ipaddress.ip_network(raw.get("net") or "", strict=False)
     except ValueError:
         net = None
-    fit_txt = (" Подойдёт сайт соседа: " + ", ".join(r["name"] for r in fit[:3])) if fit else ""
+    cur = {n.lower() for rl in raw.get("reality") or [] for n in (rl.get("names") or []) + [rl.get("sni") or ""] if n}   # наши сайты маскировки
     for rl in raw.get("reality") or []:
         if rl.get("skip"):
             continue
         names = [n.lower() for n in rl.get("names") or []] or ([rl["dest"].rsplit(":", 1)[0].lower()] if rl.get("dest") else [])
+        others = [r for r in fit if r["name"].lower() not in names and not set(names) & set(r.get("names") or [])]   # не советуем тот же сайт
+        fit_txt = (" Подойдёт сайт соседа: " + ", ".join(r["name"] for r in others[:3])) if others else ""
         inside = False
         if "ok" in rl:      # сервер сам попробовал открыть сайт маскировки (как его откроет Xray для чужих)
             sni = rl.get("sni") or (names or ["?"])[0]
             if not rl["ok"]:
                 why = {"dns": "имени больше нет в DNS", "timeout": "сайт не отвечает", "refused": "сайт не принимает подключения",
                        "cert": "сертификат не на это имя или просрочен", "tls": "ошибка TLS", "net": "нет связи"}.get(rl.get("err"), "не открывается")
+                pc = next((r for r in genuine if sni.lower() == (r["name"] or "").lower() or sni.lower() in (r.get("names") or [])), None)
                 note("bad", "Reality на порту %s маскируется под %s, но с сервера этот сайт сейчас не открывается (%s) — кто постучится "
                             "на порт, увидит ошибку вместо сайта, маскировки нет. Поменяйте в 3X-UI target и SNI на живой сайт.%s"
                      % (rl.get("port"), sni, why, fit_txt))
+                if pc and rl.get("err") in ("timeout", "refused", "net", "tls"):
+                    note("warn", "При этом с этого компьютера %s открывается нормально (%s). Значит, сайт жив, но не пускает именно ваш "
+                                 "сервер — похоже, его защита заблокировала адрес сервера. Так бывает с маскировкой Reality: всех чужих, кто "
+                                 "стучится на ваш порт (сканеры, проверки), Xray пересылает на этот сайт с адреса сервера, и сайт принимает "
+                                 "это за атаку. Проверить в консоли сервера: curl -sv --connect-timeout 5 https://%s -o /dev/null. "
+                                 "Возвращаться на этот сайт не стоит — берите другой."
+                         % (sni, pc["ip"], sni))
                 mine.append({"port": rl.get("port"), "remark": rl.get("remark"), "name": sni, "dead": True, "err": rl.get("err")})
                 continue
             if rl.get("tls") != "TLSv1.3" or rl.get("alpn") != "h2":
@@ -360,7 +370,7 @@ def summarize(raw):
                                                                 ("; так же маскируются ещё %d %s" % (same, plural(same, "сосед", "соседа", "соседей"))) if same else "",
                                                                 "; спокойнее — сайт соседа из списка ниже" if fit else ""))
     return {"ip": me, "net": raw.get("net"), "total": raw.get("total"), "tls": tls_n, "level": level, "brands": brands,
-            "foreign": foreign, "genuine": genuine, "other": other, "fit": [r["name"] for r in fit][:8], "mine": mine,
+            "foreign": foreign, "genuine": genuine, "other": other, "fit": [r["name"] for r in fit if r["name"].lower() not in cur][:8], "mine": mine,
             "notes": notes, "secs": raw.get("secs")}
 
 

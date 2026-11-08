@@ -27,7 +27,7 @@
   выхода передаётся файлом в `/root/.vpn-dash-job/pw/` (rssh в vpn-restore.sh берёт его через
   sshpass) и удаляется в finally. Ставятся роли «выход» (vpn-exit-setup.sh + vpn-add-exit.sh на входах)
   и «вход из бэкапа» (vpn-restore.sh с VPN_NAME, XUI_SSL_MODE=ip; установщик 3X-UI без TTY идёт
-  без вопросов). Замена выхода — роль «выход» с `params.replace` = id старого: на входах
+  без вопросов; `xray_match` — Xray той же версии, что `xray=` в versions.txt бэкапа, с GitHub XTLS по sha256 из .dgst). Замена выхода — роль «выход» с `params.replace` = id старого: на входах
   `REPLACE=IP_старого vpn-add-exit.sh` переводит исходящие старого на новый туннель и
   переименовывает теги во всём шаблоне (места в цепочках, включая DC5TG, сохраняются), затем
   выключает старый wgN; старый сервер убирается из панели (`Dash.remove_server`).

@@ -273,7 +273,7 @@ label{font-size:13px;line-height:18px}
 .term-menu{border:1px solid var(--border-2);box-shadow:none}
 .modal .box{border:0}
 .savebar{box-shadow:none;border:2px solid var(--warn)}
-.banner{background:var(--warn-bg);color:var(--text)}
+.banner{background:var(--warn-bg);color:var(--text)}.banner.bad-b{background:var(--bad);color:var(--on-mark)}.banner.bad-b a{color:inherit}
 .toast{border:0;background:var(--text);color:var(--bg);box-shadow:none}.toast.bad{background:var(--bad);color:var(--on-mark)}.toast.ok{background:var(--ok);color:var(--bg)}
 .toast .x{color:inherit;opacity:.75}.toast .x:hover{color:inherit;opacity:1}
 .awg-row{border:0;background:var(--surface-2)}.awg-p .pv{border:0;background:var(--surface-2)}.awg-tiles .t{border:0;background:var(--surface)}
@@ -352,6 +352,10 @@ a.pill{text-decoration:none}a.pill:hover{text-decoration:underline;text-underlin
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 // Сообщения внизу экрана вместо системных окон alert(): не блокируют страницу и сами исчезают
+// Раскрытые <details data-keep="ключ"> остаются раскрытыми, когда страница перерисовывается (журналы задач и т. п.)
+const KEEP_OPEN = new Set();
+const keep = (k) => ` data-keep="${esc(k)}"${KEEP_OPEN.has(k) ? " open" : ""}`;
+document.addEventListener("toggle", (ev) => { const d = ev.target; if (d && d.dataset && d.dataset.keep) { if (d.open) KEEP_OPEN.add(d.dataset.keep); else KEEP_OPEN.delete(d.dataset.keep); } }, true);
 function toast(msg, kind) {
   let box = document.querySelector(".toasts");
   if (!box) { box = document.createElement("div"); box.className = "toasts"; box.setAttribute("role", "status"); box.setAttribute("aria-live", "polite"); document.body.appendChild(box); }
@@ -466,8 +470,9 @@ function serverIssues(s) {
     if (m.skip) continue;
     const tip = "Reality на порту " + m.port + " маскируется под " + m.sni + " (target " + m.dest + "). Чужому, кто постучится на этот порт "
       + "(сканер, проверка ТСПУ), Xray показывает этот сайт. Нажмите — раздел «Качество»: там соседи, под которых можно маскироваться вместо него.";
-    if (!m.ok) out.push(["маскировка: " + m.sni + " — " + (MASK_ERR[m.err] || "не открывается"), "bad", "mask",
-      tip + (m.why ? " Ошибка: " + m.why + "." : "") + " Сейчас проверка увидит ошибку вместо сайта — поменяйте target и SNI в 3X-UI на живой сайт."]);
+    if (!m.ok) out.push(["маскировка: " + m.sni + " — " + (MASK_ERR[m.err] || "не открывается") + ", клиенты не подключатся", "bad", "mask",
+      tip + (m.why ? " Ошибка: " + m.why + "." : "") + " Reality при каждом подключении обращается к этому сайту — пока он недоступен с сервера, "
+      + "через этот вход не подключится никто. Поменяйте в 3X-UI target и SNI на живой сайт (в serverNames старое имя можно оставить, пока не обновите подписки)."]);
     else if (m.tls !== "TLSv1.3" || m.alpn !== "h2") out.push(["маскировка: у " + m.sni + " нет " + (m.tls !== "TLSv1.3" ? "TLS 1.3" : "h2"), "warn", "mask",
       tip + " Reality нужен сайт с TLS 1.3 и h2, иначе маскировка выдаёт себя."]);
     else if (m.days != null && m.days < 7) out.push(["маскировка: у " + m.sni + " сертификат на " + Math.max(0, m.days) + " дн", "warn", "mask",
@@ -585,6 +590,10 @@ function renderOverview() {
     <button class="btn primary" data-act="all" ${isRun("all") ? "disabled" : ""}>${spinIcon(isRun("all"))}${isRun("all") ? "Проверяю…" : "Проверить всё"}</button></div>`;
   if (!S.servers.length) h += `<div class="banner">Серверов пока нет. Добавьте входы и выходы на странице <a href="#/servers">«Серверы и пароли»</a> — кнопка «+ Добавить сервер».</div>`;
   if (noPw.length) h += `<div class="banner">Не заданы пароли: ${esc(noPw.map((s) => s.name).join(", "))}. Откройте <a href="#/servers">«Серверы и пароли»</a>.</div>`;
+  for (const e of entries) for (const m of (((e.state || {}).data || {}).entry || {}).mask || [])
+    if (!m.skip && !m.ok && (m.fails || 0) >= 2) h += `<div class="banner bad-b"><b>${esc(e.name)}: через этот вход сейчас никто не подключится.</b>
+      Сайт маскировки ${esc(m.sni)} (порт ${esc(m.port)}) не открывается с сервера — ${esc(MASK_ERR[m.err] || "ошибка")}, уже ${m.fails} проверки подряд.
+      Поменяйте в 3X-UI target и SNI на живой сайт — подходящие соседи в <a href="#/addr" data-act="mask" data-id="${esc(e.id)}">«Качестве»</a>.</div>`;
   if (!S.keyring) h += `<div class="banner">Не установлен модуль keyring: пароли хранятся только до перезапуска панели. Запустите start.bat ещё раз.</div>`;
 
   h += `<div class="tiles">
@@ -1114,13 +1123,19 @@ function wzEntrySteps(st) {
       <div class="form">${W.src.kind === "server" ? `<label>Сервер-образец<select data-w="srcid">${ents.map((e) => `<option value="${esc(e.id)}" ${W.src.id === e.id ? "selected" : ""}>${esc(e.name)}</option>`).join("")}</select></label>` : ""}
       ${W.src.kind === "file" ? `<label style="grid-column:1/-1">Файл бэкапа<select data-w="srcfile" class="mono">${files.map((n) => `<option ${W.src.file === n ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>` : ""}
       <label>Имя латиницей (для AWG-клиентов на выходах)<input data-wt="tag" class="mono" value="${esc(W.tag)}" placeholder="Entry3"></label></div>
-      <div class="msg sm muted">Новый вход будет копией образца: те же клиенты с теми же ключами, тот же входящий VLESS и маскировка, порт и путь панели, подписка, цепочка выходов и правило DC5. На устройствах достаточно добавить подписку нового входа. Поменять что-то можно будет потом в панели 3X-UI нового входа — сравнение входов в обзоре покажет различия.</div></section>`;
+      <div class="msg sm muted">Новый вход будет копией образца: те же клиенты с теми же ключами, тот же входящий VLESS и маскировка, порт и путь панели, подписка, цепочка выходов и обходы из «Сайтов и обходов». На устройствах достаточно добавить подписку нового входа. Поменять что-то можно будет потом в панели 3X-UI нового входа — сравнение входов в обзоре покажет различия.</div></section>`;
   }
   if (st === 5) {
     const ex = wzSrcExits();
     return `<section class="card"><div class="head"><h3>Связи</h3><span class="sm muted">как у образца</span></div>
       <div class="wz-row"><span>${ex.length ? "На каждом выходе образца — " + esc(ex.join(", ")) + " — появится AWG-клиент " : "На каждом выходе, прописанном в бэкапе, появится AWG-клиент "}<span class="mono">${esc(W.tag)}-wgN</span>. Пароли выходов панель передаст новому серверу на время установки и удалит.</span></div>
-      <div class="wz-row"><span>Цепочка резерва и правило Telegram DC5 — точно как на образце.</span></div></section>`;
+      ${(() => { const sid = W.src.kind === "server" ? W.src.id : "";
+        const bp = (S.bypasses || []).filter((b) => b.on && b.on[sid]).map((b) => b.title || b.code);
+        const z = sid ? (((((S.servers.find((x) => x.id === sid) || {}).state || {}).data || {}).entry || {}).xui || {}).pinned || [] : [];
+        const zn = z.filter((x) => (x.comment || "").startsWith("Z-")).map((x) => { const t = ((S.zapret || {}).targets || []).find((y) => "Z-" + y.id === x.comment); return t ? t.name : x.comment; });
+        return `<div class="wz-row"><span>Цепочка резерва и обходы — точно как на образце${bp.length ? ": " + esc(bp.join(", ")) : ""}. Новый вход сразу появится у них в «Сайтах и обходах».</span></div>`
+          + (zn.length ? `<div class="wz-row"><span>Правила Zapret «напрямую» (${esc(zn.join(", "))}) тоже переедут, а сам zapret на новый вход не ставится.
+            Если эти сайты с нового входа без zapret не открываются — после установки поставьте zapret на нём или уберите «напрямую» в разделе «Zapret».</span></div>` : ""); })()}</section>`;
   }
   return "";
 }
@@ -1184,7 +1199,7 @@ function renderNew() {
     if (!cj) h += `<div class="empty">Нажмите «Проверить»: панель зайдёт на ${esc(f.host)} по SSH и соберёт всё, что важно для установки.</div>`;
     else if (running) h += wzJobView(cj);
     else if (cj.status !== "ok") h += `<div class="empty" style="color:var(--bad)">${esc(cj.error)}</div>
-      ${(cj.log || []).length ? `<details style="padding:0 16px 16px"><summary class="sm muted" style="cursor:pointer">подробно</summary><pre class="wz-term">${esc(cj.log.join("\n"))}</pre></details>` : ""}`;
+      ${(cj.log || []).length ? `<details${keep("wz-check-log")} style="padding:0 16px 16px"><summary class="sm muted" style="cursor:pointer">подробно</summary><pre class="wz-term">${esc(cj.log.join("\n"))}</pre></details>` : ""}`;
     if (c) {
       for (const x of c.items) h += `<div class="wz-row"><span class="dot ${x.st === "ok" ? "ok" : x.st === "warn" ? "warn" : "bad"}"></span><span style="width:210px;flex:none;font-weight:500">${esc(x.k)}</span><span style="flex:1 1 260px;color:var(--soft)">${esc(x.v)}</span></div>`;
       h += `<div style="padding:16px 16px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:12px"><div class="row" style="gap:12px"><b style="font-weight:500">Telegram DC</b><span class="sm muted">подключение с этого сервера к порту 443 каждого DC</span></div>
@@ -1198,7 +1213,7 @@ function renderNew() {
       <button class="btn" data-w="bench" ${brun ? "disabled" : ""}>${brun ? spinIcon(true) + "Замеряю…" : bj ? "Замерить ещё раз" : "Замерить"}</button></div>
       <div class="wz-tiles" style="padding-bottom:4px">${bmodes.map(([k, t, d]) => `<button type="button" class="wz-tile ${bm === k ? "on" : ""}" style="min-height:70px" data-w="bmode" data-v="${k}" ${brun ? "disabled" : ""}><b style="font-size:15px">${t}</b><span>${d}</span></button>`).join("")}</div>
       <div style="padding:12px 16px 16px">${!bj ? `<span class="muted">Необязательно. Для входа в РФ полезнее «Наш замер»: он показывает скорость именно до ваших выходов.</span>`
-        : (bj.params || {}).mode === "ours" || !(bj.params || {}).mode ? `${wzJobView(bj)}<details style="padding-top:12px"><summary class="sm muted" style="cursor:pointer">журнал замера</summary><pre class="wz-term" id="wz-bench">${esc((bj.log || []).join("\n"))}</pre></details>`
+        : (bj.params || {}).mode === "ours" || !(bj.params || {}).mode ? `${wzJobView(bj)}<details${keep("wz-bench-log")} style="padding-top:12px"><summary class="sm muted" style="cursor:pointer">журнал замера</summary><pre class="wz-term" id="wz-bench">${esc((bj.log || []).join("\n"))}</pre></details>`
         : `<pre class="wz-term" id="wz-bench">${esc((bj.log || []).join("\n"))}</pre>`}
         ${bj && bj.status === "error" ? `<div class="sm" style="color:var(--bad);padding-top:8px">${esc(bj.error)}</div>` : ""}
         ${bj && (bj.params || {}).mode && bj.params.mode !== "ours" && (bj.steps || []).some((x) => x.status === "warn") ? `<div class="sm" style="color:var(--warn);padding-top:8px">${esc(bj.steps.find((x) => x.status === "warn").note)}</div>` : ""}</div></section>`;
@@ -1462,7 +1477,7 @@ function geoView(g, at, fold) {
       if (fold && !(g.services || []).length && !bases.length) return "";
       return fold ? `<details data-fold="${esc(fold)}"${ADDR_OPEN.has(fold) ? " open" : ""}><summary class="sm muted" style="cursor:pointer">сервисы (${(g.services || []).length}) и базы геолокации (${bases.length})</summary>
           ${grid(g.services || [], true)}<div class="sm muted" style="padding-top:12px">базы геолокации и CDN</div>${grid(bases, false)}</details>`
-        : `${grid(g.services || [])}<details><summary class="sm muted" style="cursor:pointer">базы геолокации и CDN</summary>${grid(bases, true)}</details>`;
+        : `${grid(g.services || [])}<details${keep("geo-bases")}><summary class="sm muted" style="cursor:pointer">базы геолокации и CDN</summary>${grid(bases, true)}</details>`;
     })()}</div>`;
 }
 // ------------------------------------------------------------------ AmneziaWG: все туннели наглядно (только чтение)
@@ -1733,7 +1748,7 @@ function renderPkgs() {
     ${(info.notes || []).map((n) => `<div class="pk-note"><span class="dot ${n.level === "warn" ? "warn" : ""}" style="margin-top:8px"></span><span>${n.label ? `<b>${esc(n.label)}:</b> ` : ""}${esc(n.text)}</span></div>`).join("")}
     <span class="sm dim">Списки пакетов обновлялись ${info.lists_at ? esc(ago(info.lists_at)) : "давно"}, ядро ${esc(info.kernel || "")}, ${esc(upFmt(info.uptime_s || 0))}${info.reboot_required ? `, <span style="color:var(--warn)">ждёт перезагрузки${(info.reboot_pkgs || []).length ? " (" + esc(info.reboot_pkgs.join(", ")) + ")" : ""}</span>` : ""}</span></div>`;
   if (todo.length) { h += `<div class="grp" style="border-top:1px solid var(--border)">Будут установлены, ${todo.length}</div>`; h += todo.map(row).join(""); }
-  if (held.length) h += `<details style="border-top:1px solid var(--border)"><summary class="sm muted" style="padding:12px 16px;cursor:pointer">Отложены Ubuntu, ${held.length} — их выкатывают постепенно, поставятся сами в следующие дни</summary>${held.map(row).join("")}</details>`;
+  if (held.length) h += `<details${keep("pk-held")} style="border-top:1px solid var(--border)"><summary class="sm muted" style="padding:12px 16px;cursor:pointer">Отложены Ubuntu, ${held.length} — их выкатывают постепенно, поставятся сами в следующие дни</summary>${held.map(row).join("")}</details>`;
   if (!items.length) h += `<div class="empty" style="border-top:1px solid var(--border)">Все пакеты свежие.</div>`;
   h += `<div class="row" style="padding:16px 16px;border-top:1px solid var(--border)">
     ${todo.length ? `<label class="wz-chk" style="display:flex;gap:8px;align-items:center;font-size:13px"><input type="checkbox" id="pk-reboot" ${PK.reboot ? "checked" : ""}> перезагрузить после установки, если потребуется</label>` : ""}

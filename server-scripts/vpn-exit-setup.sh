@@ -53,7 +53,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vpn-awg-common.sh" || { ec
 
 stage_packages() {
   apt_begin
-  apt-get install -y -q curl ca-certificates openssl jq python3 iptables fail2ban qrencode zstd \
+  apt-get install -y -q curl ca-certificates openssl jq python3 iputils-ping iptables fail2ban qrencode zstd \
     software-properties-common "linux-headers-$(uname -r)" \
     || die "не поставились пакеты. Если не нашлись linux-headers — обновите систему и перезагрузитесь"
   add_amnezia_ppa
@@ -69,7 +69,14 @@ net.ipv4.ip_forward=1
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-  sysctl --system >/dev/null
+  # файлы самого образа хостера бывают с тем, что ядро уже не примет (kernel.yama.ptrace_scope и т. п.) — не бросаем
+  # установку из-за них, а свои настройки применяем отдельно и проверяем главное — пересылку пакетов
+  local out
+  if ! out=$(sysctl --system 2>&1 >/dev/null); then
+    warn "часть настроек ядра из образа хостера не применилась (не наши, на VPN не влияют): $(printf '%s' "$out" | grep -v '^\*' | tail -2 | tr '\n' ' ')"
+  fi
+  sysctl -e -q -p /etc/sysctl.d/99-vpn-exit.conf >/dev/null 2>&1 || true
+  [ "$(sysctl -n net.ipv4.ip_forward)" = 1 ] || { echo "не включилась пересылка пакетов (net.ipv4.ip_forward)" >&2; exit 1; }
   ok "ip_forward=$(sysctl -n net.ipv4.ip_forward), $(sysctl -n net.ipv4.tcp_congestion_control)"
 }
 

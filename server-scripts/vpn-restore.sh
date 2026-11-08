@@ -123,7 +123,15 @@ stage_sysctl() {
     echo 'net.core.default_qdisc=fq' >> /etc/sysctl.d/99-vpn-restore.conf
     echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.d/99-vpn-restore.conf
   }
-  sysctl --system >/dev/null
+  # sysctl --system применяет и файлы самого образа: у некоторых хостеров там то, что ядро уже не примет
+  # (kernel.yama.ptrace_scope ниже текущего и т. п.) — это не повод бросать установку; наши файлы применяем отдельно
+  local out
+  if ! out=$(sysctl --system 2>&1 >/dev/null); then
+    warn "часть настроек ядра из образа хостера не применилась (не наши, на VPN не влияют): $(printf '%s' "$out" | grep -v '^\*' | tail -2 | tr '\n' ' ')"
+  fi
+  for f in /etc/sysctl.d/99-vpn-restore.conf /etc/sysctl.d/99-zz-vpn-swap.conf; do
+    [ -f "$f" ] && { sysctl -e -q -p "$f" >/dev/null 2>&1 || warn "не все строки $f применились"; }
+  done
   ok "$(sysctl -n net.ipv4.tcp_congestion_control) включён"
 }
 
@@ -135,7 +143,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vpn-awg-common.sh" || { ec
 
 stage_packages() {
   apt_begin
-  apt-get install -y -q curl ca-certificates openssl python3 jq software-properties-common \
+  apt-get install -y -q curl ca-certificates openssl python3 jq iputils-ping software-properties-common \
     fail2ban "linux-headers-$(uname -r)"
   add_amnezia_ppa
   apt-get install -y -q amneziawg amneziawg-tools
@@ -347,6 +355,41 @@ stage_awg() {
 
 # ---------------------------------------------------------------- 3X-UI
 
+# Xray той же версии, что на образце: установщик 3X-UI кладёт свой Xray, а на образце его могли обновить
+# из панели 3X-UI («Версия Xray»). Берём тот же релиз с GitHub XTLS/Xray-core, сверяем sha256 из .dgst.
+XRAY_PREV=""
+xray_match() {
+  local want have bin asset tmp sum url
+  want=$(sed -n 's/^xray=//p' "$VERS" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+  bin=$(ls "${XUI_BIN_DIR:-/usr/local/x-ui/bin}"/xray-linux-* 2>/dev/null | grep -v '\.before-' | head -n1 || true)
+  [ -n "$want" ] && [ -n "$bin" ] || return 0
+  have=$("$bin" version 2>/dev/null | sed -n 1p | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+  if [ "$have" = "$want" ]; then ok "Xray $have — как на образце"; return 0; fi
+  case "$(uname -m)" in
+    x86_64) asset=Xray-linux-64.zip ;;
+    aarch64) asset=Xray-linux-arm64-v8a.zip ;;
+    *) warn "Xray $have, на образце $want — для $(uname -m) сам не меняю"; return 0 ;;
+  esac
+  url="https://github.com/XTLS/Xray-core/releases/download/v$want/$asset"
+  tmp=$(mktemp -d)
+  if curl -fsSL -m 180 -o "$tmp/x.zip" "$url" && curl -fsSL -m 30 -o "$tmp/x.dgst" "$url.dgst"; then
+    sum=$(sed -n 's/^SHA2-256= *//p' "$tmp/x.dgst" | head -n1)
+    if [ -n "$sum" ] && [ "$(sha256sum "$tmp/x.zip" | awk '{print $1}')" = "$sum" ] \
+       && python3 -c 'import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extract("xray", sys.argv[2])' "$tmp/x.zip" "$tmp" \
+       && chmod 755 "$tmp/xray" && "$tmp/xray" version 2>/dev/null | sed -n 1p | grep -qF "$want"; then
+      cp -a "$bin" "$bin.before-restore"
+      install -m 755 "$tmp/xray" "$bin"
+      XRAY_PREV="$bin"
+      ok "Xray $want — как на образце (установщик 3X-UI поставил $have)"
+    else
+      warn "Xray $want с GitHub не прошёл проверку — оставляю $have; сменить можно в панели 3X-UI"
+    fi
+  else
+    warn "не скачался Xray $want с GitHub — оставляю $have; сменить можно в панели 3X-UI"
+  fi
+  rm -rf "$tmp"
+}
+
 stage_xui() {
   say "3X-UI"
   [ -f "$SRC/etc/x-ui/x-ui.db" ] || die "в бэкапе нет x-ui.db"
@@ -391,8 +434,15 @@ stage_xui() {
     [ -n "$key" ] && [ -f "$SRC$key" ] && install -D -m 600 "$SRC$key" "$key"
     ok "сертификат $crt"
   done < <(xui_cert_pairs)
+  xray_match
   systemctl start x-ui
   sleep 3
+  if [ -n "$XRAY_PREV" ] && ! systemctl is-active --quiet x-ui; then
+    warn "с новым Xray x-ui не запустилась — возвращаю Xray от установщика"
+    systemctl stop x-ui 2>/dev/null || true
+    mv -f "$XRAY_PREV.before-restore" "$XRAY_PREV"
+    systemctl start x-ui; sleep 3
+  fi
   systemctl is-active --quiet x-ui || die "x-ui не запустилась: journalctl -u x-ui -n 50"
   # сверка: в рабочей базе те же входящие и тот же порт панели, что в бэкапе
   local cmp
