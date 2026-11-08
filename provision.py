@@ -72,7 +72,7 @@ class Job:
                 s["status"] = "run"
                 s["t0"] = time.time()
                 self.log("")
-                self.log("== %s%s" % (s["title"], " · " + s["where"] if s["where"] else ""))
+                self.log("== %s%s" % (s["title"], ", " + s["where"] if s["where"] else ""))
         self.save()
 
     def end(self, key, status="ok", note=""):
@@ -212,7 +212,7 @@ class Provisioner:
         for n in sm["notes"]:
             job.log(("! " if n["level"] in ("warn", "bad") else "") + n["text"])
         job.end("geo", "warn" if any(n["level"] == "bad" for n in sm["notes"]) else "ok",
-                "по базам: %s · владелец сети: %s" % (sm.get("country") or "?", sm.get("registered") or "?"))
+                "по базам: %s, владелец сети: %s" % (sm.get("country") or "?", sm.get("registered") or "?"))
         if p.get("sid"):
             with self.d.lock:
                 self.d.geo[p["sid"]] = dict(sm, at=time.time())
@@ -241,7 +241,7 @@ class Provisioner:
         if not srv:
             raise Stop("сервера больше нет в панели")
         what = ("маска %s" % p["profile"].upper()) if p["profile"] else "убрать маски"
-        job.plan([("mimic", "%s · %s: %s, перезапуск туннеля, проверка рукопожатия" % (srv["name"], p["iface"], what), "")])
+        job.plan([("mimic", "%s, %s: %s, перезапуск туннеля, проверка рукопожатия" % (srv["name"], p["iface"], what), "")])
         job.begin("mimic")
         lines = awgmimic.generate(p["profile"]) if p["profile"] else {}
         for k, v in lines.items():
@@ -341,7 +341,7 @@ class Provisioner:
         for n in sm["notes"]:
             job.log(("! " if n["level"] in ("warn", "bad") else "") + n["text"])
         job.end("scan", {"ok": "ok", "warn": "warn", "bad": "warn"}[sm["level"]],
-                "ответили %d · чужих сертификатов %d · настоящих сайтов %d" % (sm["tls"], len(sm["foreign"]), len(sm["genuine"])))
+                "ответили %d, чужих сертификатов %d, настоящих сайтов %d" % (sm["tls"], len(sm["foreign"]), len(sm["genuine"])))
         with self.d.lock:
             self.d.nb[srv["id"]] = dict(sm, at=time.time())
         self.d.addr_save()
@@ -946,7 +946,7 @@ class Provisioner:
             res["net"].append({"name": n, "mbit": round(float(spd) * 8 / 1e6, 1) if ok else None,
                                "error": "" if ok else ("файл не найден (код %s) — поменяйте адрес в «Настройках»" % code if code not in ("000", "200", "206") else "не открылся")})
         bad = [x["name"] for x in res["net"] if x["mbit"] is None]
-        job.end("net", "warn" if bad else "ok", " · ".join("%s %s" % (x["name"], "%.0f Мбит/с" % x["mbit"] if x["mbit"] is not None else "— " + x["error"]) for x in res["net"]))
+        job.end("net", "warn" if bad else "ok", ", ".join("%s %s" % (x["name"], "%.0f Мбит/с" % x["mbit"] if x["mbit"] is not None else "— " + x["error"]) for x in res["net"]))
 
         for i, (a, b, bpw) in enumerate(pairs):
             key = "link%d" % i
@@ -967,7 +967,7 @@ class Provisioner:
             link = {"a": an, "b": b["name"], "down": float(dm.group(1)) if dm else None, "up": float(um.group(1)) if um else None}
             res["links"].append(link)
             f = lambda v: "%.0f Мбит/с" % v if v is not None else "—"   # noqa: E731
-            job.end(key, "ok" if dm and um else "warn", "%s → %s %s · %s → %s %s" % (b["name"], an, f(link["down"]), an, b["name"], f(link["up"])))
+            job.end(key, "ok" if dm and um else "warn", "%s → %s %s, %s → %s %s" % (b["name"], an, f(link["down"]), an, b["name"], f(link["up"])))
 
     # ------------------------------------------------------------ установка выхода
     def _install(self, job, password):
@@ -1225,7 +1225,7 @@ class Provisioner:
         job.begin("panel")
         sid = self.unique_id(latin(tag).lower()[:12])
         new = {"id": sid, "name": name, "host": p["host"], "port": int(p.get("port") or 22), "user": p.get("user") or "root",
-               "role": "entry", "provider": p.get("provider") or "", "note": "вход · резерв", "cc": ""}
+               "role": "entry", "provider": p.get("provider") or "", "note": "вход, резерв", "cc": ""}
         with self.d.lock:
             cfg.data["servers"].append(new)
             cfg.save()
@@ -1432,7 +1432,7 @@ def verdict(role, p, pre, lat):
     add("Ядро", "%s, заголовки %s" % (pre.get("kernel"), "есть в репозитории" if pre.get("headers") else "не найдены — появятся после обновления системы"),
         "ok" if pre.get("headers") else "warn")
     mem, free = pre.get("mem_mb") or 0, pre.get("disk_free_gb") or 0
-    res = "%s vCPU · %s МБ RAM%s · диск %s ГБ, свободно %s ГБ" % (pre.get("cpu"), mem, (" + swap %s МБ" % pre["swap_mb"]) if pre.get("swap_mb") else "",
+    res = "%s vCPU, %s МБ RAM%s, диск %s ГБ, свободно %s ГБ" % (pre.get("cpu"), mem, (" + swap %s МБ" % pre["swap_mb"]) if pre.get("swap_mb") else "",
                                                                   pre.get("disk_gb"), free)
     swap = pre.get("swap_mb") or 0
     # мало памяти — это ещё не приговор, если есть swap: на swap держится сборка модуля AWG,
@@ -1447,7 +1447,7 @@ def verdict(role, p, pre, lat):
     add("Порты", "заняты: " + ", ".join("%s/%s %s" % (x[1], x[0], x[2]) for x in busy[:8]) if busy else "кроме SSH ничего не слушает", "warn" if busy else "ok")
     ip4 = pre.get("ipv4") or []
     nat = p["host"] not in ip4 and pre.get("public_ip") and pre.get("public_ip") != p["host"]
-    add("Адреса", "IPv4 %s%s · IPv6 %s" % (", ".join(ip4) or "?", " (снаружи виден %s — сервер за NAT?)" % pre["public_ip"] if nat else "",
+    add("Адреса", "IPv4 %s%s; IPv6 %s" % (", ".join(ip4) or "?", " (снаружи виден %s — сервер за NAT?)" % pre["public_ip"] if nat else "",
                                          ", ".join(pre.get("ipv6") or []) or "нет (нам не нужен)"), "warn" if nat else "ok")
     dns_bad = [h for h, ok in (pre.get("dns") or {}).items() if not ok]
     web_bad = [h for h, ok in (pre.get("web") or {}).items() if not ok]
@@ -1456,7 +1456,7 @@ def verdict(role, p, pre, lat):
     upd, rb = pre.get("updates") or 0, pre.get("reboot_required")
     add("Обновления", ("%d %s%s — обновим при установке" % (upd, plural(upd, "пакет", "пакета", "пакетов"), ", нужна перезагрузка" if rb else "")) if upd or rb else "система свежая",
         "warn" if upd or rb else "ok")
-    lat_txt = " · ".join("%s %s" % (k, "%d мс" % v if v is not None else "нет связи") for k, v in lat.items())
+    lat_txt = ", ".join("%s %s" % (k, "%d мс" % v if v is not None else "нет связи") for k, v in lat.items())
     lat_bad = [k for k, v in lat.items() if v is None]
     lat_all_bad = bool(lat) and len(lat_bad) == len(lat)
     if lat_all_bad and role != "entry":
@@ -1482,7 +1482,7 @@ def verdict(role, p, pre, lat):
     if n_bad:
         v = {"level": "bad", "text": "ставить нельзя: %d %s" % (n_bad, "проблема" if n_bad == 1 else "проблемы")}
     elif n_warn:
-        v = {"level": "warn", "text": "можно ставить · замечаний: %d" % n_warn}
+        v = {"level": "warn", "text": "можно ставить, замечаний: %d" % n_warn}
     else:
         v = {"level": "ok", "text": "можно ставить"}
     return {"items": items, "dc": dc, "dc_text": dc_text, "dc5_ok": dc5_ok, "verdict": v,

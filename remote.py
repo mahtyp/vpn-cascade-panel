@@ -146,18 +146,19 @@ def set_cookie(tok, max_age=SESSION_MAX):
 
 LOGIN_HTML = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Вход · Панель каскада</title>
+<title>Вход — панель каскада</title>
 <style>
-:root{color-scheme:dark;--bg:#0e1116;--surface:#151a21;--border:#262d36;--text:#e6e9ee;--muted:#8b95a3;--accent:#5b8cff;--bad:#ff6b6b}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);
-font-family:'IBM Plex Sans',system-ui,'Segoe UI',sans-serif;font-size:15px;padding:16px}
-form{width:min(380px,100%);background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:26px;display:flex;flex-direction:column;gap:14px}
-h1{margin:0 0 4px;font-size:20px}p{margin:0;color:var(--muted);font-size:13px;line-height:1.45}
-label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted)}
-input{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:#0b0d10;color:var(--text)}
-input:focus{outline:2px solid var(--accent);outline-offset:1px}
-button{font:inherit;font-weight:600;padding:11px;border:0;border-radius:10px;background:var(--accent);color:#0b1220;cursor:pointer}
-.err{color:var(--bad);font-size:13px}
+:root{color-scheme:dark;--bg:#000000;--surface:#181818;--border:#313131;--text:#EDEDED;--muted:#A1A1A1;--accent:#588EE4;--accent-2:#73A0E8;--bad:#E3635F}
+*{box-sizing:border-box}body{margin:0;min-height:100dvh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);
+font-family:'Golos Text',system-ui,'Segoe UI',sans-serif;font-size:14px;line-height:20px;padding:16px;-webkit-font-smoothing:antialiased}
+form{width:min(380px,100%);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;display:flex;flex-direction:column;gap:16px}
+h1{margin:0 0 4px;font-size:20px;line-height:28px;font-weight:600;letter-spacing:-.015em}p{margin:0;color:var(--muted);font-size:14px;line-height:20px}
+label{display:flex;flex-direction:column;gap:8px;font-size:12px;line-height:16px;color:var(--muted)}
+input{font:inherit;font-size:14px;padding:8px 12px;min-height:40px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text)}
+input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+button{font:inherit;font-weight:600;min-height:40px;padding:8px 12px;border:1px solid var(--accent);border-radius:8px;background:var(--accent);color:#0A0A0A;cursor:pointer;transition:background-color .3s cubic-bezier(.22,1,.36,1),transform .2s cubic-bezier(.22,1,.36,1)}
+button:hover{background:var(--accent-2)}button:active{transform:scale(.98)}
+.err{color:var(--bad);font-size:14px}
 </style></head><body>
 <form method="post" action="/login" autocomplete="off">
 <h1>Панель каскада</h1><p>Удалённый вход. Пароль задан на домашнем компьютере, код — из приложения-аутентификатора.</p>

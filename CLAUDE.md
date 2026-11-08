@@ -10,7 +10,13 @@
   из неё строится страница «Настройки»; значения в `servers.json` → `settings`).
 - `probe.py` — отправляется на сервер через `python3 -` (stdin) с префиксом `MODE = "status"|"dc"|"config"`;
   только читает. Секреты в режиме config заменяются отпечатками (`SECRET_RE`).
-- `index.html` — вся страница (vanilla JS, без фреймворков), `static/` — xterm.js.
+- `index.html` — вся страница (vanilla JS, без фреймворков), `static/` — xterm.js и шрифты (`static/fonts`: Golos Text и JetBrains Mono, OFL; в `STATIC_FILES`).
+  Вид — Hallmark, тема Grid (швейцарский стиль, app screen): токены в `:root` (светлый лист — по умолчанию) и `[data-theme="dark"]`,
+  выбор в «Настройках» → «Оформление» (localStorage `vd-theme`: нет = светлое, dark, auto; ставится до отрисовки скриптом в `<head>`).
+  `--field` (ультрамарин) — где идёт трафик и что выбрано, `--bad`/`--mark` (красный) — беда и знак; без рамок, теней и скруглений;
+  шрифт 13/15/17/18/24/28/44, плитки Обзора: `field` / `alarm`; цвета только через токены; без «·» в подписях; `alert()` → `toast()`.
+  Обзор внизу: журнал проверок и справа «Бэкапы» (`backupCard`); «Сверка резервов» — внизу «Серверы и пароли» (`driftCard`, `#drift-box`
+  обновляется в `render()`), на Обзоре только пометка «резерв не как основной: N» со ссылкой `#/servers?drift`.
 - `tray.py` — значок в трее (pystray), автозапуск (HKCU\...\Run), `--launch` из start.bat.
 - `updater.py` — обновление из GitHub (`git pull --ff-only`) и перезапуск.
 - Обновления пакетов: `classify_pkgs` в dash.py (пометки и вывод), задача `upgrade` в provision.py

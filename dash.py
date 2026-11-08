@@ -1642,7 +1642,7 @@ class Dash:
                 return
             xid, xname, cc = exit_of(a["host"])
             chans.append({"key": "awg:" + ref, "n": n, "kind": "AWG", "exit_id": xid, "exit": xname, "cc": cc, "tag": tag,
-                          "host": a["host"], "via": "%s · %s" % (ref, a.get("address", "")),
+                          "host": a["host"], "via": "%s, %s" % (ref, a.get("address", "")),
                           "iface": ref, "handshake_age": a.get("handshake_age"), "up": a.get("up")})
             used.add(ref)
 
@@ -1839,7 +1839,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             x = ((self.status.get(s["id"], {}).get("data") or {}).get("entry") or {}).get("xui") or {}
             for ib in x.get("inbounds", []):
                 if ib.get("enable"):
-                    out.append((s, ib["port"], "VLESS · %s" % (ib.get("remark") or ib["port"])))
+                    out.append((s, ib["port"], "VLESS, %s" % (ib.get("remark") or ib["port"])))
             if x.get("sub"):
                 out.append((s, x["sub"]["port"], "подписка"))
             out.append((s, int(s.get("port") or 22), "SSH"))
@@ -2286,7 +2286,7 @@ def terminal_session(handler, srv, cols, rows, via=""):
         return
     D.note("ok", "Консоль открыта: %s%s" % (srv["name"], " — через вход %s (%s)" % (path["via"], path["how"]) if own else ""))
     if own:
-        send(0x1, json.dumps({"info": "через вход %s · %s" % (path["via"], path["how"])}, ensure_ascii=False).encode())
+        send(0x1, json.dumps({"info": "через вход %s, %s" % (path["via"], path["how"])}, ensure_ascii=False).encode())
     closed = threading.Event()
 
     def pump():
@@ -2452,7 +2452,8 @@ D = None
 ALLOWED_HOSTS = {"127.0.0.1:%d" % PORT, "localhost:%d" % PORT}
 ALLOWED_ORIGINS = {"http://" + h for h in ALLOWED_HOSTS}
 STATIC_FILES = {"xterm.js": "application/javascript", "xterm.css": "text/css", "addon-fit.js": "application/javascript",
-                "qrcode.js": "application/javascript"}
+                "qrcode.js": "application/javascript", "fonts/golos-latin.woff2": "font/woff2", "fonts/golos-cyrillic.woff2": "font/woff2",
+                "fonts/jbmono-latin.woff2": "font/woff2", "fonts/jbmono-cyrillic.woff2": "font/woff2"}
 
 
 class Handler(BaseHTTPRequestHandler):
