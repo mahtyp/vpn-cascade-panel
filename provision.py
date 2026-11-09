@@ -763,14 +763,28 @@ class Provisioner:
         if not p.get("only_reboot"):
             job.begin("upg")
             rc = self.detached(job, srv, "upgrade", UPGRADE_SH, timeout=2400)
+            if any(l.startswith("AWG-KERNEL-FAIL:") for l in job.lines):
+                raise Stop("Новое ядро не подходит AmneziaWG и не убралось — НЕ перезагружайте сервер: туннели после перезагрузки не "
+                           "поднимутся. Журнал выше; пришлите его или «диагностику» сервера")
             if rc != 0:
                 raise Stop("apt-get завершился с ошибкой (код %d) — журнал выше. Сервер работает на старых пакетах; "
                            "можно повторить позже или разобраться в консоли" % rc)
             n = sum(1 for l in job.lines if l.startswith("Unpacking ") or l.startswith("Распаковывается"))
             job.result["installed"] = n
-            job.end("upg", note="пакетов: %d" % n if n else "")
+            gone = [l.split(":", 1)[1].strip() for l in job.lines if l.startswith("AWG-KERNEL-REMOVED:")]
+            if gone:
+                job.result["kernel_removed"] = gone
+                job.log("! Ядро %s не поставлено: модуль AmneziaWG под него не собирается. Сервер остаётся на текущем ядре; "
+                        "новые ядра этой серии сами не приедут, пока AmneziaWG не научится их собирать" % ", ".join(gone))
+            job.end("upg", note=("пакетов: %d" % n if n else "") + ("; ядро %s не поставлено — AmneziaWG его не умеет" % ", ".join(gone) if gone else ""))
         if p.get("reboot") or p.get("only_reboot"):
             job.begin("reboot")
+            if not STAND:     # ядро, под которое не собран модуль AmneziaWG, — не перезагружаем в него
+                _, bad, _ = self.sh(srv, AWG_KERNEL_LIST + "awg_bad_kernels")
+                if bad.split():
+                    raise Stop("Не перезагружаю: сервер загрузится в ядро %s, а модуля AmneziaWG под него нет — туннели не "
+                               "поднимутся. Поставьте обновления ещё раз (панель уберёт это ядро) или пришлите «диагностику»"
+                               % ", ".join(bad.split()))
             rc, out, _ = self.sh(srv, "test -f /var/run/reboot-required && echo yes || echo no")
             if out.strip() != "yes" and not p.get("only_reboot"):
                 job.skip("reboot", "не требуется")
@@ -1394,10 +1408,41 @@ fi
 dpkg --configure -a || true
 """
 
+# AmneziaWG — модуль ядра (DKMS). Если под новое ядро он не собрался (так было: linux-azure переехал на 7.0, а модуль его
+# не умеет), после перезагрузки туннели не поднимутся. Только ядра новее текущего: пробуем собрать ещё раз, не вышло —
+# убираем это ядро целиком (мета-пакет вроде linux-azure уходит вместе с ним), сервер остаётся на текущем.
+AWG_KERNEL_LIST = r"""awg_bad_kernels() {
+  dkms status 2>/dev/null | grep -q '^amneziawg' || return 0
+  cur=$(uname -r)
+  for f in ${VPN_BOOT:-/boot}/vmlinuz-*; do
+    [ -e "$f" ] || continue
+    v=${f##*/vmlinuz-}; [ "$v" = "$cur" ] && continue
+    dpkg --compare-versions "${v%%-[a-z]*}" gt "${cur%%-[a-z]*}" 2>/dev/null || continue
+    dkms status -m amneziawg -k "$v" 2>/dev/null | grep -q ': installed' && continue
+    echo "$v"
+  done
+}
+"""
+
+AWG_KERNEL_GUARD = AWG_KERNEL_LIST + r"""for v in $(awg_bad_kernels); do
+  # частая причина — нет заголовков под новое ядро (стоял linux-headers-<старое>, а не мета-пакет): ставим и собираем снова
+  [ -d "/lib/modules/$v/build" ] || apt-get -y -q -o Dpkg::Use-Pty=0 install "linux-headers-$v" >/dev/null 2>&1 || true
+  dkms autoinstall -k "$v" >/dev/null 2>&1 || true
+  dkms status -m amneziawg -k "$v" 2>/dev/null | grep -q ': installed' && { echo "модуль AmneziaWG под ядро $v собрался со второго раза"; continue; }
+  base=${v%-*}
+  pk=$(dpkg-query -W -f='${Package}\n' 'linux-*' 2>/dev/null | grep -E -- "-($v|$base)\$" | tr '\n' ' ')
+  echo "AWG-KERNEL: модуль AmneziaWG не собирается под новое ядро $v — с ним туннели не поднимутся. Убираю это ядро, сервер остаётся на $(uname -r)."
+  apt-get -y -q -o Dpkg::Use-Pty=0 purge $pk && echo "AWG-KERNEL-REMOVED: $v" || echo "AWG-KERNEL-FAIL: $v"
+done
+"""
+
 UPGRADE_SH = r"""export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a LC_ALL=C
 """ + GRUB_FIX_SH + r"""apt-get update -q -o DPkg::Lock::Timeout=1200
 apt-get -y -q -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=1200 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade
 rc=$?
+""" + AWG_KERNEL_GUARD + r"""if [ $rc -ne 0 ] && [ -z "$(awg_bad_kernels)" ] && dpkg --configure -a && [ -z "$(dpkg --audit 2>/dev/null)" ]; then
+  echo "пакеты доустановлены — всё на месте"; rc=0
+fi
 # обновление openssh-server на Ubuntu 24.04 останавливает ssh — поднимаем сами
 systemctl start ssh.socket >/dev/null 2>&1 || true
 systemctl is-active --quiet ssh || systemctl start ssh >/dev/null 2>&1 || systemctl start sshd >/dev/null 2>&1 || true
@@ -1408,7 +1453,8 @@ exit $rc
 UPDATE_SH = r"""export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 """ + GRUB_FIX_SH + r"""set -e
 apt-get update -q
-apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade
+apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade || true
+""" + AWG_KERNEL_GUARD + r"""dpkg --configure -a
 apt-get -y -q autoremove
 # обновление openssh-server на Ubuntu 24.04 останавливает ssh и может оставить сервер без входа
 # по SSH на минуты — поднимаем сами (скрипт идёт на сервере и без связи с панелью)

@@ -107,6 +107,19 @@ def nft_script(v4, v6, keep):
             + "    ip saddr @gov4 counter drop comment \"gov4\"\n    ip6 saddr @gov6 counter drop comment \"gov6\"\n  }\n}\n")
 
 
+def nft_update(v4, v6, keep):
+    """Для `nft -f` поверх уже включённой таблицы: только новые списки сетей. Правила и их счётчики не трогаются
+    (вся замена — одна транзакция: либо целиком, либо ничего)."""
+    k4 = [k for k in keep if ":" not in k]
+    k6 = [k for k in keep if ":" in k]
+    out = ""
+    for name, items in (("gov4", v4), ("gov6", v6), ("keep4", k4), ("keep6", k6)):
+        out += "flush set inet %s %s\n" % (TABLE, name)
+        if items:
+            out += "add element inet %s %s { %s }\n" % (TABLE, name, ", ".join(items))
+    return out
+
+
 # ------------------------------------------------------------------ на сервере (python3 -)
 # P = {"do": "apply", "nft": текст, "meta": {...}, "undo_s": 300} | {"do": "confirm"} | {"do": "undo"} | {"do": "off"} | {"do": "who", "ports": [...]}
 # apply: ставит nftables (только пакет, его службу не включает), прежнее состояние — в .prev, «ремень» его вернёт.
@@ -212,6 +225,12 @@ if rc != 0:
     done(False, "nftables не принял список (ничего не менял): " + out.strip()[-300:])
 cancel_undo()
 had = os.path.exists(NFT) and on()
+run = tmp                            # уже включено — меняем только списки в той же таблице, счётчик остаётся
+if had and P.get("upd"):
+    with open(NFT + ".upd", "w") as f:
+        f.write(P["upd"])
+    if sh("nft -c -f %s.upd" % NFT, 60)[0] == 0:
+        run = NFT + ".upd"
 if had:
     shutil.copy(NFT, PREV)
     if os.path.exists(META):
@@ -225,7 +244,9 @@ os.chmod(UNDO_SH, 0o700)
 p = subprocess.Popen(["sh", "-c", "sleep %d; sh %s" % (int(P["undo_s"]), UNDO_SH)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 open(UNDO, "w").write(str(p.pid))
-rc, out = sh("nft -f %s" % tmp, 60)
+rc, out = sh("nft -f %s" % run, 60)
+if run != tmp:
+    os.remove(run)
 if rc != 0:
     os.remove(tmp)
     cancel_undo()
@@ -237,6 +258,7 @@ with open(UNIT, "w") as f:
     f.write("[Unit]\nDescription=vpn-dash: не пускать сети госорганов (таблица nftables %s)\nAfter=network-pre.target\n\n"
             "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s -f %s\nExecStop=-%s delete table inet %s\n\n"
             "[Install]\nWantedBy=multi-user.target\n" % (TABLE, shutil.which("nft"), NFT, shutil.which("nft"), TABLE))
-done(True, "включено; если панель не подтвердит, через %d с всё вернётся как было" % int(P["undo_s"]), on=on())
+done(True, "включено; если панель не подтвердит, через %d с всё вернётся как было" % int(P["undo_s"]), on=on(),
+     inplace=run != tmp)
 '''
 

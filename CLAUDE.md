@@ -37,6 +37,15 @@
   Автоматически ничего не создаётся и не перепроверяется.
   «Что режут на входах» — `Sites.dpi` (`/api/dpi`, в фоне, снимок `dpi`): probe MODE "dpi" `dpi_check(DPI_SITES)` на каждом входе —
   curl напрямую, при сбое разбор dns/spoof (DoH 1.1.1.1/8.8.8.8)/ip/sni (TLS с чужим именем)/stall/tls/stub. На стенде — `/etc/testbed-dpi.json`.
+- Сквозная проверка входа — probe `xray_e2e()` в статусе (`entry.e2e`): временный клиент Xray (бинарник 3X-UI, `xray run -c` во временной папке, socks на 127.0.0.1)
+  подключается к своему VLESS Reality (клиент без limitIp, publicKey из realitySettings.settings или `xray x25519 -i`) и открывает `E2E_URL` (cloudflare trace) — ip/loc выхода;
+  curl с `--noproxy ''`. В dash — `e2e_fail`, `exit`/`direct`; 2 провала подряд — тревога в `overall()` и баннер на Обзоре. На стенде — `/etc/testbed-e2e.json` (`-bad.json` — сбой).
+- Проверка входа с ПК — `pce2e.py` (`check_pc_e2e` в check_all, настройка `pc_e2e`): параметры клиента приходят в `entry.e2e.pc` и сразу
+  вынимаются в `Dash.e2e_params` (только память); Xray той же версии, что на входе, — `ensure_xray` в `tools/xray-<ver>/` (GitHub XTLS, sha256 из .dgst,
+  .gitignore), клиент с http-входом, CONNECT вручную (`fetch`: системные исключения прокси не мешают). Итог — снимок `pce2e`; сквозная с сервера ок,
+  а с ПК 2 провала — «режется дорога до входа» (баннер, warn в overall). На стенде — `/etc/testbed-pc-e2e.json` (`-bad.json`).
+- Диагностика — кнопка у сервера → `/api/diag` → probe MODE "diag" (`diag()`: службы, xray fd/conntrack, туннели, наружу через wgN, журнал x-ui,
+  error.log Xray, маршрутизация, dmesg, фаервол) + что видит панель; `Dash._redact`: адреса серверов → [имя], прочие → [адрес-N], UUID/ключи скрыты.
 - Telegram DC (`dc_check` в probe): TCP 443 + первый шаг MTProto (obfuscated2 + req_pq_multi, AES-CTR через `openssl enc`, как censorcheck);
   `tcp` без `mt` — «молчит». На стенде — `dev/fake-mtproto.py` на 127.0.1.1…5:443 (настройка tg_dc стенда), молчащий DC — `/etc/testbed-mtproto.json`.
 - Консоль выхода «через вход»: меню у кнопки «Консоль» → `/ws/term?via=<вход>` → `SSHPool.connect(srv, pw, via)`: с входа на адрес выхода
@@ -73,7 +82,7 @@
   своя таблица `inet vpn_dash_gov` (`ct state != new accept`, keep4/keep6, gov4/gov6 → drop с counter), файл /etc/vpn-dash/govblock.nft,
   юнит `vpn-dash-govblock` (`nft -f`), nftables ставится пакетом, его служба не включается. `Dash.gov_apply`: who (адрес панели из
   SSH_CONNECTION + кто подключён к входящим) → keep, замер `_fw_probe` → apply с «ремнём» (`.prev` / delete table) → замер → confirm
-  или undo. Автообновление `gov_auto` раз в `gov_hours` — только где включено и sha списка поменялся (второе автоматическое
+  или undo. Где уже включено — `nft_update` (flush/add element в тех же наборах, счётчики правил целы; кнопка «Обновить список» = `/api/gov` do update, fresh). Счётчик через перезагрузки копит панель (`_gov_count`, `govdrops.json`). Автообновление `gov_auto` раз в `gov_hours` — только где включено и sha списка поменялся (второе автоматическое
   изменение на серверах). На стенде — `/etc/testbed-govblock-v4/v6.txt` (выдуманный список из адресов 127.x, `local_ok`).
 - Перевод выхода Docker → без Docker: задача `migrate` в provision.py (`start_migrate`, `/api/migrate`): на выходе
   `ONLY_AWG=1 vpn-exit-setup.sh` (только awg0), ufw allow + route allow; на входах `MIGRATE=1 vpn-add-exit.sh` —

@@ -71,7 +71,7 @@ def _watchdog(secs):
     signal.alarm(secs)
 
 
-_watchdog({"status": 80, "config": 55, "dc": 55, "fw": 50, "quality": 290, "lat": 100, "precheck": 115, "pkgs": 290, "dpi": 170}.get(MODE, 110))
+_watchdog({"status": 80, "config": 55, "dc": 55, "fw": 50, "quality": 290, "lat": 100, "precheck": 115, "pkgs": 290, "dpi": 170, "diag": 170}.get(MODE, 110))
 
 
 def mem_available_mb():
@@ -388,6 +388,183 @@ def xui():
         item["outbound"] = " → ".join(item["chain"])
         out["pinned"].append(item)
     return out
+
+
+E2E_URL = "https://www.cloudflare.com/cdn-cgi/trace"   # отвечает адресом и страной, с которых пришёл запрос
+
+
+def xray_e2e():
+    """Сквозная проверка входа: временный клиент Xray (тот же бинарник, что у 3X-UI) подключается к своему же входу
+    VLESS Reality — как телефон — и открывает страницу через все правила, цепочку резерва, DNS Xray и туннель.
+    Настройки сервера не меняются: процесс живёт секунды, его файл — во временной папке и удаляется."""
+    fake = "/etc/testbed-e2e-bad.json" if os.path.exists("/etc/testbed-e2e-bad.json") else "/etc/testbed-e2e.json"
+    if os.path.exists(fake):
+        try:
+            return json.load(open(fake))
+        except Exception:
+            return None
+    xb = [b for b in sorted(glob.glob("/usr/local/x-ui/bin/xray-linux-*")) if ".before" not in b]
+    if not xb or not xray_running():
+        return None
+    try:
+        db = sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True, timeout=5)
+        rows = db.execute("select port, listen, remark, settings, stream_settings from inbounds where enable=1 and protocol='vless'").fetchall()
+    except Exception as e:
+        return {"ok": False, "skip": True, "err": "x-ui.db: %s" % e}
+    why = "нет входа VLESS Reality по TCP"
+    for port, listen, remark, settings, ss in rows:
+        try:
+            st, sv = json.loads(ss or "{}"), json.loads(settings or "{}")
+        except ValueError:
+            continue
+        r = st.get("realitySettings") or {}
+        if st.get("security") != "reality" or st.get("network", "tcp") not in ("tcp", "raw") or not r.get("privateKey"):
+            continue
+        if (sv.get("decryption") or "none") != "none":
+            why = "вход с VLESS Encryption — такой клиент проверка не собирает"
+            continue
+        now_ms = time.time() * 1000
+        cl = [c for c in sv.get("clients") or [] if c.get("id") and c.get("enable", True) is not False
+              and not (0 < (c.get("expiryTime") or 0) < now_ms)]
+        cl.sort(key=lambda c: bool(c.get("limitIp")))     # лимит по IP не трогаем: проверка — ещё один адрес
+        if not cl:
+            why = "у входа нет включённых клиентов"
+            continue
+        c = cl[0]
+        flow = c.get("flow")
+        if flow is None:
+            try:
+                flow = (db.execute("select flow from clients where email=?", (c.get("email"),)).fetchone() or [""])[0]
+            except Exception:
+                flow = ""
+        pbk = (r.get("settings") or {}).get("publicKey")
+        if not pbk:
+            m = re.search(r"(?:Public key|Password[^:\n]*):\s*(\S+)", sh("%s x25519 -i '%s'" % (xb[0], r["privateKey"])))
+            pbk = m and m.group(1)
+        if not pbk:
+            return {"ok": False, "skip": True, "port": port, "err": "не узнать открытый ключ Reality"}
+        host = listen if listen and listen not in ("0.0.0.0", "::", "::0") else "127.0.0.1"
+        v = {"address": host, "port": port, "id": c["id"], "flow": flow or "",
+             "sni": (r.get("serverNames") or [""])[0], "pbk": pbk, "sid": next(iter(r.get("shortIds") or []), "")}
+        out = _e2e_run(xb[0], port, remark, v)
+        out["pc"] = dict(v, listen=listen or "")      # для проверки с ПК панели — та вынимает до сохранения статуса
+        return out
+    return {"ok": False, "skip": True, "err": why}
+
+
+def _e2e_run(xbin, port, remark, v):
+    import signal, shutil, socket, tempfile
+    t0 = time.time()
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    sp = s.getsockname()[1]
+    s.close()
+    cfg = {"log": {"loglevel": "none"},
+           "inbounds": [{"listen": "127.0.0.1", "port": sp, "protocol": "socks", "settings": {"udp": False}}],
+           "outbounds": [{"protocol": "vless",
+                          "settings": {"vnext": [{"address": v["address"], "port": v["port"],
+                                                  "users": [{"id": v["id"], "encryption": "none", "flow": v["flow"]}]}]},
+                          "streamSettings": {"network": "tcp", "security": "reality",
+                                             "realitySettings": {"serverName": v["sni"], "fingerprint": "chrome",
+                                                                 "publicKey": v["pbk"], "shortId": v["sid"]}}}]}
+    d = tempfile.mkdtemp(prefix="vpn-dash-e2e-")
+    out = {"ok": False, "port": port, "remark": remark}
+    p = None
+    try:
+        path = os.path.join(d, "c.json")
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
+            json.dump(cfg, f)
+        p = subprocess.Popen([xbin, "run", "-c", path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        _CHILDREN.add(p)
+        for _ in range(40):                 # ждём, пока клиент начнёт слушать
+            if p.poll() is not None:
+                out["err"] = "временный клиент Xray не запустился: " + (p.stderr.read() or "")[-200:].strip()
+                return out
+            try:
+                socket.create_connection(("127.0.0.1", sp), 0.2).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        rc, body, err = run("curl -s -m 12 --noproxy '' -w '\\ncode=%%{http_code}' --socks5-hostname 127.0.0.1:%d %s" % (sp, E2E_URL), 15)
+        kv = dict(l.split("=", 1) for l in body.splitlines() if "=" in l)
+        out["ms"] = int((time.time() - t0) * 1000)
+        if kv.get("code") == "200" and kv.get("ip"):
+            out.update(ok=True, ip=kv["ip"], loc=kv.get("loc", ""))
+        else:
+            code = kv.get("code") or "000"
+            out["err"] = ("страница через вход вернула HTTP %s" % code if code != "000" else
+                          "нет ответа за 12 с" if rc in (28, -9) else "соединение через вход оборвалось (curl %s)" % rc)
+        return out
+    finally:
+        if p is not None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+            _CHILDREN.discard(p)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ диагностика (кнопка «диагностика»)
+
+def diag():
+    """Всё, что обычно просят прислать при сбое, одним махом. Только чтение; ключи и пароли сюда не попадают,
+    адреса панель заменяет на имена уже у себя."""
+    out = []
+
+    def sec(title, cmd, timeout=20, tail=None):
+        rc, o, e = run(cmd, timeout)
+        txt = (o + (("\n" + e) if e.strip() and rc else "")).rstrip()
+        if tail:
+            txt = "\n".join(txt.splitlines()[-tail:])
+        out.append([title, txt or "(пусто)" if rc != -9 else "(не уложилось в %d с)" % timeout])
+
+    sec("время и нагрузка", "date -u; uptime; uname -r; free -m; df -h / | tail -1")
+    sec("службы", "systemctl --no-pager --plain list-units --type=service --state=failed | head -20; echo; "
+        "for u in x-ui fail2ban ufw nftables vpn-dash-govblock zapret2; do "
+        "systemctl list-unit-files $u.service >/dev/null 2>&1 && printf '%-20s %s\\n' $u \"$(systemctl is-active $u)\"; done; "
+        "for u in $(systemctl list-units --plain --no-legend 'awg-quick@*' | awk '{print $1}'); do printf '%-20s %s\\n' $u \"$(systemctl is-active $u)\"; done")
+    x = sh("pgrep -f 'xray-linux' | head -1")
+    if x:
+        sec("xray: процесс, файлы, соединения",
+            "ps -o pid,rss,etime,args -p %s | cut -c1-120; echo \"открыто файлов: $(ls /proc/%s/fd | wc -l) из $(awk '/open files/{print $4}' /proc/%s/limits)\"; "
+            "ss -s | head -3; echo \"conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null) из $(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)\"; "
+            "echo \"подключений к 443: $(ss -Htn state established '( sport = :443 )' | wc -l)\"" % (x, x, x))
+    if shutil.which("awg") or shutil.which("wg"):
+        sec("туннели AmneziaWG", "(awg show 2>/dev/null || wg show 2>/dev/null) | grep -E '^interface|endpoint|latest handshake|transfer|listening port'")
+    ifs = [i for i in sh("awg show interfaces 2>/dev/null").split() if re.fullmatch(r"[\w.-]{1,15}", i) and os.path.exists("/sys/class/net/" + i)]
+    if ifs:
+        sec("наружу через туннели", "; ".join(
+            ["printf '%s: '; curl -s -m 8 --noproxy '*' --interface %s https://ifconfig.me || echo нет; echo" % (i, i) for i in ifs]), 60)
+    if os.path.exists("/etc/x-ui/x-ui.db"):
+        sec("журнал x-ui (2 ч)", "journalctl -u x-ui --since '-2 hour' --no-pager | grep -vE 'accepted|TLS handshake error'", 20, 50)
+        try:
+            db = sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True, timeout=5)
+            t = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+            lg = (t.get("log") or {}).get("error") or ""
+            if lg and lg not in ("none",):
+                path = lg if lg.startswith("/") else next((p for p in ("/usr/local/x-ui/" + lg, "/usr/local/x-ui/bin/" + lg) if os.path.exists(p)), "")
+                if path:
+                    sec("ошибки Xray (%s)" % path, "tail -n 400 %s | grep -vE 'accepted' | tail -n 40" % path)
+            r = t.get("routing") or {}
+            lines = ["DNS: %s" % json.dumps((t.get("dns") or {}).get("servers"), ensure_ascii=False),
+                     "наблюдатель: %s" % ("есть" if t.get("observatory") or t.get("burstObservatory") else "нет")]
+            for b in r.get("balancers") or []:
+                lines.append("цепочка %s → %s, запасной %s" % (b.get("tag"), b.get("selector"), b.get("fallbackTag") or "—"))
+            for i, x in enumerate(r.get("rules") or []):
+                if any(str(t).startswith("_bl_") for t in x.get("inboundTag") or []):
+                    continue
+                k = {f: x[f] for f in ("inboundTag", "domain", "ip", "port", "network", "protocol") if f in x}
+                k = {f: (v[:3] + ["…"] if isinstance(v, list) and len(v) > 3 else v) for f, v in k.items()}
+                lines.append("правило %d %s → %s" % (i, json.dumps(k, ensure_ascii=False), x.get("balancerTag") or x.get("outboundTag")))
+            out.append(["маршрутизация Xray", "\n".join(lines)])
+        except Exception as e:
+            out.append(["маршрутизация Xray", "не прочитать: %s" % e])
+    sec("ядро (dmesg)", "dmesg -T 2>/dev/null | grep -iE 'conntrack|oom|killed process|table full|segfault|amnezia|link is down|hung task' | tail -n 15")
+    sec("фаервол", "ufw status 2>/dev/null | head -25; echo; nft list tables 2>/dev/null")
+    print(json.dumps({"sections": out}, ensure_ascii=False))
 
 
 # ------------------------------------------------------------------ веб-панель 3X-UI
@@ -1252,7 +1429,9 @@ def zapret_info():
 
 # ------------------------------------------------------------------ main
 
-if MODE == "config":
+if MODE == "diag":
+    diag()
+elif MODE == "config":
     print(json.dumps({"config": config_snapshot()}, ensure_ascii=False))
 elif MODE == "site":
     print(json.dumps({"site": site_check(globals().get("URLS") or [], globals().get("CHANNELS") or [],
@@ -1282,6 +1461,8 @@ else:
     # вход — туннели до выходов или 3X-UI на сервере, который сам не выход AmneziaWG
     if glob.glob(AWG_DIR + "/wg*.conf") or os.path.exists("/etc/x-ui/x-ui.db") and not data["exit"].get("awg"):
         data["entry"] = {"awg": awg_clients(), "xui": xui(), "mask": reality_mask()}
+        if os.path.exists("/etc/x-ui/x-ui.db"):
+            data["entry"]["e2e"] = xray_e2e()
     data["web"] = web_info()
     data["gov"] = gov_info()
     data["sw"] = sw_versions()

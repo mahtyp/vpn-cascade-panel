@@ -338,6 +338,11 @@ a.pill{text-decoration:none}a.pill:hover{text-decoration:underline;text-underlin
   <div class="head"><h3 id="job-title" style="flex-grow:1">Задача</h3>
     <button class="btn" data-act="close-job" aria-label="Закрыть">✕</button></div>
   <div id="job-body" style="overflow:auto"></div></div></div>
+<div class="modal hidden" id="diag-modal" role="dialog" aria-modal="true" aria-labelledby="diag-title"><div class="box" style="width:min(980px,100%)">
+  <div class="head"><h3 id="diag-title" style="flex-grow:1">Диагностика</h3><span class="sm muted">адреса и ключи скрыты — можно присылать</span>
+    <button class="btn" data-act="diag-copy">Скопировать</button><button class="btn" data-act="diag-save">Сохранить .txt</button>
+    <button class="btn" data-act="diag-close" aria-label="Закрыть">✕</button></div>
+  <pre id="diag-body" class="mono" style="margin:0;padding:16px 16px;overflow:auto;max-height:70vh;font-size:13px;line-height:1.5;color:var(--soft);white-space:pre-wrap"></pre></div></div>
 <div class="modal hidden" id="awg-modal" role="dialog" aria-modal="true" aria-labelledby="awg-title"><div class="box" style="width:min(760px,100%)">
   <div class="head"><h3 id="awg-title" style="flex-grow:1">Конфиг</h3><span class="sm muted">ключи скрыты — с сервера они не передаются</span>
     <button class="btn" data-act="awg-close" aria-label="Закрыть">✕</button></div>
@@ -478,6 +483,33 @@ function serverIssues(s) {
     else if (m.days != null && m.days < 7) out.push(["маскировка: у " + m.sni + " сертификат на " + Math.max(0, m.days) + " дн", "warn", "mask",
       tip + " Если сайт не продлит сертификат, маскировка сломается."]);
   }
+  const e2 = e && e.e2e;
+  if (e2 && !e2.skip && s.role === "entry") {     // сквозная: временный клиент Xray на входе, как телефон, через все правила и цепочку
+    const how = "Раз в проверку панель запускает на входе временный клиент Xray: он подключается к входу " + (e2.remark ? "«" + e2.remark + "» " : "")
+      + "(порт " + e2.port + ") как телефон и открывает страницу через все правила, цепочку резерва, DNS Xray и туннель. Настройки сервера не меняются.";
+    const sec = e2.ms != null ? ", " + (e2.ms / 1000).toFixed(1).replace(".", ",") + " с" : "";
+    if (e2.ok && e2.direct) out.push(["сквозная: выходит прямо с входа", "warn", "", how + " Страница открылась, но с адреса самого входа (" + e2.ip
+      + ") — мимо выходов. Проверьте в 3X-UI правила маршрутизации."]);
+    else if (e2.ok) out.push(["сквозная: через " + (e2.exit || e2.ip + (e2.loc ? " (" + e2.loc + ")" : "")) + sec, "info", "", how + " Ответ пришёл с адреса " + e2.ip + (e2.loc ? ", страна " + e2.loc : "") + "."]);
+    else out.push(["сквозная: трафик не идёт" + ((e2.fails || 0) < 2 ? " (1-я неудача)" : ""), (e2.fails || 0) >= 2 ? "bad" : "warn", "",
+      how + " Сейчас: " + (e2.err || "сбой") + ". Каналы до выходов при этом могут быть зелёными — значит, застрял сам Xray или его правила. "
+      + "Обычно помогает перезапуск Xray: в консоли входа systemctl restart x-ui (журнал до перезапуска: journalctl -u x-ui --since \"-1 hour\")."]);
+  }
+  const pc = s.role === "entry" && (S.pce2e || {})[s.id];
+  if (pc && pc.skip) out.push(["с ПК: не проверить", "warn", "", pc.err || ""]);
+  else if (pc) {
+    const how = "При полной проверке панель запускает на этом компьютере клиент Xray и открывает страницу через этот вход — по той же дороге, что телефон из дома. "
+      + "Сквозная с сервера проверяет сам вход, эта — ещё и дорогу до него.";
+    const sec = pc.ms != null ? ", " + (pc.ms / 1000).toFixed(1).replace(".", ",") + " с" : "";
+    if (pc.ok && pc.direct) out.push(["с ПК: выходит прямо с входа", "warn", "", how + " Страница открылась с адреса самого входа — мимо выходов."]);
+    else if (pc.ok) out.push(["с ПК: через " + (pc.exit || pc.ip + (pc.loc ? " (" + pc.loc + ")" : "")) + sec, "info", "", how + " Ответ пришёл с адреса " + pc.ip + "."]);
+    else {
+      const srvOk = e2 && e2.ok;
+      out.push(["с ПК: не открывается" + ((pc.fails || 0) < 2 ? " (1-я неудача)" : ""), (pc.fails || 0) >= 2 ? (srvOk ? "warn" : "bad") : "warn", "",
+        how + " Сейчас: " + (pc.err || "сбой") + "." + (srvOk ? " Сквозная с сервера при этом проходит — значит, сам вход работает, а режется дорога от вас до него "
+        + "(провайдер, ТСПУ или сеть хостера). Перезапуск Xray не поможет — переключите устройства на другой вход." : "")]);
+    }
+  }
   const sw = d.sw || {};
   const aw = sw.awg;
   if (aw) {
@@ -594,6 +626,14 @@ function renderOverview() {
     if (!m.skip && !m.ok && (m.fails || 0) >= 2) h += `<div class="banner bad-b"><b>${esc(e.name)}: через этот вход сейчас никто не подключится.</b>
       Сайт маскировки ${esc(m.sni)} (порт ${esc(m.port)}) не открывается с сервера — ${esc(MASK_ERR[m.err] || "ошибка")}, уже ${m.fails} проверки подряд.
       Поменяйте в 3X-UI target и SNI на живой сайт — подходящие соседи в <a href="#/addr" data-act="mask" data-id="${esc(e.id)}">«Качестве»</a>.</div>`;
+  for (const e of entries) { const e2 = ((((e.state || {}).data || {}).entry || {}).e2e) || {};
+    if (!e2.skip && e2.ok === false && (e2.fails || 0) >= 2) h += `<div class="banner bad-b"><b>${esc(e.name)}: через вход не ходит трафик.</b>
+      Сквозная проверка (временный клиент Xray на самом входе, как телефон) не открыла страницу уже ${e2.fails} раза подряд: ${esc(e2.err || "сбой")}.
+      Если каналы до выходов зелёные — застрял сам Xray: перезапустите его в консоли входа (<code>systemctl restart x-ui</code>).</div>`;
+    const pc = (S.pce2e || {})[e.id] || {};
+    if (e2.ok && !pc.skip && pc.ok === false && (pc.fails || 0) >= 2) h += `<div class="banner"><b>${esc(e.name)}: сам вход работает, а с этого компьютера до него не достучаться.</b>
+      Сквозная проверка с сервера проходит, а через вход с этого компьютера страница не открывается уже ${pc.fails} раза подряд: ${esc(pc.err || "сбой")}.
+      Режется дорога до входа — у провайдера или в сети хостера. Перезапуск Xray не поможет: переключите устройства на другой вход и подождите.</div>`; }
   if (!S.keyring) h += `<div class="banner">Не установлен модуль keyring: пароли хранятся только до перезапуска панели. Запустите start.bat ещё раз.</div>`;
 
   h += `<div class="tiles">
@@ -652,10 +692,11 @@ function renderOverview() {
         <span class="sm muted">${sy ? esc(upFmt(sy.uptime_s)) : st ? esc(ago(st.at)) : ""}</span><span class="sm muted">${sy ? esc((sy.os || "").replace(" LTS", "") + ", " + sy.kernel) : ""}</span>
         <span class="row" style="gap:8px"><button class="btn sm" style="min-height:30px;padding:0 12px" data-act="server" data-id="${esc(s.id)}" ${run ? "disabled" : ""} title="Проверить сервер ещё раз">${spinIcon(run)}${run ? "проверяю" : "проверить"}</button>
         ${st && st.ok ? `<button class="btn sm" style="min-height:30px;padding:0 12px" data-act="pkgs" data-id="${esc(s.id)}" title="Какие обновления пакетов есть, можно ли ставить, установить">обновления</button>` : ""}
+        ${s.has_password ? `<button class="btn sm" style="min-height:30px;padding:0 12px" data-act="diag" data-id="${esc(s.id)}" ${isRun("diag:" + s.id) ? "disabled" : ""} title="Собрать всё для разбора сбоя одним текстом: журналы, туннели, соединения, проверки панели. Адреса и ключи скрыты — можно присылать">${isRun("diag:" + s.id) ? spinIcon(true) + "собираю" : "диагностика"}</button>` : ""}
         ${st && st.ok && st.data.web && st.data.web.openable ? `<a class="btn sm" style="min-height:30px;padding:0 12px;text-decoration:none" href="/xui/open?id=${encodeURIComponent(s.id)}" target="_blank" rel="noopener" title="Открыть веб-панель 3X-UI этого сервера через SSH — даже если она закрыта из интернета">3X-UI</a>` : ""}</span></div>
       <div style="display:flex;flex-direction:column;gap:4px">${meters}${sy ? hwLines(sy) : ""}</div>
       <div class="chips">${serverChips(s).map(([l, c, act, tip]) => act ? `<button class="chip ${c}" style="cursor:pointer;font:inherit;font-size:13px;border:0" data-act="${act}" data-id="${esc(s.id)}" title="${esc(tip)}" ${isRun("xui:" + s.id) ? "disabled" : ""}>${esc(l)}</button>` : `<span class="chip ${c}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(l)}</span>`).join("")}</div>
-      <div class="chips">${serverIssues(s).map(([l, c, act, tip]) => act ? `<button class="iss ${c}" data-act="${act}" data-id="${esc(s.id)}" title="${esc(tip || "Открыть: какие обновления, можно ли ставить, установить")}" ${act.startsWith("xui") && isRun("xui:" + s.id) || act === "acme-80" && isRun("acme:" + s.id) ? "disabled" : ""}>${esc(l)}</button>` : `<span class="iss ${c}">${esc(l)}</span>`).join("")}</div></div>`;
+      <div class="chips">${serverIssues(s).map(([l, c, act, tip]) => act ? `<button class="iss ${c}" data-act="${act}" data-id="${esc(s.id)}" title="${esc(tip || "Открыть: какие обновления, можно ли ставить, установить")}" ${act.startsWith("xui") && isRun("xui:" + s.id) || act === "acme-80" && isRun("acme:" + s.id) ? "disabled" : ""}>${esc(l)}</button>` : `<span class="iss ${c}"${tip ? ` title="${esc(tip)}" style="cursor:help"` : ""}>${esc(l)}</span>`).join("")}</div></div>`;
   }
   h += `</div></div></section>`;
 
@@ -2434,10 +2475,11 @@ function renderFw() {
       ${p && p.state === "on" ? `<button class="btn sm" style="min-height:30px" data-act="fw-off" data-id="${esc(s.id)}" ${busyAny || run ? "disabled" : ""}>Выключить</button>` : ""}</div>`;
     if (s.role === "entry") {
       const gi = (((s.state || {}).data || {}).gov) || null, gm = (gi && gi.meta) || {}, grun = isRun("govon:" + s.id);
-      const txt = gi && gi.on ? `<span class="pill ok sm">не пускаются</span> <span class="sm muted">список от ${esc((gm.date || "?").split("-").reverse().join("."))}, ${gm.n4 || 0} сетей, отсечено подключений: ${gi.drops || 0}${gi.boot ? "" : ", <span style='color:var(--warn)'>после перезагрузки не включится</span>"}${gi.undo ? ", ждёт подтверждения" : ""}</span>`
+      const txt = gi && gi.on ? `<span class="pill ok sm">не пускаются</span> <span class="sm muted">список от ${esc((gm.date || "?").split("-").reverse().join("."))}, ${gm.n4 || 0} сетей, отсечено подключений: ${gi.drops || 0}${G.sha && gm.sha && gm.sha !== G.sha && G.at ? `, <span style="color:var(--warn)">есть список новее (от ${esc(new Date(G.at * 1000).toLocaleDateString("ru-RU"))})</span>` : ""}${gi.boot ? "" : ", <span style='color:var(--warn)'>после перезагрузки не включится</span>"}${gi.undo ? ", ждёт подтверждения" : ""}</span>`
         : `<span class="pill sm">пускаются</span>`;
-      h += `<div class="list-row" style="padding:12px 16px;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><b style="font-weight:500">Сети госорганов:</b> ${txt}<div style="flex-grow:1"></div>
-        ${gi && gi.on ? `<button class="btn sm" style="min-height:30px" data-act="gov-off" data-id="${esc(s.id)}" ${gBusy ? "disabled" : ""}>Пускать снова</button>`
+      h += `<div class="list-row" style="padding:12px 16px;gap:12px;align-items:center;border-bottom:1px solid var(--border)"><b style="font-weight:500;white-space:nowrap">Сети госорганов:</b> ${txt}<div style="flex-grow:1"></div>
+        ${gi && gi.on ? `<button class="btn ${G.sha && gm.sha && gm.sha !== G.sha ? "primary " : ""}sm" style="min-height:30px;white-space:nowrap;flex-shrink:0" data-act="gov-update" data-id="${esc(s.id)}" ${gBusy ? "disabled" : ""}>${grun ? spinIcon(true) : ""}Обновить список</button>
+          <button class="btn sm" style="min-height:30px;white-space:nowrap;flex-shrink:0" data-act="gov-off" data-id="${esc(s.id)}" ${gBusy ? "disabled" : ""}>Пускать снова</button>`
           : `<button class="btn primary sm" style="min-height:30px" data-act="gov-on" data-id="${esc(s.id)}" ${gBusy || !G.at && G.error ? "disabled" : ""}>${grun ? spinIcon(true) : ""}Не пускать</button>`}</div>`;
       const gj = (S.govjob || {})[s.id];
       if (gj && (!gj.done || S.now - gj.at < 1800)) h += `<div style="padding:12px 16px;display:flex;flex-direction:column;gap:4px;background:var(--acc-bg);border-bottom:1px solid var(--border)">
@@ -2638,6 +2680,25 @@ document.addEventListener("click", async (ev) => {
     awgMimic(b.dataset.id, b.dataset.iface, a === "awg-mimic" ? (sel ? sel.value : "quic") : ""); return; }
   if (a === "awg-conf") { const x = AWG.idx[b.dataset.k]; if (!x) return; $("#awg-title").textContent = x.title; $("#awg-body").textContent = x.conf; $("#awg-modal").classList.remove("hidden"); return; }
   if (a === "awg-close") { $("#awg-modal").classList.add("hidden"); return; }
+  if (a === "diag") {
+    S.running.push("diag:" + id); render();
+    let r;
+    try { r = await api("/api/diag", { id }); } finally { S.running = S.running.filter((x) => x !== "diag:" + id); render(); }
+    if (!r || r.error) { toast((r && r.error) || "не получилось", "bad"); return; }
+    DIAG = r; $("#diag-title").textContent = "Диагностика: " + r.name; $("#diag-body").textContent = r.text;
+    $("#diag-modal").classList.remove("hidden"); return;
+  }
+  if (a === "diag-close") { $("#diag-modal").classList.add("hidden"); return; }
+  if (a === "diag-copy") {
+    try { await navigator.clipboard.writeText(DIAG.text); toast("Скопировано — вставьте в чат"); }
+    catch (_) { const rg = document.createRange(); rg.selectNodeContents($("#diag-body")); const sl = getSelection(); sl.removeAllRanges(); sl.addRange(rg); toast("Выделено — нажмите Ctrl+C"); }
+    return;
+  }
+  if (a === "diag-save") {
+    const u = URL.createObjectURL(new Blob([DIAG.text], { type: "text/plain;charset=utf-8" }));
+    const l = document.createElement("a"); l.href = u; l.download = "диагностика-" + DIAG.name + "-" + new Date().toISOString().slice(0, 16).replace(/[T:]/g, "-") + ".txt";
+    document.body.appendChild(l); l.click(); l.remove(); setTimeout(() => URL.revokeObjectURL(u), 1000); return;
+  }
   if (a === "addr-all") {
     const run = new Set((S.addrjobs || []).filter((j) => j.status === "run").map((j) => j.kind + ":" + j.sid));
     for (const sv of S.servers) for (const k of ["geo", "nb", "dns"]) if (!run.has(k + ":" + sv.id)) await api("/api/" + k, { id: sv.id });
@@ -2648,6 +2709,14 @@ document.addEventListener("click", async (ev) => {
     b.disabled = true; const r = await api("/api/gov", { do: "fetch" }); b.disabled = false;
     if (r.error) alert(r.error);
     S = await api("/api/state"); renderFw(); return;
+  }
+  if (a === "gov-update") {
+    const sv = S.servers.find((x) => x.id === id);
+    if (!confirm("Обновить список сетей госорганов на «" + sv.name + "»?\n\nПанель скачает свежий список и заменит его в той же таблице — счётчик отсечённых не сбросится. "
+      + "Как при включении: замер до и после, что-то сломалось — вернёт как было. Если на сервере уже этот список — ничего не меняет.")) return;
+    const r = await api("/api/gov", { id, do: "update" });
+    if (r.error) { toast(r.error, "bad"); return; }
+    S = await api("/api/state"); renderFw(); schedule(1500); return;
   }
   if (a === "gov-on" || a === "gov-off") {
     const sv = S.servers.find((x) => x.id === id);
@@ -2974,11 +3043,14 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("#chart-modal").classList.contains("hidden")) $("#chart-modal").classList.add("hidden");
   if (!$("#awg-modal").classList.contains("hidden")) $("#awg-modal").classList.add("hidden");
+  if (!$("#diag-modal").classList.contains("hidden")) $("#diag-modal").classList.add("hidden");
   if (!$("#pkg-modal").classList.contains("hidden")) closePkgs();
   if (!$("#job-modal").classList.contains("hidden")) closeJob();
 });
 $("#chart-modal").addEventListener("click", (e) => { if (e.target.id === "chart-modal") e.target.classList.add("hidden"); });
 $("#awg-modal").addEventListener("click", (e) => { if (e.target.id === "awg-modal") e.target.classList.add("hidden"); });
+$("#diag-modal").addEventListener("click", (e) => { if (e.target.id === "diag-modal") e.target.classList.add("hidden"); });
+let DIAG = { text: "", name: "" };
 load();
 </script>
 </body>

@@ -53,6 +53,7 @@ KNOWN_HOSTS = APP / "known_hosts"
 LOG_FILE = APP / "checks.log"
 HIST_FILE = APP / "history.db"
 GOV_FILE = APP / "govblock.json"        # «Сети госорганов»: последний скачанный список (только адреса сетей)
+GOVDROPS_FILE = APP / "govdrops.json"   # «Сети госорганов»: счётчик отсечённых по входам, копится через перезагрузки серверов
 ADDR_FILE = APP / "addrcheck.json"      # «Качество»: последние «как видят» и «соседи» по серверам (адреса — только здесь)
 BACKUP_DIR = APP / "backups"
 BACKUP_SCRIPT = APP / "server-scripts" / "vpn-backup.sh"
@@ -107,6 +108,9 @@ SETTINGS = [
     ("check_url", "https://ifconfig.me", "url", None, None, "Проверки", "Адрес для проверки канала",
      "Должен отвечать голым IP-адресом. Другие варианты: https://api.ipify.org, https://icanhazip.com"),
     ("hs_stale_min", 5, "int", 1, 120, "Проверки", "Рукопожатие AWG считать старым после, мин", ""),
+    ("pc_e2e", True, "bool", None, None, "Проверки", "Проверять входы и с этого компьютера",
+     "При полной проверке панель запускает у себя клиент Xray (скачивается с GitHub XTLS при первой проверке) и открывает страницу "
+     "через каждый вход — как телефон. Вместе со сквозной проверкой с сервера видно, сломался вход или режется дорога до него."),
     ("cpu_warn", 60, "int", 1, 100, "Пороги", "CPU: жёлтый от, %", ""),
     ("cpu_bad", 85, "int", 1, 100, "Пороги", "CPU: красный от, %", ""),
     ("mem_warn", 75, "int", 1, 100, "Пороги", "Память: жёлтый от, %", ""),
@@ -791,6 +795,14 @@ def classify_pkgs(info, srv, is_main):
     notes = [{"level": lvl, "label": label, "text": text} for label, (lvl, text) in tags_seen.items()]
     if "Docker" in tags_seen and srv["role"] == "exit":
         notes.append({"level": "info", "label": "", "text": "пока Docker перезапускается, трафик сам уйдёт на следующий выход в цепочке"})
+    cur = re.match(r"(\d+\.\d+)", info.get("kernel") or "")
+    for it in todo:     # ядро новой серии (6.8 → 7.0): модуль AmneziaWG может под него не собраться
+        m = re.match(r"(\d+\.\d+)\.", it.get("new") or "")
+        if cur and m and re.match(r"^linux-(image-)?(generic|virtual|azure|aws|gcp|kvm|oem)", it["name"]) and m.group(1) != cur.group(1):
+            notes.append({"level": "warn", "label": "", "text": "приедет ядро новой серии %s (сейчас %s). Модуль AmneziaWG может под него не "
+                          "собраться — панель проверит это после установки и, если не собрался, уберёт это ядро: сервер останется на "
+                          "текущем, перезагрузки в него не будет" % (m.group(1), cur.group(1))})
+            break
     if is_main and any(n["level"] == "warn" for n in notes):
         notes.append({"level": "warn", "label": "", "text": "через этот вход идёт трафик всех устройств — возможен короткий перерыв, "
                                                            "удобнее ставить, когда VPN не нужен"})
@@ -827,6 +839,9 @@ class Dash:
         self.lock = threading.RLock()
         self.status = {}        # sid -> {at, ok, error, data}
         self.mask_fail = {}     # (sid, порт) -> сколько проверок подряд сайт маскировки не открывается с сервера
+        self.e2e_fail = {}      # sid -> сколько проверок подряд не прошла сквозная проверка через Xray входа
+        self.e2e_params = {}    # sid -> параметры клиента для проверки с ПК (UUID и т. п.) — только в памяти, на страницу не уходят
+        self.pc_e2e = {}        # sid -> итог проверки с этого компьютера {ok, ip, loc, ms, err, at, fails, exit}
         self.channels = {}      # entry sid -> [channel]
         self.results = {}       # "entry:key" -> {status, ip, ms, at, error}
         self.dc = {}            # exit sid -> {at, cells|error}
@@ -840,6 +855,10 @@ class Dash:
             self.gov = json.loads(GOV_FILE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.gov = {}       # {at, sha, v4, v6, bad, error, tried}: список сетей госорганов (govblock.fetch)
+        try:
+            self.gov_drops = json.loads(GOVDROPS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.gov_drops = {}  # sid -> {base, last, since}: счётчик nftables сбрасывается при перезагрузке — копим здесь
         self.xui_web = {}       # sid -> {port, path, https, domain, listen}: веб-панель 3X-UI (путь — только здесь, не на странице)
         self.geo = {}           # sid -> итог «как видят адрес» (ipcheck.summarize + at)
         self.nb = {}            # sid -> итог «шумные соседи» (neighbors.summarize + at)
@@ -1358,6 +1377,32 @@ class Dash:
         self._gov_save()
         return g
 
+    def _gov_count(self, sid, gi):
+        """Счётчик «отсечено подключений» с момента включения: после перезагрузки сервера nftables считает с нуля,
+        панель прибавляет то, что было до неё. Выключили защиту — счёт заново."""
+        rec = self.gov_drops.get(sid)
+        if not gi or not gi.get("on"):
+            if rec is None:
+                return
+            self.gov_drops.pop(sid, None)
+        else:
+            cur = int(gi.get("drops") or 0)
+            old = dict(rec) if rec else None
+            if rec is None:
+                rec = self.gov_drops[sid] = {"base": 0, "last": cur, "since": now()}
+            elif cur < rec["last"]:             # сервер перезагрузился или таблица поставлена заново
+                rec["base"] += rec["last"]
+            rec["last"] = cur
+            gi["drops"], gi["since"] = rec["base"] + cur, rec["since"]
+            if rec == old:
+                return
+        try:
+            tmp = GOVDROPS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.gov_drops), encoding="utf-8")
+            os.replace(tmp, GOVDROPS_FILE)
+        except OSError:
+            pass
+
     def _gov_save(self):
         try:
             tmp = GOV_FILE.with_suffix(".tmp")
@@ -1379,8 +1424,9 @@ class Dash:
             raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:300])
         return json.loads(lines[-1])
 
-    def gov_apply(self, sid, auto=False):
-        """Включить (или обновить список) на входе: свои адреса — в исключения, замер до и после, «ремень» на 5 минут."""
+    def gov_apply(self, sid, auto=False, fresh=False):
+        """Включить (или обновить список) на входе: свои адреса — в исключения, замер до и после, «ремень» на 5 минут.
+        auto — обновление списка там, где уже включено; fresh — сначала скачать список заново (кнопка «Обновить список»)."""
         import govblock
         srv = self.cfg.by_id(sid)
         job = {"at": now(), "do": "update" if auto else "enable", "steps": [], "ok": None, "done": False}
@@ -1397,7 +1443,8 @@ class Dash:
 
         with self.busy("govon:" + sid):
             g = self.gov
-            if not g.get("v4") or now() - (g.get("at") or 0) > 24 * 3600:
+            gi = ((self.status.get(sid) or {}).get("data") or {}).get("gov") or {}
+            if fresh or not g.get("v4") or now() - (g.get("at") or 0) > 24 * 3600:
                 step("info", "скачиваю список с GitHub")
                 try:
                     g = self.gov_fetch()
@@ -1420,15 +1467,20 @@ class Dash:
             for a, n in peers:
                 step("warn", "к входу сейчас подключён %s из сети %s — оставляю открытым (если это не ваш, уберите в «Настройках»)" % (a, n))
             keep = sorted(set(keep + [a for a, _ in govblock.hits(nets, mine)] + [a for a, _ in peers]))
+            gm = gi.get("meta") or {}
+            if fresh and gi.get("on") and gm.get("sha") == g["sha"] and sorted(gm.get("keep") or []) == keep:
+                return finish(True, "на сервере уже этот список (от %s) — менять нечего"
+                              % time.strftime("%d.%m", time.localtime(g["at"])))
             chans = self._fw_channels(sid)
             step("info", "замеряю, как всё работает сейчас: SSH, %d каналов, порты входа с этого компьютера" % len(chans))
             ssh0, ch0, ports0 = self._fw_probe(srv, chans)
             meta = {"date": time.strftime("%Y-%m-%d", time.localtime(g["at"])), "sha": g["sha"], "n4": len(g["v4"]),
                     "n6": len(g["v6"]), "keep": keep, "at": now()}
             try:
-                step("info", "ставлю таблицу nftables: %d сетей IPv4, %d IPv6; «ремень» — всё вернётся само через 5 минут"
-                     % (len(g["v4"]), len(g["v6"])))
-                res = self._gov_run(srv, {"do": "apply", "nft": govblock.nft_script(g["v4"], g["v6"], keep), "meta": meta,
+                step("info", ("меняю списки в той же таблице nftables (счётчик не сбрасывается)" if gi.get("on") else "ставлю таблицу nftables")
+                     + ": %d сетей IPv4, %d IPv6; «ремень» — всё вернётся само через 5 минут" % (len(g["v4"]), len(g["v6"])))
+                res = self._gov_run(srv, {"do": "apply", "nft": govblock.nft_script(g["v4"], g["v6"], keep),
+                                          "upd": govblock.nft_update(g["v4"], g["v6"], keep), "meta": meta,
                                           "undo_s": 300}, timeout=600)
             except CheckError as e:
                 return finish(False, "не дошло до сервера: %s — если успело включиться, через 5 минут вернётся само" % e)
@@ -1594,6 +1646,14 @@ class Dash:
                     raise CheckError("проверочный скрипт: %s" % (
                         "не уложился в 80 с — сервер перегружен?" if rc == 3 else (err.strip().splitlines() or ["код %s" % rc])[-1][:200]))
                 data = json.loads(out)
+                e2 = (data.get("entry") or {}).get("e2e")
+                if isinstance(e2, dict) and "pc" in e2:          # параметры клиента — в память, из статуса убрать
+                    v = e2.pop("pc")
+                    ls = v.pop("listen", "")
+                    v["address"] = ls if ls and ls not in ("0.0.0.0", "::", "::0") and not ls.startswith("127.") else srv["host"]
+                    v["ver"] = (((data.get("entry") or {}).get("xui") or {}).get("xray") or "")
+                    self.e2e_params[sid] = v
+                self._gov_count(sid, data.get("gov"))
                 sysd = data.get("system") or {}
                 if sysd.get("updates") is not None:
                     self.pkg_count[sid] = {"at": now(), "n": sysd["updates"]}
@@ -1617,6 +1677,15 @@ class Dash:
                         k = (sid, m.get("port"))
                         self.mask_fail[k] = 0 if m.get("ok") else self.mask_fail.get(k, 0) + 1
                         m["fails"] = self.mask_fail[k]
+                    e2 = (data.get("entry") or {}).get("e2e")
+                    if e2 and not e2.get("skip"):          # сквозная: как телефон, через сам Xray входа
+                        self.e2e_fail[sid] = 0 if e2.get("ok") else self.e2e_fail.get(sid, 0) + 1
+                        e2["fails"] = self.e2e_fail[sid]
+                        ex = next((x for x in self.cfg.servers if x["role"] == "exit" and x.get("host") == e2.get("ip")), None)
+                        if ex:
+                            e2["exit"] = ex["name"]
+                        elif e2.get("ip") and e2["ip"] == srv.get("host"):
+                            e2["direct"] = True        # вышло прямо с входа, мимо выходов
             except CheckError as e:
                 st = {"at": now(), "ok": False, "error": str(e)}
             except Exception as e:
@@ -1873,6 +1942,113 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                     self.note("ok", "%s: порт %s (%s) снова открывается" % (s["name"], port, label))
             list(self.leaf.map(one, self.reach_targets()))
 
+    def check_pc_e2e(self):
+        """Проверка входов с этого компьютера: клиент Xray у себя → вход → цепочка → страница Cloudflare."""
+        import pce2e
+        with self.busy("pce2e"):
+            stand = os.environ.get("VPN_DASH_STAND") == "1"
+            ents = [s for s in self.cfg.servers if s["role"] == "entry" and (stand or s["id"] in self.e2e_params)]
+            bins = {}
+
+            def one(s):
+                sid = s["id"]
+                if stand:      # стенд: Reality настоящий не поднять — готовый ответ
+                    f = "/etc/testbed-pc-e2e-bad.json" if os.path.exists("/etc/testbed-pc-e2e-bad.json") else "/etc/testbed-pc-e2e.json"
+                    try:
+                        r = json.load(open(f, encoding="utf-8"))
+                    except (OSError, ValueError):
+                        return
+                else:
+                    v = self.e2e_params[sid]
+                    ver = v.get("ver") or "26.10.31"
+                    try:
+                        if ver not in bins:
+                            bins[ver] = pce2e.ensure_xray(ver, str(APP))
+                    except Exception as e:
+                        bins[ver] = None
+                        r = {"ok": False, "skip": True, "err": "не удалось взять Xray %s с GitHub для проверки: %s" % (ver, str(e)[:120])}
+                    else:
+                        if bins[ver] is None:
+                            r = {"ok": False, "skip": True, "err": "Xray %s для проверки не скачался (см. соседний вход)" % ver}
+                        else:
+                            try:
+                                r = pce2e.run(bins[ver], v, v["address"], timeout=int(self.cfg.settings.get("channel_timeout") or 15))
+                            except Exception as e:
+                                r = {"ok": False, "skip": True, "err": "проверка с ПК сломалась: %s: %s" % (type(e).__name__, str(e)[:120])}
+                prev = self.pc_e2e.get(sid) or {}
+                if not r.get("skip"):
+                    r["fails"] = 0 if r.get("ok") else prev.get("fails", 0) + 1
+                ex = next((x for x in self.cfg.servers if x["role"] == "exit" and x.get("host") == r.get("ip")), None)
+                if ex:
+                    r["exit"] = ex["name"]
+                elif r.get("ip") and r["ip"] == s.get("host"):
+                    r["direct"] = True
+                r["at"] = now()
+                with self.lock:
+                    self.pc_e2e[sid] = r
+                if r.get("fails") == 2:
+                    self.note("bad", "%s: с этого компьютера через вход не открывается (%s)" % (s["name"], r.get("err") or "сбой"))
+                elif r.get("ok") and prev.get("fails", 0) >= 2:
+                    self.note("ok", "%s: с этого компьютера через вход снова открывается" % s["name"])
+            list(self.leaf.map(one, ents))
+
+    # --- диагностика одним файлом (кнопка «диагностика» у сервера)
+
+    def diag(self, sid):
+        srv = self.cfg.by_id(sid)
+        if not srv:
+            return {"error": "нет такого сервера"}
+        rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "diag"\n' + PROBE, timeout=200)
+        try:
+            secs = json.loads(out.strip().splitlines()[-1])["sections"]
+        except Exception:
+            return {"error": "сервер не ответил: " + ((err or out).strip().splitlines() or ["код %s" % rc])[-1][:200]}
+        st = self.status.get(sid) or {}
+        d = st.get("data") or {}
+        e = d.get("entry") or {}
+        lines = ["проверка панели: %s, %s" % (time.strftime("%d.%m %H:%M", time.localtime(st["at"])) if st.get("at") else "—",
+                                              "на связи" if st.get("ok") else "нет связи: %s" % st.get("error"))]
+        if e.get("e2e"):
+            lines.append("сквозная с сервера: %s" % json.dumps(e["e2e"], ensure_ascii=False))
+        if self.pc_e2e.get(sid):
+            lines.append("с этого компьютера: %s" % json.dumps(self.pc_e2e[sid], ensure_ascii=False))
+        for m in e.get("mask") or []:
+            lines.append("маскировка: %s" % json.dumps({k: m.get(k) for k in ("port", "sni", "ok", "err", "tls", "alpn", "days", "fails")}, ensure_ascii=False))
+        for c in self.channels.get(sid, []):
+            r = self.results.get("%s:%s" % (sid, c["key"])) or {}
+            lines.append("канал %s: %s %s" % (c.get("key"), r.get("status", "—"), r.get("error") or ("%s с" % r.get("time") if r.get("time") else "")))
+        for r in self.reach.values():
+            if r.get("entry") == sid:
+                lines.append("порт %s (%s) с этого компьютера: %s" % (r.get("port"), r.get("label"), "открыт" if r.get("ok") else r.get("error")))
+        secs.insert(0, ["что видит панель", "\n".join(lines)])
+        text = "Диагностика: %s (%s), %s\n" % (srv["name"], "вход" if srv["role"] == "entry" else "выход", time.strftime("%Y-%m-%d %H:%M"))
+        text += "".join("\n== %s\n%s\n" % (t, b) for t, b in secs)
+        return {"name": srv["name"], "text": self._redact(text)}
+
+    def _redact(self, text):
+        """Адреса серверов → [имя], прочие адреса → [адрес-N], UUID и ключи → скрыты. Домены остаются."""
+        names = {s["host"]: s["name"] for s in self.cfg.servers}
+        seen = {}
+
+        def ip4(m):
+            a = m.group(0)
+            if a in names:
+                return "[%s]" % names[a]
+            if a.startswith(("127.", "10.", "192.168.", "0.")) or re.match(r"172\.(1[6-9]|2\d|3[01])\.", a) or a in ("1.1.1.1", "8.8.8.8", "9.9.9.9", "1.0.0.1"):
+                return a
+            if a not in seen:
+                seen[a] = "[адрес-%d]" % (len(seen) + 1)
+            return seen[a]
+        for h, n in names.items():
+            if not re.fullmatch(r"[\d.]+", h):
+                text = text.replace(h, "[%s]" % n)
+        text = re.sub(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", "[uuid]", text)
+        text = re.sub(r"(?<![\w/.-])[A-Za-z0-9+/_-]{40,}={0,2}", "[ключ]", text)
+        text = re.sub(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", ip4, text)
+        text = re.sub(r"\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})+::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?\b", "[адрес6]", text)
+        text = re.sub(r"\b(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}\b", "[адрес6]", text)
+        return text
+
     # --- сравнение входов
 
     def drift_main(self):
@@ -2030,6 +2206,8 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             entries = [s["id"] for s in self.cfg.servers if s["role"] == "entry" and self.status.get(s["id"], {}).get("ok")]
             jobs = [self.pool.submit(self.check_entry_channels, e) for e in entries]
             jobs.append(self.pool.submit(self.check_reach))
+            if self.cfg.settings.get("pc_e2e", True):
+                jobs.append(self.pool.submit(self.check_pc_e2e))
             if self.cfg.settings.get("drift_auto", True):
                 jobs.append(self.pool.submit(self.check_drift))
             if with_dc:
@@ -2098,6 +2276,12 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             for m in ((status[s["id"]].get("data") or {}).get("entry") or {}).get("mask") or []:
                 if not m.get("skip") and not m.get("ok") and m.get("fails", 0) >= 2:     # одна неудача — может быть случайность
                     bad.append("%s: сайт маскировки %s не открывается — клиенты через этот вход не подключатся" % (s["name"], m.get("sni")))
+            e2 = ((status[s["id"]].get("data") or {}).get("entry") or {}).get("e2e") or {}
+            if not e2.get("skip") and e2.get("ok") is False and e2.get("fails", 0) >= 2:
+                bad.append("%s: через вход не ходит трафик (сквозная проверка: %s)" % (s["name"], e2.get("err") or "сбой"))
+            pc = self.pc_e2e.get(s["id"]) or {}
+            if not pc.get("skip") and pc.get("ok") is False and pc.get("fails", 0) >= 2 and e2.get("ok"):
+                warn.append("%s: сам вход работает, но с этого компьютера до него не достучаться — режется дорога до входа" % s["name"])
             rs = [(c, results.get("%s:%s" % (s["id"], c["key"]))) for c in chans.get(s["id"], [])]
             rs = [(c, r) for c, r in rs if r]
             if not rs:
@@ -2209,7 +2393,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                 chans[sid] = [dict(c, **self._exit_label(c), result=self.results.get("%s:%s" % (sid, c["key"]))) for c in lst]
             return {
                 "now": now(), "servers": servers, "channels": chans, "dc": self.dc,
-                "reach": list(self.reach.values()), "running": sorted(self.running),
+                "reach": list(self.reach.values()), "running": sorted(self.running), "pce2e": self.pc_e2e,
                 "log": self.log[-60:][::-1], "settings": self.cfg.settings,
                 "keyring": bool(keyring), "slow_s": float(self.cfg.settings.get("slow_s") or 2),
                 "abuse_key": bool(self.cfg.get_pw("_abuseipdb_key")),
@@ -2909,7 +3093,7 @@ class Handler(BaseHTTPRequestHandler):
                     j.update(ok=False, done=True)
             D.pool.submit(job)
             return self._send(200, {"ok": True})
-        if p == "/api/gov":                     # «сети госорганов» на входе: enable | off | fetch
+        if p == "/api/gov":                     # «сети госорганов» на входе: enable | update | off | fetch
             do = str(body.get("do") or "")
             if do == "fetch":
                 try:
@@ -2922,7 +3106,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "это не вход — список нужен только на входах"})
             if any(k.startswith(("govon:", "fwon:")) for k in D.running):
                 return self._send(409, {"error": "уже идёт включение на другом сервере — по одному"})
-            def gjob(f=D.gov_apply if do == "enable" else D.gov_off, sid=srv["id"]):
+            f = {"enable": D.gov_apply, "update": lambda sid: D.gov_apply(sid, auto=True, fresh=True)}.get(do, D.gov_off)
+            def gjob(f=f, sid=srv["id"]):
                 try:
                     f(sid)
                 except Exception as e:          # чтобы окно не крутилось вечно
@@ -2987,6 +3172,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send(409, {"error": str(e)})
             return self._send(200, {"ok": True, "job": jid})
+        if p == "/api/diag":                     # диагностика сервера одним текстом (адреса и ключи скрыты)
+            return self._send(200, D.diag(body.get("id", "")))
         if p == "/api/abusekey":                 # ключ AbuseIPDB для «Качества» — только в keyring, на страницу не уходит
             return self._send(200, D.abuse_key(body))
         if p == "/api/remote":

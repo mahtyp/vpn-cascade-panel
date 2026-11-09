@@ -17,3 +17,6 @@ dash.pid
 *.png
 govblock.json
 govblock.tmp
+govdrops.json
+govdrops.tmp
+tools/
