@@ -2888,6 +2888,9 @@ class Handler(BaseHTTPRequestHandler):
             info.update(classify_pkgs(info, srv, bool(main and main["id"] == srv["id"])))
             info["at"] = now()
             D.pkg_count[srv["id"]] = {"at": now(), "n": info["todo"]}
+            st = D.status.get(srv["id"]) or {}
+            if isinstance((st.get("data") or {}).get("system"), dict):
+                st["data"]["system"]["updates"] = info["todo"]      # число у сервера — как в окне, сразу
             if body.get("refresh"):
                 D.pool.submit(D.check_server, srv["id"])       # число обновлений в обзоре — сразу свежее
             return self._send(200, info)

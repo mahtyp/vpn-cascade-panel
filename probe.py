@@ -144,13 +144,18 @@ def system():
     m = re.search(r'^PRETTY_NAME="?([^"\n]+)', read("/etc/os-release"), re.M)
     if m:
         osname = m.group(1)
-    # только то, что поставит обычный apt-get upgrade (без «отложенных» пакетов, которые Ubuntu выкатывает постепенно).
+    # только то, что поставит apt-get --with-new-pkgs upgrade, как кнопка «Обновления» (с новыми ядрами, но без «отложенных» пакетов, которые Ubuntu выкатывает постепенно).
     # Подсчёт тяжёлый (на сервере с 0,5 ГБ — минуты), поэтому только когда панель просит (раз в несколько часов)
     # и когда памяти хватает; иначе панель покажет прошлое число.
     upd = ""
     if globals().get("PKG_COUNT") and (mem_available_mb() or 0) >= 120:
-        rc, o, _ = run("LC_ALL=C nice -n 19 apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst '", 45)
-        upd = o.strip() if rc != -9 else ""
+        # считаем так же, как окно «Обновления»: пакеты из apt list --upgradable, которые apt поставит сейчас
+        # (новые пакеты ядра вроде linux-image-6.8.0-NNN-generic отдельно не считаются — они идут с linux-generic)
+        rc, o, _ = run("LC_ALL=C nice -n 19 apt-get -s -o Debug::NoLocking=1 --with-new-pkgs upgrade 2>/dev/null", 45)
+        if rc != -9:
+            inst = set(re.findall(r"^Inst (\S+)", o, re.M))
+            upl = {l.split("/")[0] for l in sh("LC_ALL=C apt list --upgradable 2>/dev/null", 30).splitlines() if "/" in l}
+            upd = str(len(inst & upl))
     cpu, steal = cpu_percent()
     return {
         "hostname": socket.gethostname(),
@@ -957,7 +962,7 @@ def pkgs_info(refresh=False):
         out["refresh_rc"] = rc
         if rc:
             out["refresh_err"] = "не уложилось в 2,5 минуты" if rc == -9 else (err.strip().splitlines() or [""])[-1][:300]
-    sim = sh(env + "nice -n 10 apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null", 90)
+    sim = sh(env + "nice -n 10 apt-get -s -o Debug::NoLocking=1 --with-new-pkgs upgrade 2>/dev/null", 90)
     inst = set(re.findall(r"^Inst (\S+)", sim, re.M))
     items = []
     for line in sh(env + "apt list --upgradable 2>/dev/null", 60).splitlines():

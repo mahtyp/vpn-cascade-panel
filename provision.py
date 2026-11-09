@@ -971,8 +971,8 @@ class Provisioner:
             link["stall"] = bool(stall)
             job.end(key, "ok" if dm and um and not stall else "warn", "%s → %s %s, %s → %s %s%s" % (
                 b["name"], an, f(link["down"]), an, b["name"], f(link["up"]),
-                ": поток в эту сторону завис — так бывает, когда ТСПУ режет TCP до зарубежных хостеров; туннель AWG идёт по UDP, "
-                "его это может не задевать — проверьте канал после установки" if stall else ""))
+                ": обычный поток TCP в эту сторону завис — так бывает, когда ТСПУ режет TCP до зарубежных хостеров. "
+                "Канала AWG это обычно не касается: он идёт по UDP — проверьте скорость в «Связи» после установки" if stall else ""))
 
     # ------------------------------------------------------------ установка выхода
     def _install(self, job, password):
@@ -1396,7 +1396,7 @@ dpkg --configure -a || true
 
 UPGRADE_SH = r"""export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a LC_ALL=C
 """ + GRUB_FIX_SH + r"""apt-get update -q -o DPkg::Lock::Timeout=1200
-apt-get -y -q -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=1200 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
+apt-get -y -q -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=1200 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade
 rc=$?
 # обновление openssh-server на Ubuntu 24.04 останавливает ssh — поднимаем сами
 systemctl start ssh.socket >/dev/null 2>&1 || true
@@ -1408,7 +1408,7 @@ exit $rc
 UPDATE_SH = r"""export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 """ + GRUB_FIX_SH + r"""set -e
 apt-get update -q
-apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
+apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade
 apt-get -y -q autoremove
 # обновление openssh-server на Ubuntu 24.04 останавливает ssh и может оставить сервер без входа
 # по SSH на минуты — поднимаем сами (скрипт идёт на сервере и без связи с панелью)
