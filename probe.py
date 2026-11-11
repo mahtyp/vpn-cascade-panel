@@ -3,6 +3,7 @@
 # Режим задаёт первая строка, которую добавляет панель: MODE = "status" | "dc" | "config" | "precheck" | "lat" | …
 # (для "quality" перед этим файлом идёт исходник quality.py)
 import glob
+import hashlib
 import json
 import os
 import re
@@ -323,6 +324,15 @@ def xui():
         st = dict(db.execute("select key, value from settings").fetchall())
         for port, remark, enable in db.execute("select port, remark, enable from inbounds"):
             out["inbounds"].append({"port": port, "remark": remark, "enable": bool(enable)})
+        fps = {}            # клиенты входов VLESS: имя → отпечаток UUID (для «клиенты те же, что на основном»)
+        for (sv,) in db.execute("select settings from inbounds where enable=1 and protocol='vless'"):
+            try:
+                for c in json.loads(sv or "{}").get("clients") or []:
+                    if c.get("id") and c.get("enable", True) is not False:
+                        fps[str(c.get("email") or c["id"][:8])] = hashlib.sha256(c["id"].encode()).hexdigest()[:12]
+            except ValueError:
+                pass
+        out["clients_fp"] = fps
         if st.get("subEnable", "true") != "false":
             out["sub"] = {"port": int(st.get("subPort") or 2096)}
         cert = st.get("subCertFile") or st.get("webCertFile")
@@ -391,6 +401,10 @@ def xui():
 
 
 E2E_URL = "https://www.cloudflare.com/cdn-cgi/trace"   # отвечает адресом и страной, с которых пришёл запрос
+# российские сервисы «ваш адрес»: через правильный вход они должны видеть адрес самого входа (ру — напрямую)
+# (страницы, где стоит адрес посетителя; оба сайта на .ru и в российских сетях — под правила «российское напрямую» попадают
+# и по имени, и по адресу). 2ip.ru переехал в Германию, API Яндекса программам отвечает 127.0.0.1 — не годятся.
+E2E_RU_URLS = ["https://ip.mail.ru/", "https://yandex.ru/internet/"]
 
 
 def xray_e2e():
@@ -400,9 +414,12 @@ def xray_e2e():
     fake = "/etc/testbed-e2e-bad.json" if os.path.exists("/etc/testbed-e2e-bad.json") else "/etc/testbed-e2e.json"
     if os.path.exists(fake):
         try:
-            return json.load(open(fake))
+            r = json.load(open(fake))
         except Exception:
             return None
+        if "self" in ((r.get("ru") or {}).get("ips") or []):      # стенд: «российский сайт видит адрес самого входа»
+            r["ru"]["ips"] = [(os.environ.get("SSH_CONNECTION") or "? ? ?").split()[2]]
+        return r
     xb = [b for b in sorted(glob.glob("/usr/local/x-ui/bin/xray-linux-*")) if ".before" not in b]
     if not xb or not xray_running():
         return None
@@ -445,7 +462,8 @@ def xray_e2e():
             return {"ok": False, "skip": True, "port": port, "err": "не узнать открытый ключ Reality"}
         host = listen if listen and listen not in ("0.0.0.0", "::", "::0") else "127.0.0.1"
         v = {"address": host, "port": port, "id": c["id"], "flow": flow or "",
-             "sni": (r.get("serverNames") or [""])[0], "pbk": pbk, "sid": next(iter(r.get("shortIds") or []), "")}
+             "sni": (r.get("serverNames") or [""])[0], "pbk": pbk, "sid": next(iter(r.get("shortIds") or []), ""),
+             "fp": (r.get("settings") or {}).get("fingerprint") or "firefox"}     # как в подписке у телефонов
         out = _e2e_run(xb[0], port, remark, v)
         out["pc"] = dict(v, listen=listen or "")      # для проверки с ПК панели — та вынимает до сохранения статуса
         return out
@@ -465,7 +483,7 @@ def _e2e_run(xbin, port, remark, v):
                           "settings": {"vnext": [{"address": v["address"], "port": v["port"],
                                                   "users": [{"id": v["id"], "encryption": "none", "flow": v["flow"]}]}]},
                           "streamSettings": {"network": "tcp", "security": "reality",
-                                             "realitySettings": {"serverName": v["sni"], "fingerprint": "chrome",
+                                             "realitySettings": {"serverName": v["sni"], "fingerprint": v.get("fp") or "firefox",
                                                                  "publicKey": v["pbk"], "shortId": v["sid"]}}}]}
     d = tempfile.mkdtemp(prefix="vpn-dash-e2e-")
     out = {"ok": False, "port": port, "remark": remark}
@@ -495,6 +513,27 @@ def _e2e_run(xbin, port, remark, v):
             code = kv.get("code") or "000"
             out["err"] = ("страница через вход вернула HTTP %s" % code if code != "000" else
                           "нет ответа за 12 с" if rc in (28, -9) else "соединение через вход оборвалось (curl %s)" % rc)
+        # тот же клиент — российский сайт: по схеме он должен уйти напрямую с входа и увидеть его адрес
+        # адреса из страницы: какой из них «наш» (вход или выход), решает панель — в HTML бывают и чужие адреса
+        ru = {"ok": False, "err": "российский сайт через вход не ответил"}
+        for u in E2E_RU_URLS:
+            rc2, b2, _ = run("curl -s -L --compressed -m 10 --noproxy '' -A 'Mozilla/5.0' -w '\\ncode=%%{http_code}' "
+                             "--socks5-hostname 127.0.0.1:%d %s" % (sp, u), 13)
+            lines = b2.splitlines()
+            code2 = lines[-1].split("=", 1)[-1] if lines and lines[-1].startswith("code=") else "000"
+            ips = []
+            for a in re.findall(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])", "\n".join(lines[:-1])):
+                if a not in ips and all(int(x) < 256 for x in a.split(".")) and not re.match(
+                        r"(0|10|127|169\.254|172\.(1[6-9]|2\d|3[01])|192\.168|22[4-9]|2[3-5]\d)\.", a):
+                    ips.append(a)
+            if code2 == "200" and ips:
+                ru = {"ok": True, "ips": ips[:30], "by": u.split("/")[2]}
+                break
+            if rc2 in (28, -9):
+                ru["err"] = "российский сайт через вход не ответил за 10 с"
+            elif code2 == "200":
+                ru["err"] = "на странице %s нет адреса посетителя" % u.split("/")[2]
+        out["ru"] = ru
         return out
     finally:
         if p is not None:

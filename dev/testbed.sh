@@ -214,10 +214,10 @@ S
   pgrep -x xray-linux-srv >/dev/null || cp "$(readlink -f "$(command -v python3)")" /usr/local/x-ui/bin/xray-linux-srv   # занятый файл не перезаписать
   pgrep -x x-ui-web >/dev/null || cp "$(readlink -f "$(command -v python3)")" /usr/local/x-ui/x-ui-web
   cp "$HERE/fake-xui-web.py" /usr/local/x-ui/fake-web.py
-  cp "$HERE/fake-ipregion.json" /etc/testbed-ipregion.json; cp "$HERE/fake-ipregion-mm.json" /etc/testbed-ipregion-mm.json; cp "$HERE/fake-ipregion-rep.json" /etc/testbed-ipregion-rep.json; cp "$HERE/fake-abuseipdb.json" /etc/testbed-abuseipdb.json; cp "$HERE/fake-ipregion-ai.json" /etc/testbed-ipregion-ai.json; cp "$HERE/fake-neighbors.json" /etc/testbed-neighbors.json; cp "$HERE/fake-dns.json" /etc/testbed-dns.json   # «как видят адрес»
+  cp "$HERE/fake-ipregion.json" /etc/testbed-ipregion.json; cp "$HERE/fake-ipregion-mm.json" /etc/testbed-ipregion-mm.json; cp "$HERE/fake-ipregion-rep.json" /etc/testbed-ipregion-rep.json; cp "$HERE/fake-abuseipdb.json" /etc/testbed-abuseipdb.json; cp "$HERE/fake-ipregion-ai.json" /etc/testbed-ipregion-ai.json; cp "$HERE/fake-neighbors.json" /etc/testbed-neighbors.json; echo '{"cloud.example-files.nl": false}' > /etc/testbed-fit.json; cp "$HERE/fake-dns.json" /etc/testbed-dns.json   # «как видят адрес»
   cp "$HERE/fake-govblock-v4.txt" /etc/testbed-govblock-v4.txt; cp "$HERE/fake-govblock-v6.txt" /etc/testbed-govblock-v6.txt   # «сети госорганов»
   # сквозная проверка: настоящий Reality-клиент стенду не по силам — готовый ответ (первый выход); сбой — /etc/testbed-e2e-bad.json
-  echo '{"ok": true, "port": 1935, "remark": "rutube", "ip": "127.0.0.3", "loc": "SE", "ms": 640}' > /etc/testbed-e2e.json; rm -f /etc/testbed-e2e-bad.json
+  echo '{"ok": true, "port": 1935, "remark": "rutube", "ip": "127.0.0.3", "loc": "SE", "ms": 640, "ru": {"ok": true, "ips": ["self"], "by": "ip.mail.ru"}}' > /etc/testbed-e2e.json; rm -f /etc/testbed-e2e-bad.json
   echo '{"ok": true, "ip": "127.0.0.3", "loc": "SE", "ms": 910}' > /etc/testbed-pc-e2e.json; rm -f /etc/testbed-pc-e2e-bad.json   # то же «с ПК»
   rm -f /etc/testbed-units
   cp "$HERE/fake-ufw.py" /usr/local/sbin/ufw && chmod +x /usr/local/sbin/ufw && rm -f /etc/testbed-ufw.json /etc/testbed-ufw-break
@@ -271,7 +271,7 @@ down() {
   stop >/dev/null
   for u in mtproto mask; do [ -f /run/testbed-$u.pid ] && kill "$(cat /run/testbed-$u.pid)" 2>/dev/null; rm -f /run/testbed-$u.pid; done
   rm -f /etc/testbed-units
-  rm -f /usr/local/sbin/awg /usr/local/sbin/curl /usr/local/sbin/systemctl /usr/local/sbin/ufw /usr/local/sbin/docker /usr/local/sbin/ping /etc/testbed-quality.json /etc/testbed-ipregion.json /etc/testbed-ipregion-mm.json /etc/testbed-ipregion-rep.json /etc/testbed-abuseipdb.json /etc/testbed-ipregion-ai.json /etc/testbed-neighbors.json /etc/testbed-dns.json /etc/testbed-awg-mimic-bad /etc/testbed-sites.json /etc/testbed-ufw.json /etc/testbed-ufw-break /etc/testbed-docker.json /etc/testbed-mtproto.json /etc/testbed-dpi.json /etc/testbed-blockcheck.txt /etc/testbed-blockcheck-pace /etc/testbed-zapret-bad /etc/testbed-zapret-nohelp /etc/testbed-mask-dead /etc/testbed-e2e.json /etc/testbed-e2e-bad.json /etc/testbed-pc-e2e.json /etc/testbed-pc-e2e-bad.json
+  rm -f /usr/local/sbin/awg /usr/local/sbin/curl /usr/local/sbin/systemctl /usr/local/sbin/ufw /usr/local/sbin/docker /usr/local/sbin/ping /etc/testbed-quality.json /etc/testbed-ipregion.json /etc/testbed-ipregion-mm.json /etc/testbed-ipregion-rep.json /etc/testbed-abuseipdb.json /etc/testbed-ipregion-ai.json /etc/testbed-neighbors.json /etc/testbed-fit.json /etc/testbed-dns.json /etc/testbed-awg-mimic-bad /etc/testbed-sites.json /etc/testbed-ufw.json /etc/testbed-ufw-break /etc/testbed-docker.json /etc/testbed-mtproto.json /etc/testbed-dpi.json /etc/testbed-blockcheck.txt /etc/testbed-blockcheck-pace /etc/testbed-zapret-bad /etc/testbed-zapret-nohelp /etc/testbed-mask-dead /etc/testbed-e2e.json /etc/testbed-e2e-bad.json /etc/testbed-pc-e2e.json /etc/testbed-pc-e2e-bad.json
   rm -rf /opt/zapret2 /etc/systemd/system/zapret2.service /root/vpn-zapret.sh
   nft delete table inet vpn_dash_gov 2>/dev/null; rm -rf /etc/vpn-dash /etc/systemd/system/vpn-dash-govblock.service /etc/testbed-govblock-v4.txt /etc/testbed-govblock-v6.txt /root/.vpn-dash-gov-undo*
   pkill -x sshd || true

@@ -9,6 +9,7 @@ h2 — лучшие кандидаты для маскировки Reality: са
 С сервера только читается, под какой сайт маскируется Reality (база 3X-UI), и открывается ли этот сайт оттуда
 (reality_script → probe.reality_mask). Ничего не меняет.
 """
+import json
 import re
 from jsonline import last_json
 
@@ -19,6 +20,64 @@ def reality_script():
     m = re.search(r"^def reality_mask\(.*?(?=^\S)", src, re.M | re.S)
     return ("import json, re, socket, sqlite3, time\n" + m.group(0).rstrip()
             + "\n\nprint(json.dumps({'reality': reality_mask()}, ensure_ascii=False))\n")
+
+
+# Скрипт для сервера: открываются ли С НЕГО сайты-кандидаты для маскировки (Xray будет ходить к ним оттуда).
+# Сосед может не пускать именно ваш сервер (защита сайта, фильтры хостера) — с ПК открылся, а Reality на нём зависнет.
+FIT_PY = r'''
+import json, os, socket, ssl
+from concurrent.futures import ThreadPoolExecutor
+
+def one(n):
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+        with socket.create_connection((n, 443), timeout=5) as s:
+            s.settimeout(6)
+            with ctx.wrap_socket(s, server_hostname=n) as t:
+                v, a = t.version(), t.selected_alpn_protocol()
+                return {"ok": v == "TLSv1.3" and a == "h2", "tls": v, "alpn": a}
+    except socket.gaierror:
+        return {"ok": False, "err": "dns"}
+    except socket.timeout:
+        return {"ok": False, "err": "timeout"}
+    except ssl.SSLCertVerificationError:
+        return {"ok": False, "err": "cert"}
+    except ConnectionRefusedError:
+        return {"ok": False, "err": "refused"}
+    except Exception:
+        return {"ok": False, "err": "net"}
+
+T = "/etc/testbed-fit.json"            # стенд: какие имена «открываются с сервера»
+if os.path.exists(T):
+    fake = json.load(open(T))
+    res = {n: {"ok": True} if fake.get(n, True) else {"ok": False, "err": "timeout"} for n in NAMES}
+else:
+    with ThreadPoolExecutor(8) as ex:
+        res = dict(zip(NAMES, ex.map(one, NAMES)))
+print(json.dumps({"fit": res}))
+'''
+
+
+def fit_candidates(raw):
+    """Имена соседей, которые с ПК подошли для маскировки, — их надо перепроверить с сервера."""
+    return sorted({h["fit"]["name"] for h in raw.get("hosts") or [] if (h.get("fit") or {}).get("ok")})
+
+
+def fit_script(names):
+    return "NAMES = %s\n" % json.dumps(names) + FIT_PY
+
+
+def apply_server_fit(raw, res):
+    """Кандидат, который с сервера не открылся, из подсказок убирается (в таблице — «с сервера не открывается»)."""
+    bad = []
+    for h in raw.get("hosts") or []:
+        f = h.get("fit") or {}
+        r = res.get(f.get("name"))
+        if f.get("ok") and r and not r.get("ok"):
+            f.update(ok=False, srv=r.get("err") or "tls")
+            bad.append(f["name"])
+    return bad
 
 
 def _der_len(b, i):
@@ -272,7 +331,8 @@ def summarize(raw):
                "alpn": h.get("alpn"), "brand": b, "issuer": (h.get("issuer") or [None])[0], "err": h.get("err")}
         if h.get("own"):
             f = h.get("fit") or {}
-            row.update(fit=f.get("ok"), fit_why=None if f.get("ok") else (f.get("err") and "не открылся с именем" or
+            row.update(fit=f.get("ok"), fit_why=None if f.get("ok") else (f.get("srv") and "с сервера не открывается" or
+                       f.get("err") and "не открылся с именем" or
                        f.get("tls") != "TLSv1.3" and "нет TLS 1.3" or f.get("alpn") != "h2" and "нет h2" or None))
             genuine.append(row)
         elif b:

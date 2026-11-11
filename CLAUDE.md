@@ -15,8 +15,11 @@
   выбор в «Настройках» → «Оформление» (localStorage `vd-theme`: нет = светлое, dark, auto; ставится до отрисовки скриптом в `<head>`).
   `--field` (ультрамарин) — где идёт трафик и что выбрано, `--bad`/`--mark` (красный) — беда и знак; без рамок, теней и скруглений;
   шрифт 13/15/17/18/24/28/44, плитки Обзора: `field` / `alarm`; цвета только через токены; без «·» в подписях; `alert()` → `toast()`.
-  Обзор внизу: журнал проверок и справа «Бэкапы» (`backupCard`); «Сверка резервов» — внизу «Серверы и пароли» (`driftCard`, `#drift-box`
-  обновляется в `render()`), на Обзоре только пометка «резерв не как основной: N» со ссылкой `#/servers?drift`.
+  Обзор внизу: журнал проверок и справа «Бэкапы» (`backupCard`); «Схема входов» — внизу «Серверы и пароли» (`driftCard`, `#drift-box`
+  обновляется в `render()`): `Dash.principle()` по живому трафику — клиент → вход (проверка с ПК + клиенты основного по отпечаткам UUID
+  `clients_fp`, только в памяти `client_fps`), российское напрямую (`e2e.ru`: тот же клиент открывает `E2E_RU_URLS` (ip.mail.ru, yandex.ru/internet — HTML, в нём ищется адрес входа или выхода)),
+  зарубежное через выход (`e2e`); нарушения — в `overall()` и «замечания» (список — во всплывающей подсказке). Сравнение настроек поле за полем
+  (`check_drift`) — только по кнопке «Сравнить» в свёрнутом блоке, без пометок и журнала.
 - `tray.py` — значок в трее (pystray), автозапуск (HKCU\...\Run), `--launch` из start.bat.
 - `updater.py` — обновление из GitHub (`git pull --ff-only`) и перезапуск.
 - Обновления пакетов: `classify_pkgs` в dash.py (пометки и вывод), задача `upgrade` в provision.py
@@ -38,7 +41,7 @@
   «Что режут на входах» — `Sites.dpi` (`/api/dpi`, в фоне, снимок `dpi`): probe MODE "dpi" `dpi_check(DPI_SITES)` на каждом входе —
   curl напрямую, при сбое разбор dns/spoof (DoH 1.1.1.1/8.8.8.8)/ip/sni (TLS с чужим именем)/stall/tls/stub. На стенде — `/etc/testbed-dpi.json`.
 - Сквозная проверка входа — probe `xray_e2e()` в статусе (`entry.e2e`): временный клиент Xray (бинарник 3X-UI, `xray run -c` во временной папке, socks на 127.0.0.1)
-  подключается к своему VLESS Reality (клиент без limitIp, publicKey из realitySettings.settings или `xray x25519 -i`) и открывает `E2E_URL` (cloudflare trace) — ip/loc выхода;
+  подключается к своему VLESS Reality (клиент без limitIp, publicKey из realitySettings.settings или `xray x25519 -i`, отпечаток — как в подписке, `fp`) и открывает `E2E_URL` (cloudflare trace) — ip/loc выхода;
   curl с `--noproxy ''`. В dash — `e2e_fail`, `exit`/`direct`; 2 провала подряд — тревога в `overall()` и баннер на Обзоре. На стенде — `/etc/testbed-e2e.json` (`-bad.json` — сбой).
 - Проверка входа с ПК — `pce2e.py` (`check_pc_e2e` в check_all, настройка `pc_e2e`): параметры клиента приходят в `entry.e2e.pc` и сразу
   вынимаются в `Dash.e2e_params` (только память); Xray той же версии, что на входе, — `ensure_xray` в `tools/xray-<ver>/` (GitHub XTLS, sha256 из .dgst,
@@ -99,7 +102,8 @@
   хранятся в `addrcheck.json` (.gitignore), в снимке `geo`, `nb`, `addrjobs`. `neighbors.py` — «шумные соседи»: /24 сервера
   сканируется С ЭТОГО ПК (`scan`: 443 без SNI, сертификат через `ssl._ssl._test_decode_cert`/свой DER, DoH Яндекс/Google/Cloudflare (`doh_ips`) — настоящий
   ли сайт, для своих — TLS 1.3+h2 с проверкой сертификата), с сервера только `reality_script` (serverNames/target из x-ui.db и проверка сайта маскировки).
-  `summarize`: чужие (BRANDS) / настоящие / прочее, шум, наша маскировка. Сайт маскировки: probe `reality_mask()` (в статусе входа
+  `summarize`: чужие (BRANDS) / настоящие / прочее, шум, наша маскировка. Кандидаты для маскировки перепроверяются с сервера (`FIT_PY`,
+  `apply_server_fit`: не открылся оттуда — «с сервера не открывается», в подсказки не попадает; стенд — `/etc/testbed-fit.json`). Сайт маскировки: probe `reality_mask()` (в статусе входа
   `entry.mask`: TLS к target с SNI, проверка сертификата, TLS 1.3/h2, срок) → метка у сервера «маскировка: …» (ведёт в «Качество»);
   тот же код уходит в задачу nb (`neighbors.reality_script`): мёртвый сайт — note bad, живой не в /24 — warn, «переехал» — адрес с сервера не в /24 ни одного ответа `doh_ips` (`pub_ips`/`pub_by`). На стенде — `dev/fake-mask-site.py`
   (mask.testbed → 127.0.1.20:443, свой CA в системных), `/etc/testbed-mask-dead` — «сайт пропал». Задача `nb` (`start_nb`, `/api/nb`). На стенде —

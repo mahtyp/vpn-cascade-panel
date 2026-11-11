@@ -333,6 +333,15 @@ class Provisioner:
             if not ip:
                 raise Stop("не понял внешний адрес сервера «%s» — нужен обычный IPv4" % srv["host"])
             raw = neighbors.scan(ip, job.log)
+        cands = neighbors.fit_candidates(raw)
+        if cands:       # Xray ходит к сайту маскировки с сервера — подсказываем только то, что открывается оттуда
+            try:
+                rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.fit_script(cands), timeout=90)
+                bad = neighbors.apply_server_fit(raw, (neighbors.parse(out) or {}).get("fit") or {})
+                job.log("сайты для маскировки проверены с сервера: подходят %d из %d%s" % (
+                    len(cands) - len(bad), len(cands), ("; не открылись оттуда: " + ", ".join(bad)) if bad else ""))
+            except (Stop, ValueError) as e:
+                job.log("! не проверил сайты для маскировки с сервера (%s) — подсказки только по проверке с этого компьютера" % e)
         raw["reality"] = reality
         sm = neighbors.summarize(raw)
         job.result = {"nb": sm}

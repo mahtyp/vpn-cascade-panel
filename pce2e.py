@@ -57,7 +57,7 @@ def client_config(v, address, port):
                            "settings": {"vnext": [{"address": address, "port": v["port"],
                                                    "users": [{"id": v["id"], "encryption": "none", "flow": v.get("flow") or ""}]}]},
                            "streamSettings": {"network": "tcp", "security": "reality",
-                                              "realitySettings": {"serverName": v["sni"], "fingerprint": "chrome",
+                                              "realitySettings": {"serverName": v["sni"], "fingerprint": v.get("fp") or "firefox",
                                                                   "publicKey": v["pbk"], "shortId": v.get("sid") or ""}}}]}
 
 

@@ -129,8 +129,6 @@ SETTINGS = [
      "Свежий список скачивается этим компьютером; на входах, где включено, он ставится с тем же замером и «ремнём», что и при включении."),
     ("gov_keep", "", "iplist", None, None, "Сети госорганов", "Свои адреса, которые не блокировать",
      "IP или сети через пробел или по строке — например, рабочий адрес, если он вдруг попал в список. Адрес этого компьютера добавляется сам."),
-    ("drift_auto", True, "bool", None, None, "Сверка резервов", "Сверять при каждой полной проверке",
-     "Основной вход (первый в списке серверов) сравнивается с каждым резервным. Иначе — только по кнопке «Сверить»."),
     ("backup_server", "", "entry", None, None, "Бэкап", "Чей бэкап делать", "Пусто — первый вход в списке серверов."),
     ("backup_hours", 24, "int", 0, 720, "Бэкап", "Автоматически раз в, ч (0 — выкл.)", ""),
     ("backup_keep", 10, "int", 1, 100, "Бэкап", "Сколько архивов хранить", "Лишние старые удаляются из папки backups."),
@@ -375,6 +373,10 @@ class SSHPool:
         except (socket.timeout, TimeoutError):
             raise CheckError(pre + "SSH не отвечает (таймаут)")
         except (paramiko.SSHException, OSError) as e:
+            if "No existing session" in str(e) or "No authentication methods" in str(e):
+                raise CheckError(pre + "сервер оборвал вход до проверки пароля — скорее всего вход %s по паролю на нём выключен "
+                                 "(только по ключу) или его режет защита от перебора. Нужно разрешить: PermitRootLogin yes и "
+                                 "PasswordAuthentication yes в настройках SSH сервера" % (srv.get("user") or "root"))
             raise CheckError(pre + "SSH: %s" % e)
         c.save_host_keys(str(KNOWN_HOSTS))
         return c, path
@@ -840,6 +842,8 @@ class Dash:
         self.status = {}        # sid -> {at, ok, error, data}
         self.mask_fail = {}     # (sid, порт) -> сколько проверок подряд сайт маскировки не открывается с сервера
         self.e2e_fail = {}      # sid -> сколько проверок подряд не прошла сквозная проверка через Xray входа
+        self.ru_fail = {}       # sid -> сколько раз подряд российский сайт через вход не ответил
+        self.client_fps = {}    # sid -> {имя клиента: отпечаток UUID} — только в памяти, на страницу не уходит
         self.e2e_params = {}    # sid -> параметры клиента для проверки с ПК (UUID и т. п.) — только в памяти, на страницу не уходят
         self.pc_e2e = {}        # sid -> итог проверки с этого компьютера {ok, ip, loc, ms, err, at, fails, exit}
         self.channels = {}      # entry sid -> [channel]
@@ -1653,6 +1657,9 @@ class Dash:
                     v["address"] = ls if ls and ls not in ("0.0.0.0", "::", "::0") and not ls.startswith("127.") else srv["host"]
                     v["ver"] = (((data.get("entry") or {}).get("xui") or {}).get("xray") or "")
                     self.e2e_params[sid] = v
+                xu = (data.get("entry") or {}).get("xui") or {}
+                if "clients_fp" in xu:
+                    self.client_fps[sid] = xu.pop("clients_fp") or {}
                 self._gov_count(sid, data.get("gov"))
                 sysd = data.get("system") or {}
                 if sysd.get("updates") is not None:
@@ -1681,11 +1688,22 @@ class Dash:
                     if e2 and not e2.get("skip"):          # сквозная: как телефон, через сам Xray входа
                         self.e2e_fail[sid] = 0 if e2.get("ok") else self.e2e_fail.get(sid, 0) + 1
                         e2["fails"] = self.e2e_fail[sid]
+                        mine = self._own_ips(srv)
                         ex = next((x for x in self.cfg.servers if x["role"] == "exit" and x.get("host") == e2.get("ip")), None)
                         if ex:
                             e2["exit"] = ex["name"]
-                        elif e2.get("ip") and e2["ip"] == srv.get("host"):
+                        elif e2.get("ip") and e2["ip"] in mine:
                             e2["direct"] = True        # вышло прямо с входа, мимо выходов
+                        ru = e2.get("ru")
+                        if isinstance(ru, dict):       # российский сайт: по схеме — напрямую с входа
+                            self.ru_fail[sid] = 0 if ru.get("ok") else self.ru_fail.get(sid, 0) + 1
+                            ru["fails"] = self.ru_fail[sid]
+                            ips = ru.get("ips") or ([ru["ip"]] if ru.get("ip") else [])
+                            rx = next((x for x in self.cfg.servers if x["role"] == "exit" and x.get("host") in ips), None)
+                            if mine & set(ips):
+                                ru["direct"] = True
+                            elif rx:
+                                ru["exit"] = rx["name"]
             except CheckError as e:
                 st = {"at": now(), "ok": False, "error": str(e)}
             except Exception as e:
@@ -1701,6 +1719,72 @@ class Dash:
                 self.note("bad", "%s: нет связи — %s" % (srv["name"], st["error"]))
             elif st["ok"] and old is not None and not old["ok"] and not nopw(old):
                 self.note("ok", "%s: снова на связи" % srv["name"])
+
+    def _own_ips(self, srv):
+        """Адреса самого сервера: как записан в панели и во что превращается имя (если записан именем)."""
+        h = srv.get("host") or ""
+        ips = {h}
+        if not re.match(r"^[\d.]+$|:", h):
+            try:
+                ips |= {a[4][0] for a in socket.getaddrinfo(h, None, socket.AF_INET)}
+            except OSError:
+                pass
+        return ips
+
+    def principle(self):
+        """Схема «клиент → вход → ру напрямую, зарубеж через выход» по каждому входу — по живому трафику
+        (сквозная проверка с сервера и с ПК), без сравнения настроек. {sid: {client|ru|world: {lvl, text}}}."""
+        with self.lock:
+            servers = list(self.cfg.servers)
+            status = dict(self.status)
+        main = self.drift_main()
+        mfp = self.client_fps.get(main["id"]) if main else None
+        out = {}
+        for s in servers:
+            st = status.get(s["id"]) or {}
+            if s["role"] != "entry" or not st.get("ok"):
+                continue
+            e2 = ((st.get("data") or {}).get("entry") or {}).get("e2e") or {}
+            if not e2 or e2.get("skip"):
+                continue
+            r = {}
+            # клиент → вход: с ПК подключается, и клиенты основного здесь есть (их подписки заработают)
+            pc = self.pc_e2e.get(s["id"]) or {}
+            miss = []
+            if mfp and s["id"] != main["id"] and s["id"] in self.client_fps:
+                have = set(self.client_fps[s["id"]].values())
+                miss = sorted(n for n, f in mfp.items() if f not in have)
+            if miss:
+                r["client"] = {"lvl": "warn", "text": "нет клиентов основного входа: %s — их подписки здесь не заработают" % ", ".join(miss[:6])
+                               + (" и ещё %d" % (len(miss) - 6) if len(miss) > 6 else "")}
+            elif pc.get("ok"):
+                r["client"] = {"lvl": "ok", "text": "с этого компьютера подключается как телефон"}
+            elif pc.get("ok") is False and pc.get("fails", 0) >= 2:
+                r["client"] = {"lvl": "bad", "text": "с этого компьютера не подключиться: %s" % (pc.get("err") or "сбой")}
+            elif pc and not pc.get("skip"):
+                r["client"] = {"lvl": "none", "text": "с этого компьютера: одна неудача, жду следующую проверку"}
+            # ру — напрямую
+            ru = e2.get("ru")
+            if isinstance(ru, dict):
+                if ru.get("ok") and ru.get("direct"):
+                    r["ru"] = {"lvl": "ok", "text": "напрямую — российские сайты видят адрес входа"}
+                elif ru.get("ok") and ru.get("exit"):
+                    r["ru"] = {"lvl": "warn", "text": "через выход %s — российские сайты видят зарубежный адрес" % ru["exit"]}
+                elif ru.get("ok"):          # в странице нет ни адреса входа, ни выхода — вывода о маршруте нет
+                    r["ru"] = {"lvl": "none", "text": "не проверить: %s не показал ни адрес входа, ни адрес выхода" % (ru.get("by") or "сайт")}
+                else:           # сервис «ваш адрес» мог просто не ответить — это не нарушение схемы, тревогу не поднимаем
+                    r["ru"] = {"lvl": "none", "text": "не проверить: %s" % (ru.get("err") or "российский сайт не ответил")}
+            # зарубеж — через выход
+            if e2.get("ok") and e2.get("direct"):
+                r["world"] = {"lvl": "bad", "text": "напрямую с входа — зарубежные сайты видят российский адрес, закрытое не откроется"}
+            elif e2.get("ok") and (e2.get("loc") or "").upper() == "RU":
+                r["world"] = {"lvl": "bad", "text": "выходит в России (%s) — зарубежный выход не работает" % e2.get("ip")}
+            elif e2.get("ok"):
+                r["world"] = {"lvl": "ok", "text": "через %s" % (e2.get("exit") or "%s (%s)" % (e2.get("ip"), e2.get("loc") or "?"))}
+            elif e2.get("ok") is False:
+                r["world"] = {"lvl": "bad" if e2.get("fails", 0) >= 2 else "none", "text": "трафик не идёт: %s" % (e2.get("err") or "сбой")}
+            out[s["id"]] = r
+        return out
 
     def _build_channels(self, srv, data):
         e = data.get("entry") or {}
@@ -2084,17 +2168,8 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                     d["title"] = describe(d)
                 res.append({"id": s["id"], "diffs": diffs})
             r = {"at": now(), "main": main["id"], "res": res}
-            prev = self.drift if self.drift and self.drift.get("main") == main["id"] else None
             with self.lock:
                 self.drift = r
-            pn = {x["id"]: self.drift_open(x) for x in (prev or {}).get("res", [])}
-            for x in res:
-                srv = self.cfg.by_id(x["id"]) or {"name": x["id"]}
-                n, was = self.drift_open(x), pn.get(x["id"])
-                if n is None or n == was or (was is None and n == 0):
-                    continue
-                self.note("ok" if n == 0 else "warn", "%s и %s: %s" % (
-                    main["name"], srv["name"], "настройки совпадают" if n == 0 else "отличий в настройках: %d" % n))
 
     def drift_ok_set(self):
         return {(o.get("p"), o.get("a"), o.get("b")) for o in self.cfg.data.get("drift_ok", [])}
@@ -2208,8 +2283,6 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             jobs.append(self.pool.submit(self.check_reach))
             if self.cfg.settings.get("pc_e2e", True):
                 jobs.append(self.pool.submit(self.check_pc_e2e))
-            if self.cfg.settings.get("drift_auto", True):
-                jobs.append(self.pool.submit(self.check_drift))
             if with_dc:
                 jobs += [self.leaf.submit(self.check_dc, s["id"]) for s in self.cfg.servers if s["role"] == "exit"]
             cf.wait(jobs)
@@ -2293,10 +2366,16 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             nbad = sum(1 for c, r in rs if r.get("status") == "bad")
             if nbad:
                 warn.append("%s: каналов со сбоем %d из %d" % (s["name"], nbad, len(rs)))
-        for x in (drift or {}).get("res", []):
-            n = self.drift_open(x)
-            if n:
-                warn.append("%s отличается от основного входа: %d" % ((self.cfg.by_id(x["id"]) or {}).get("name", x["id"]), n))
+        for sid, r in self.principle().items():
+            nm = (self.cfg.by_id(sid) or {}).get("name", sid)
+            for k, what in (("world", "зарубежное "), ("ru", "российское "), ("client", "")):
+                c = r.get(k) or {}
+                if k == "world" and c.get("text", "").startswith("трафик не идёт"):
+                    continue                    # это уже сказано выше («через вход не ходит трафик»)
+                if c.get("lvl") == "bad" and k != "client":
+                    bad.append("%s: %s%s" % (nm, what, c["text"]))
+                elif c.get("lvl") in ("bad", "warn") and not (k == "client" and c.get("text", "").startswith("с этого компьютера")):
+                    warn.append("%s: %s%s" % (nm, what, c["text"]))
         if bk.get("at") and not bk.get("ok"):
             warn.append("бэкап не удался")
         if bad:
@@ -2393,7 +2472,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                 chans[sid] = [dict(c, **self._exit_label(c), result=self.results.get("%s:%s" % (sid, c["key"]))) for c in lst]
             return {
                 "now": now(), "servers": servers, "channels": chans, "dc": self.dc,
-                "reach": list(self.reach.values()), "running": sorted(self.running), "pce2e": self.pc_e2e,
+                "reach": list(self.reach.values()), "running": sorted(self.running), "pce2e": self.pc_e2e, "principle": self.principle(),
                 "log": self.log[-60:][::-1], "settings": self.cfg.settings,
                 "keyring": bool(keyring), "slow_s": float(self.cfg.settings.get("slow_s") or 2),
                 "abuse_key": bool(self.cfg.get_pw("_abuseipdb_key")),
@@ -3005,6 +3084,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(lst, list):
                 return self._send(400, {"error": "servers?"})
             clean, seen = [], set()
+            olds = {o["id"]: o for o in D.cfg.servers}
             for s in lst:
                 sid = re.sub(r"[^a-z0-9_-]", "", str(s.get("id") or "").lower())[:24]
                 host = str(s.get("host") or "").strip()
@@ -3018,7 +3098,6 @@ class Handler(BaseHTTPRequestHandler):
                     "provider": str(s.get("provider") or "")[:60], "note": str(s.get("note") or "")[:40],
                     "cc": str(s.get("cc") or "")[:3].upper(),
                 })
-            olds = {o["id"]: o for o in D.cfg.servers}
             gone = [i for i in olds if i not in seen]
             added = [s["id"] for s in clean if s["id"] not in olds]
             # адрес, порт, пользователь или роль поменялись — старое соединение и результаты больше не годятся
