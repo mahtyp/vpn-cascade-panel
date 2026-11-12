@@ -138,7 +138,7 @@ class Provisioner:
     # ------------------------------------------------------------ API
     def list(self):
         return [{"id": j.id, "kind": j.kind, "status": j.status, "name": j.params.get("name"), "role": j.params.get("role"), "sid": j.params.get("sid"),
-                 "started": j.started, "finished": j.finished} for j in sorted(self.jobs.values(), key=lambda x: x.started)][-15:]
+                 "action": j.params.get("action"), "started": j.started, "finished": j.finished} for j in sorted(self.jobs.values(), key=lambda x: x.started)][-15:]
 
     def get(self, jid, since=0):
         j = self.jobs.get(jid)
@@ -323,12 +323,13 @@ class Provisioner:
                   ("test", "Проверить: под vpn-ro проверки работают, а всё остальное — отказ", srv["name"])])
         job.begin("put")
         key = readonly.get_key(self.d.cfg)
-        self.sh(srv, "rm -rf %s && install -d -m 700 %s" % (readonly.TMP, readonly.TMP), timeout=30)
-        self.put(srv, str(readonly.RO_PY), readonly.TMP + "/ro.py", 0o644)
-        self.put(srv, str(readonly.PROBE_PY), readonly.TMP + "/probe.py", 0o644)
+        tmp = "%s-%s" % (readonly.TMP, job.id)     # своя папка у каждой задачи: «везде» идёт параллельно
+        self.sh(srv, "rm -rf %s && install -d -m 700 %s" % (tmp, tmp), timeout=30)
+        self.put(srv, str(readonly.RO_PY), tmp + "/ro.py", 0o644)
+        self.put(srv, str(readonly.PROBE_PY), tmp + "/probe.py", 0o644)
         job.end("put", "ok", "ro.py и probe.py (отпечаток %s)" % readonly.files_sha())
         job.begin("user")
-        env = "TMPD=%s PUB=%s " % (shlex.quote(readonly.TMP), shlex.quote(readonly.pub_line(key)))
+        env = "TMPD=%s PUB=%s " % (shlex.quote(tmp), shlex.quote(readonly.pub_line(key)))
         rc, out, err = self.sh(srv, env + "bash -s", stdin=readonly.INSTALL_SH, timeout=180)
         job.log(out + err)
         if "RO-OK" not in out:

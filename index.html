@@ -1712,7 +1712,23 @@ function dnsView(n) {
   </div>`;
 }
 // ------------------------------------------------------------------ «Аналитика»: ИИ-агент и отчёты
-let AIV = { open: null, rep: {}, msg: "" };       // открытый отчёт, загруженные отчёты (id → отчёт)
+let AIV = { open: null, rep: {}, msg: "", jobs: [] };   // открытый отчёт, загруженные отчёты (id → отчёт), задачи vpn-ro
+async function aiJobsPoll() {
+  // ход установки vpn-ro по серверам — прямо в списке «Доступ «только чтение»» (а не только в окне первой задачи)
+  if (AIV.polling) return;
+  AIV.polling = true;
+  try {
+    for (;;) {
+      const r = await apiGet("/api/prov/jobs");
+      AIV.jobs = (r.jobs || []).filter((j) => j.kind === "ro");
+      const run = AIV.jobs.some((j) => j.status === "run");
+      if (!run) S = await api("/api/state");
+      renderAi();
+      if (!run || page !== "ai") break;
+      await new Promise((ok) => setTimeout(ok, 2000));
+    }
+  } finally { AIV.polling = false; }
+}
 function mdLite(t) {
   // Markdown от модели: экранируем всё, потом заголовки, списки, жирный, `код`. Никакого HTML из текста не проходит.
   const inl = (x) => esc(x).replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, '<code class="mono">$1</code>');
@@ -1744,6 +1760,7 @@ function roState(sv) {
 }
 function renderAi() {
   if (page !== "ai") return;
+  if (!AIV.jobsLoaded) { AIV.jobsLoaded = true; aiJobsPoll(); }
   const A = S.ai || {}, st = A.settings || {}, run = A.run, M = A.models || {};
   const mopt = (cur) => Object.entries(M).map(([k, n]) => `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(n)}</option>`).join("");
   let h = `<div class="row"><h1>Аналитика</h1><span class="muted">ИИ-агент сам смотрит серверы (только чтение) и пишет отчёт</span><div style="flex-grow:1"></div></div>`;
@@ -1789,10 +1806,15 @@ function renderAi() {
       списку проверок (журналы, службы, рукопожатия, задержки, маски Reality…) — любая другая команда получает отказ. Так агента нельзя «уговорить» что-то поменять, даже если в журналах окажется
       хитрый текст. Ставится один раз по кнопке, через root; ключи, UUID и пароли вырезаются ещё на сервере.</div>`;
   for (const sv of srv) {
-    const [cls, txt] = roState(sv), ro = ((sv.state || {}).data || {}).ro, j = isRun("ro:" + sv.id);
-    h += `<div class="row ai-ro"><b style="min-width:160px">${esc(sv.name)}</b><span class="pill sm ${cls}">${esc(txt)}</span><div style="flex-grow:1"></div>
-      ${sv.has_password ? `<button class="btn sm" data-act="ai-ro" data-id="${esc(sv.id)}">${ro && ro.user ? "Переставить" : "Поставить"}</button>` : ""}
-      ${ro && ro.user ? `<button class="btn sm" data-act="ai-ro-rm" data-id="${esc(sv.id)}">Убрать</button>` : ""}</div>`;
+    let [cls, txt] = roState(sv);
+    const ro = ((sv.state || {}).data || {}).ro, jb = AIV.jobs.filter((x) => x.sid === sv.id).pop();
+    const busy = jb && jb.status === "run";
+    if (busy) [cls, txt] = ["", jb.action === "remove" ? "убирается…" : "ставится…"];
+    else if (jb && jb.status !== "ok" && Date.now() / 1000 - (jb.finished || 0) < 3600) [cls, txt] = ["bad", "не удалось"];
+    h += `<div class="row ai-ro"><b style="min-width:160px">${esc(sv.name)}</b><span class="row" style="gap:8px">${busy ? spinIcon(true) : ""}<span class="pill sm ${cls}">${esc(txt)}</span></span><div style="flex-grow:1"></div>
+      ${jb ? `<button class="btn sm" data-act="ai-ro-log" data-job="${esc(jb.id)}" data-name="${esc(sv.name)}">Журнал</button>` : ""}
+      ${sv.has_password && !busy ? `<button class="btn sm" data-act="ai-ro" data-id="${esc(sv.id)}">${ro && ro.user ? "Переставить" : "Поставить"}</button>` : ""}
+      ${ro && ro.user && !busy ? `<button class="btn sm" data-act="ai-ro-rm" data-id="${esc(sv.id)}">Убрать</button>` : ""}</div>`;
   }
   h += `</section>`;
   // расписание и лимиты
@@ -1860,13 +1882,14 @@ async function aiAct(a, b) {
       : `Убрать с «${sv.name}» пользователя vpn-ro? Агент перестанет смотреть этот сервер.`)) return;
     const r = await api("/api/ai", { action: "ro", id: sv.id, do: a === "ai-ro-rm" ? "remove" : "install" });
     if (r.error) { toast(r.error, "bad"); return; }
-    openJob(r.job, (a === "ai-ro" ? "Доступ «только чтение», " : "Убрать vpn-ro, ") + sv.name); return;
+    openJob(r.job, (a === "ai-ro" ? "Доступ «только чтение», " : "Убрать vpn-ro, ") + sv.name); aiJobsPoll(); return;
   }
+  if (a === "ai-ro-log") { openJob(b.dataset.job, "Доступ «только чтение», " + b.dataset.name); return; }
   if (a === "ai-ro-all") {
     if (!confirm("Поставить или обновить пользователя vpn-ro на всех серверах, где его нет или он устарел?")) return;
     const r = await api("/api/ai", { action: "ro_all" });
-    toast(r.error || r.msg, r.error ? "bad" : "ok");
-    if ((r.jobs || []).length) openJob(r.jobs[0], "Доступ «только чтение» (первый из " + r.jobs.length + ")");
+    toast(r.error || (r.msg + ((r.jobs || []).length ? ". Ход — в списке ниже, у каждого сервера кнопка «Журнал»." : "")), r.error ? "bad" : "ok");
+    if ((r.jobs || []).length) aiJobsPoll();
     return;
   }
 }

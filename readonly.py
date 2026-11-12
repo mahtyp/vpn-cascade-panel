@@ -68,10 +68,11 @@ def key_tail(key):
 
 INSTALL_SH = r"""set -eu
 [ "$(id -u)" = 0 ] || { echo "нужен root"; exit 1; }
+trap 'rm -rf "$TMPD"' EXIT      # временная папка задачи — убрать при любом исходе
 command -v sudo >/dev/null || { export DEBIAN_FRONTEND=noninteractive; apt-get install -y -q sudo >/dev/null; }
 command -v python3 >/dev/null || { echo "нет python3"; exit 1; }
 if ! id -u vpn-ro >/dev/null 2>&1; then
-  useradd -r -m -d /var/lib/vpn-ro -s /bin/sh -c "vpn-dash read-only" vpn-ro
+  useradd -r -m -d /var/lib/vpn-ro -s /bin/sh -c "vpn-dash read-only" vpn-ro || id -u vpn-ro >/dev/null
   echo "пользователь vpn-ro создан"
 fi
 usermod -p '*' -d /var/lib/vpn-ro vpn-ro    # пароля нет вовсе (вход только по ключу), но учётка не «заблокирована»
@@ -79,14 +80,15 @@ install -d -o vpn-ro -g vpn-ro -m 750 /var/lib/vpn-ro     # домашняя п�
 install -d -o root -g root -m 755 /usr/local/lib/vpn-dash-ro
 install -o root -g root -m 644 "$TMPD/ro.py" /usr/local/lib/vpn-dash-ro/ro.py
 install -o root -g root -m 644 "$TMPD/probe.py" /usr/local/lib/vpn-dash-ro/probe.py
-cat > /usr/local/sbin/vpn-dash-ro.new <<'EOF'
+W=$(mktemp /usr/local/sbin/.vpn-dash-ro.XXXXXX)      # своё имя: если ставят сразу несколько задач, файлы не путаются
+cat > "$W" <<'EOF'
 #!/bin/sh
 # vpn-dash: вход vpn-ro попадает только сюда (command= в authorized_keys); дальше — только список проверок.
 # Строка проверки идёт через stdin: в sudoers команда записана целиком, без «*» (sudo-rs в Ubuntu 26.04 их не понимает)
 printf '%s' "$SSH_ORIGINAL_COMMAND" | sudo -n /usr/bin/python3 -I /usr/local/lib/vpn-dash-ro/ro.py
 EOF
-chown root:root /usr/local/sbin/vpn-dash-ro.new; chmod 755 /usr/local/sbin/vpn-dash-ro.new
-mv -f /usr/local/sbin/vpn-dash-ro.new /usr/local/sbin/vpn-dash-ro
+chown root:root "$W"; chmod 755 "$W"
+mv -f "$W" /usr/local/sbin/vpn-dash-ro
 S=$(mktemp)
 printf '%s\n' '# vpn-dash: пользователю vpn-ro — только скрипт проверок (только чтение), строка проверки — через stdin' \
   'vpn-ro ALL=(root) NOPASSWD: /usr/bin/python3 -I /usr/local/lib/vpn-dash-ro/ro.py' > "$S"
@@ -102,7 +104,6 @@ pk=$(printf '%s\n' "$T" | awk 'tolower($1)=="pubkeyauthentication"{print $2}')
 [ -n "$au" ] && ! printf '%s' " $au " | grep -q ' vpn-ro\b' && echo "SSHD-ALLOWUSERS:$au"
 [ -n "$ag" ] && echo "SSHD-ALLOWGROUPS:$ag"
 [ "$pk" = "no" ] && echo "SSHD-NOPUBKEY"
-rm -rf "$TMPD"
 echo RO-OK
 """
 
