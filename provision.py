@@ -293,6 +293,72 @@ class Provisioner:
             self.d.dns[srv["id"]] = dict(sm, at=time.time())
         self.d.addr_save()
 
+    def start_ro(self, srv, action="install"):
+        """Доступ «только чтение» для «Аналитики»: поставить или убрать пользователя vpn-ro (через root, по кнопке)."""
+        if any(j.kind == "ro" and j.status == "run" and j.params.get("sid") == srv["id"] for j in self.jobs.values()):
+            raise ValueError("на этом сервере это уже делается")
+        job = Job(self, "ro", {"sid": srv["id"], "name": srv["name"], "action": action})
+        self.jobs[job.id] = job
+        return self._spawn(job, self._ro, None)
+
+    def _ro(self, job, password):
+        import readonly
+        srv = self.d.cfg.by_id(job.params["sid"])
+        if not srv:
+            raise Stop("сервера больше нет в панели")
+        if job.params.get("action") == "remove":
+            job.plan([("rm", "Убрать пользователя vpn-ro, скрипт проверок и запись sudo", srv["name"])])
+            job.begin("rm")
+            self.d.ro.drop(srv["id"])           # своё соединение под vpn-ro — закрыть, иначе userdel скажет «пользователь занят»
+            rc, out, err = self.sh(srv, "bash -s", stdin=readonly.REMOVE_SH, timeout=60)
+            job.log(out + err)
+            if "RO-REMOVED" not in out:
+                raise Stop("не убралось: %s" % (err or out).strip()[-300:])
+            self.d.ro.drop(srv["id"])
+            job.end("rm", "ok", "убрано")
+            self.d.check_server(srv["id"])
+            return
+        job.plan([("put", "Положить скрипт проверок на сервер", srv["name"]),
+                  ("user", "Пользователь vpn-ro: вход только по ключу панели, только список проверок через sudo", srv["name"]),
+                  ("test", "Проверить: под vpn-ro проверки работают, а всё остальное — отказ", srv["name"])])
+        job.begin("put")
+        key = readonly.get_key(self.d.cfg)
+        self.sh(srv, "rm -rf %s && install -d -m 700 %s" % (readonly.TMP, readonly.TMP), timeout=30)
+        self.put(srv, str(readonly.RO_PY), readonly.TMP + "/ro.py", 0o644)
+        self.put(srv, str(readonly.PROBE_PY), readonly.TMP + "/probe.py", 0o644)
+        job.end("put", "ok", "ro.py и probe.py (отпечаток %s)" % readonly.files_sha())
+        job.begin("user")
+        env = "TMPD=%s PUB=%s " % (shlex.quote(readonly.TMP), shlex.quote(readonly.pub_line(key)))
+        rc, out, err = self.sh(srv, env + "bash -s", stdin=readonly.INSTALL_SH, timeout=180)
+        job.log(out + err)
+        if "RO-OK" not in out:
+            raise Stop("не поставилось: %s" % (err or out).strip()[-300:])
+        warn = []
+        for ln in out.splitlines():
+            if ln.startswith("SSHD-ALLOWUSERS:"):
+                warn.append("в настройках SSH сервера стоит AllowUsers%s — vpn-ro туда не входит, его не пустят. "
+                            "Добавьте vpn-ro в эту строку /etc/ssh/sshd_config (панель настройки SSH не трогает)" % ln.split(":", 1)[1])
+            elif ln.startswith("SSHD-ALLOWGROUPS:"):
+                warn.append("в настройках SSH сервера стоит AllowGroups%s — проверьте, что vpn-ro туда попадает" % ln.split(":", 1)[1])
+            elif ln == "SSHD-NOPUBKEY":
+                warn.append("на сервере выключен вход по ключам (PubkeyAuthentication no) — vpn-ro не войдёт")
+        job.end("user", "warn" if warn else "ok", "; ".join(warn) or "готово")
+        job.begin("test")
+        self.d.ro.drop(srv["id"])
+        try:
+            ver = self.d.ro.run(srv, "version", timeout=30)
+            sysinfo = self.d.ro.run(srv, "system", timeout=60)
+            deny = self.d.ro.run(srv, "id; touch /tmp/x", timeout=30)
+        except self.h["CheckError"] as e:
+            raise Stop("под vpn-ro не вышло: %s" % e)
+        job.log("version → " + ver)
+        job.log("system → " + sysinfo.splitlines()[0] if sysinfo else "system → (пусто)")
+        job.log("«id; touch /tmp/x» → " + deny)
+        if ver.strip() != readonly.version() or not sysinfo or not deny.startswith("отказ"):
+            raise Stop("проверка не прошла: version=%r, запрет=%r" % (ver[:60], deny[:80]))
+        job.end("test", "ok", "проверки работают, остальное — отказ")
+        self.d.check_server(srv["id"])
+
     def start_nb(self, srv):
         """«Шумные соседи»: подсеть /24 сервера проверяется с этого компьютера; с сервера — только настройки Reality."""
         if any(j.kind == "nb" and j.status == "run" and j.params.get("sid") == srv["id"] for j in self.jobs.values()):

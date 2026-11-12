@@ -880,6 +880,11 @@ class Dash:
         import zapret
         self.zapret = zapret.Zapret(self, PROBE)   # «Zapret»: сайты с входа напрямую
         self.last_zap = 0
+        import readonly
+        import analyst
+        self.ro = readonly.ROPool(self.cfg, KNOWN_HOSTS, CheckError)    # «Аналитика»: SSH под vpn-ro (только чтение)
+        self.ai = analyst.Analyst(self, HIST_FILE)                       # «Аналитика»: агент и отчёты
+        self.ro_ver, self.ro_tail = readonly.version(), None
         self.remote_srv = None              # второй HTTP-сервер (порт удалённого доступа)
         self.remote_pending = None          # секрет одноразовых кодов, пока его не подтвердили кодом
         self.backup = {}        # последняя попытка: {at, ok, file, error}
@@ -939,6 +944,60 @@ class Dash:
                 self.remote_error = "порт %s занят: %s" % (rc["port"], e)
                 return
             threading.Thread(target=self.remote_srv.serve_forever, daemon=True).start()
+
+    def _ro_tail(self):
+        """Хвост публичного ключа панели для vpn-ro (чтобы отличить «наш ключ» на сервере); ключа нет — None."""
+        if self.ro_tail is None:
+            import readonly
+            k = readonly.get_key(self.cfg, create=False)
+            self.ro_tail = readonly.key_tail(k) if k else ""
+        return self.ro_tail or None
+
+    def ai_api(self, body, home=True):
+        """«Аналитика»: запуск агента, отчёты, настройки, ключ API, доступ «только чтение» на серверах."""
+        a = body.get("action")
+        try:
+            if a == "run":
+                self.ai.start("manual", body.get("model"))
+                return {"ok": True}
+            if a == "get":
+                r = self.ai.get(body.get("id") or 0)
+                return {"report": r} if r else {"error": "нет такого отчёта"}
+            if a == "delete":
+                self.ai.delete(body.get("id") or 0)
+                return {"ok": True}
+            if a == "settings":
+                self.ai.save_settings(body)
+                return {"ok": True}
+            if a in ("key", "clearkey"):
+                if not home:
+                    return {"error": "ключ API меняется только на домашнем компьютере"}
+                where = self.ai.set_key("" if a == "clearkey" else body.get("key"))
+                return {"ok": True, "msg": "Ключ удалён." if a == "clearkey" else
+                        "Ключ сохранён." + ("" if where == "keyring" else " Хранилища паролей нет — ключ забудется после перезапуска панели.")}
+            if a == "ro":
+                srv = self.cfg.by_id(body.get("id"))
+                if not srv:
+                    return {"error": "нет такого сервера"}
+                job = self.prov.start_ro(srv, "remove" if body.get("do") == "remove" else "install")
+                self.ro_tail = None
+                return {"ok": True, "job": job}
+            if a == "ro_all":
+                jobs = []
+                for srv in self.cfg.servers:
+                    ro = ((self.status.get(srv["id"]) or {}).get("data") or {}).get("ro") or {}
+                    if not self.cfg.get_pw(srv["id"]) or (ro.get("ver") == self.ro_ver and ro.get("user") and ro.get("sudo")
+                                                           and ro.get("key") == self._ro_tail()):
+                        continue
+                    try:
+                        jobs.append(self.prov.start_ro(srv, "install"))
+                    except ValueError:
+                        pass
+                self.ro_tail = None
+                return {"ok": True, "jobs": jobs, "msg": "Ставлю на серверов: %d" % len(jobs) if jobs else "Везде уже стоит свежая версия."}
+        except ValueError as e:
+            return {"error": str(e)}
+        return {"error": "неизвестное действие"}
 
     def abuse_key(self, body):
         """Сохранить/удалить ключ AbuseIPDB. Перед сохранением — пробный запрос (1 из 1000 в сутки)."""
@@ -2100,7 +2159,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             lines.append("маскировка: %s" % json.dumps({k: m.get(k) for k in ("port", "sni", "ok", "err", "tls", "alpn", "days", "fails")}, ensure_ascii=False))
         for c in self.channels.get(sid, []):
             r = self.results.get("%s:%s" % (sid, c["key"])) or {}
-            lines.append("канал %s: %s %s" % (c.get("key"), r.get("status", "—"), r.get("error") or ("%s с" % r.get("time") if r.get("time") else "")))
+            lines.append("канал %s: %s %s" % (c.get("key"), r.get("status", "—"), r.get("error") or ("%s с" % round(r["ms"], 2) if r.get("ms") is not None else "")))
         for r in self.reach.values():
             if r.get("entry") == sid:
                 lines.append("порт %s (%s) с этого компьютера: %s" % (r.get("port"), r.get("label"), "открыт" if r.get("ok") else r.get("error")))
@@ -2318,6 +2377,10 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             gh = int(st.get("gov_hours") or 0)
             if has_pw and gh and now() - (self.gov.get("tried") or 0) >= gh * 3600 and "govauto" not in self.running:
                 self.pool.submit(self.gov_auto)
+            try:
+                self.ai.tick()          # «Аналитика»: ежедневный отчёт и разбор тревоги
+            except Exception:
+                traceback.print_exc()
             bs = (self.backup_target() or {}).get("id")
             if has_pw and self.cfg.get_pw(bs or "") and self.backup_due():
                 self.pool.submit(self.do_backup, bs)
@@ -2473,6 +2536,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             return {
                 "now": now(), "servers": servers, "channels": chans, "dc": self.dc,
                 "reach": list(self.reach.values()), "running": sorted(self.running), "pce2e": self.pc_e2e, "principle": self.principle(),
+                "ai": self.ai.state(), "ro": {"ver": self.ro_ver, "key": self._ro_tail()},
                 "log": self.log[-60:][::-1], "settings": self.cfg.settings,
                 "keyring": bool(keyring), "slow_s": float(self.cfg.settings.get("slow_s") or 2),
                 "abuse_key": bool(self.cfg.get_pw("_abuseipdb_key")),
@@ -3253,6 +3317,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "job": jid})
         if p == "/api/diag":                     # диагностика сервера одним текстом (адреса и ключи скрыты)
             return self._send(200, D.diag(body.get("id", "")))
+        if p == "/api/ai":                       # «Аналитика»: агент, отчёты, ключ API (только в keyring), доступ vpn-ro
+            r = D.ai_api(body, home=not self.remote)
+            return self._send(409 if r.get("error") else 200, r)
         if p == "/api/abusekey":                 # ключ AbuseIPDB для «Качества» — только в keyring, на страницу не уходит
             return self._send(200, D.abuse_key(body))
         if p == "/api/remote":

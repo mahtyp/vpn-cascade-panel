@@ -700,6 +700,17 @@ def web_listen_addrs(port):
     return out
 
 
+def ro_info():
+    """Доступ «только чтение» для «Аналитики» (vpn-dash-ro): стоит ли и какая версия списка проверок (VERSION в ro.py)."""
+    d = "/usr/local/lib/vpn-dash-ro"
+    if not os.path.exists(d + "/ro.py"):
+        return None
+    m = re.search(r'^VERSION = "(\d+)"', read(d + "/ro.py"), re.M)
+    keys = read("/var/lib/vpn-ro/.ssh/authorized_keys")
+    return {"ver": m.group(1) if m else "", "user": bool(sh("id -u vpn-ro 2>/dev/null").strip()),
+            "key": (re.findall(r"(ecdsa-\S+ \S+)", keys) or [""])[0][-24:], "sudo": os.path.exists("/etc/sudoers.d/vpn-dash-ro")}
+
+
 def gov_info():
     """«Сети госорганов» (govblock.py): включено ли, сколько сетей, от какого числа список, сколько подключений отброшено."""
     meta = read("/etc/vpn-dash/govblock.json")
@@ -1489,6 +1500,8 @@ elif MODE == "precheck":
     print(json.dumps({"precheck": precheck()}, ensure_ascii=False))
 elif MODE == "quality":   # функции — из quality.py, панель присылает его исходник перед этим файлом
     print(json.dumps({"quality": globals()["entry_run"](Q_TARGETS, Q_TESTS, Q_CH)}, ensure_ascii=False))  # noqa: F821
+elif MODE == "lib":        # как библиотека функций (vpn-dash-ro.py на сервере) — ничего не запускать
+    pass
 elif MODE == "lat":
     print(json.dumps({"lat": {name: tcp_ms(h, p) for name, h, p in globals().get("TARGETS_OVERRIDE") or []}}))
 else:
@@ -1504,6 +1517,7 @@ else:
             data["entry"]["e2e"] = xray_e2e()
     data["web"] = web_info()
     data["gov"] = gov_info()
+    data["ro"] = ro_info()
     data["sw"] = sw_versions()
     if data.get("entry"):
         data["zapret"] = zapret_info()

@@ -107,6 +107,14 @@ h2{margin:0;font-size:24px;line-height:30px;font-weight:600;letter-spacing:-.015
 .awg-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
 .awg-tiles .t{border:1px solid var(--border);border-radius:0;padding:12px 16px;background:var(--surface)}.awg-tiles .v{font-size:24px;font-weight:600}
 .addr-b{display:flex;flex-direction:column;gap:8px;padding:12px 0;border-top:1px solid var(--border)}.addr-b:first-child{border-top:0}
+.ai-row{display:grid;grid-template-columns:auto auto 1fr auto;gap:8px 12px;align-items:baseline;padding:12px 16px;border-top:1px solid var(--border);cursor:pointer}
+.ai-row:hover,.ai-row.on{background:var(--hover)}.ai-sum{min-width:0}.ai-row .pill{justify-self:start}
+.ai-rep{padding:4px 16px 16px;display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--border)}
+.md{font-size:15px;line-height:1.5;max-width:860px}.md .md-h{font-size:17px;margin:16px 0 4px}.md .md-h:first-child{margin-top:4px}
+.md p{margin:4px 0}.md ul,.md ol{margin:4px 0;padding-left:24px}.md li{margin:2px 0}.md code{font-size:13px;background:var(--hover);padding:0 4px}
+.ai-steps{margin:0;padding-left:24px;display:flex;flex-direction:column;gap:4px}.ai-steps pre{white-space:pre-wrap;max-height:120px;overflow:auto;margin:4px 0 8px;color:var(--muted);font-size:13px}
+.ai-ro{gap:8px 12px;padding:8px 16px;border-top:1px solid var(--border)}
+@media (max-width:700px){.ai-row{grid-template-columns:auto 1fr}.ai-sum{grid-column:1/-1}}
 .nb-t{border-collapse:collapse;font-size:13px;width:100%}.nb-t th{text-align:left;color:var(--muted);font-weight:500;padding:4px 12px 4px 0}.nb-t td{padding:4px 12px 4px 0;border-top:1px solid var(--border);white-space:nowrap}
 .q-chip.on{border-color:var(--accent);color:var(--text);background:color-mix(in srgb,var(--accent) 16%,transparent)}
 .q-trace{margin:0 16px 12px;border:1px solid var(--line);border-radius:0;padding:8px 12px;font-size:13px;display:grid;grid-template-columns:24px 1fr 60px 64px;gap:4px 12px}
@@ -318,6 +326,7 @@ a.pill{text-decoration:none}a.pill:hover{text-decoration:underline;text-underlin
     <a class="nav" href="#/awg" data-page="awg"><svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M176,160a39.89,39.89,0,0,0-28.62,12.09l-46.1-29.63a39.8,39.8,0,0,0,0-28.92l46.1-29.63a40,40,0,1,0-8.66-13.45l-46.1,29.63a40,40,0,1,0,0,55.82l46.1,29.63A40,40,0,1,0,176,160Zm0-128a24,24,0,1,1-24,24A24,24,0,0,1,176,32ZM64,152a24,24,0,1,1,24-24A24,24,0,0,1,64,152Zm112,72a24,24,0,1,1,24-24A24,24,0,0,1,176,224Z"/></svg>AmneziaWG</a>
     <a class="nav" href="#/addr" data-page="addr"><svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M207.06,72.67A111.24,111.24,0,0,0,128,40h-.4C66.07,40.21,16,91,16,153.13V176a16,16,0,0,0,16,16H224a16,16,0,0,0,16-16V152A111.25,111.25,0,0,0,207.06,72.67ZM224,176H119.71l54.76-75.3a8,8,0,0,0-12.94-9.42L99.92,176H32V153.13c0-3.08.15-6.12.43-9.13H56a8,8,0,0,0,0-16H35.27c10.32-38.86,44-68.24,84.73-71.66V80a8,8,0,0,0,16,0V56.33A96.14,96.14,0,0,1,221,128H200a8,8,0,0,0,0,16h23.67c.21,2.65.33,5.31.33,8Z"/></svg>Качество</a>
     <a class="nav" href="#/fw" data-page="fw"><svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M224,48H32a8,8,0,0,0-8,8V200a8,8,0,0,0,8,8H224a8,8,0,0,0,8-8V56A8,8,0,0,0,224,48ZM88,144V112h80v32Zm-48,0V112H72v32Zm144-32h32v32H184Zm32-16H136V64h80ZM120,64V96H40V64ZM40,160h80v32H40Zm96,32V160h80v32Z"/></svg>Фаервол</a>
+    <a class="nav" href="#/ai" data-page="ai"><svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M208,144a15.78,15.78,0,0,1-10.42,14.94L146,178l-19,51.62a15.92,15.92,0,0,1-29.88,0L78,178l-51.62-19a15.92,15.92,0,0,1,0-29.88L78,110l19-51.62a15.92,15.92,0,0,1,29.88,0L146,110l51.62,19A15.78,15.78,0,0,1,208,144ZM152,48h16V64a8,8,0,0,0,16,0V48h16a8,8,0,0,0,0-16H184V16a8,8,0,0,0-16,0V32H152a8,8,0,0,0,0,16Zm88,32h-8V72a8,8,0,0,0-16,0v8h-8a8,8,0,0,0,0,16h8v8a8,8,0,0,0,16,0V96h8a8,8,0,0,0,0-16Z"/></svg>Аналитика</a>
     <a class="nav" href="#/servers" data-page="servers"><svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM224,98.1c-1.09,34.09-29.75,61.86-63.89,61.9H160a63.7,63.7,0,0,1-23.65-4.51,8,8,0,0,0-8.84,1.68L116.69,168H96a8,8,0,0,0-8,8v16H72a8,8,0,0,0-8,8v16H40V187.31l58.83-58.82a8,8,0,0,0,1.68-8.84A63.72,63.72,0,0,1,96,95.92c0-34.14,27.81-62.8,61.9-63.89A64,64,0,0,1,224,98.1ZM192,76a12,12,0,1,1-12-12A12,12,0,0,1,192,76Z"/></svg>Серверы и пароли</a>
     <a class="nav" href="#/new" data-page="new"><svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M208,32H48A16,16,0,0,0,32,48V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V48A16,16,0,0,0,208,32Zm0,176H48V48H208V208Zm-32-80a8,8,0,0,1-8,8H136v32a8,8,0,0,1-16,0V136H88a8,8,0,0,1,0-16h32V88a8,8,0,0,1,16,0v32h32A8,8,0,0,1,176,128Z"/></svg>Новый сервер</a>
     <a class="nav" href="#/settings" data-page="settings"><svg width="18" height="18" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M128,80a48,48,0,1,0,48,48A48.05,48.05,0,0,0,128,80Zm0,80a32,32,0,1,1,32-32A32,32,0,0,1,128,160Zm109.94-52.79a8,8,0,0,0-3.89-5.4l-29.83-17-.12-33.62a8,8,0,0,0-2.83-6.08,111.91,111.91,0,0,0-36.72-20.67,8,8,0,0,0-6.46.59L128,41.85,97.88,25a8,8,0,0,0-6.47-.6A112.1,112.1,0,0,0,54.73,45.15a8,8,0,0,0-2.83,6.07l-.15,33.65-29.83,17a8,8,0,0,0-3.89,5.4,106.47,106.47,0,0,0,0,41.56,8,8,0,0,0,3.89,5.4l29.83,17,.12,33.62a8,8,0,0,0,2.83,6.08,111.91,111.91,0,0,0,36.72,20.67,8,8,0,0,0,6.46-.59L128,214.15,158.12,231a7.91,7.91,0,0,0,3.9,1,8.09,8.09,0,0,0,2.57-.42,112.1,112.1,0,0,0,36.68-20.73,8,8,0,0,0,2.83-6.07l.15-33.65,29.83-17a8,8,0,0,0,3.89-5.4A106.47,106.47,0,0,0,237.94,107.21Zm-15,34.91-28.57,16.25a8,8,0,0,0-3,3c-.58,1-1.19,2.06-1.81,3.06a7.94,7.94,0,0,0-1.22,4.21l-.15,32.25a95.89,95.89,0,0,1-25.37,14.3L134,199.13a8,8,0,0,0-3.91-1h-.19c-1.21,0-2.43,0-3.64,0a8.08,8.08,0,0,0-4.1,1l-28.84,16.1A96,96,0,0,1,67.88,201l-.11-32.2a8,8,0,0,0-1.22-4.22c-.62-1-1.23-2-1.8-3.06a8.09,8.09,0,0,0-3-3.06l-28.6-16.29a90.49,90.49,0,0,1,0-28.26L61.67,97.63a8,8,0,0,0,3-3c.58-1,1.19-2.06,1.81-3.06a7.94,7.94,0,0,0,1.22-4.21l.15-32.25a95.89,95.89,0,0,1,25.37-14.3L122,56.87a8,8,0,0,0,4.1,1c1.21,0,2.43,0,3.64,0a8.08,8.08,0,0,0,4.1-1l28.84-16.1A96,96,0,0,1,188.12,55l.11,32.2a8,8,0,0,0,1.22,4.22c.62,1,1.23,2,1.8,3.06a8.09,8.09,0,0,0,3,3.06l28.6,16.29A90.49,90.49,0,0,1,222.9,142.12Z"/></svg>Настройки</a>
@@ -1702,6 +1711,165 @@ function dnsView(n) {
     <div class="sm dim">Подмену проверяем на адресах, заблокированных в РФ (${esc((n.domains || ["rutracker.org", "flibusta.is", "linkedin.com"]).join(", "))}), сравнивая с ответом через ${esc(n.ref ? "DoH " + n.ref : "зашифрованный DNS")}. «✓» у UDP значит только «ответил» — честно ли, видно по строкам выше.</div>
   </div>`;
 }
+// ------------------------------------------------------------------ «Аналитика»: ИИ-агент и отчёты
+let AIV = { open: null, rep: {}, msg: "" };       // открытый отчёт, загруженные отчёты (id → отчёт)
+function mdLite(t) {
+  // Markdown от модели: экранируем всё, потом заголовки, списки, жирный, `код`. Никакого HTML из текста не проходит.
+  const inl = (x) => esc(x).replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, '<code class="mono">$1</code>');
+  let h = "", list = "";
+  const close = () => { if (list) { h += `</${list}>`; list = ""; } };
+  for (const ln of String(t || "").split("\n")) {
+    let m;
+    if ((m = ln.match(/^#{1,3}\s+(.*)/))) { close(); h += `<h4 class="md-h">${inl(m[1])}</h4>`; }
+    else if ((m = ln.match(/^\s*[-*]\s+(.*)/))) { if (list !== "ul") { close(); h += "<ul>"; list = "ul"; } h += `<li>${inl(m[1])}</li>`; }
+    else if ((m = ln.match(/^\s*\d+[.)]\s+(.*)/))) { if (list !== "ol") { close(); h += "<ol>"; list = "ol"; } h += `<li>${inl(m[1])}</li>`; }
+    else if (ln.trim()) { close(); h += `<p>${inl(ln)}</p>`; }
+    else close();
+  }
+  close();
+  return h;
+}
+const AI_LVL = { ok: ["ok", "всё в порядке"], warn: ["warn", "есть замечания"], bad: ["bad", "что-то сломано"], err: ["bad", "не получилось"] };
+const AI_TRIG = { manual: "по кнопке", daily: "по расписанию", alarm: "по тревоге" };
+const usd = (x) => "$" + (x || 0).toFixed(x >= 1 ? 2 : 3).replace(".", ",");
+function roState(sv) {
+  const ro = ((sv.state || {}).data || {}).ro, R = S.ro || {};
+  if (!sv.has_password) return ["", "нет пароля root — поставить не выйдет"];
+  if (!sv.state) return ["", "ещё не проверялся"];
+  if (!ro || !ro.user) return ["", "не стоит"];
+  if (!ro.sudo) return ["warn", "стоит не до конца"];
+  if (R.key && ro.key !== R.key) return ["warn", "ключ не этой панели"];
+  if (ro.ver !== R.ver) return ["", "работает, есть новые проверки — «Переставить»"];
+  return ["ok", "стоит ✓"];
+}
+function renderAi() {
+  if (page !== "ai") return;
+  const A = S.ai || {}, st = A.settings || {}, run = A.run, M = A.models || {};
+  const mopt = (cur) => Object.entries(M).map(([k, n]) => `<option value="${k}" ${k === cur ? "selected" : ""}>${esc(n)}</option>`).join("");
+  let h = `<div class="row"><h1>Аналитика</h1><span class="muted">ИИ-агент сам смотрит серверы (только чтение) и пишет отчёт</span><div style="flex-grow:1"></div></div>`;
+  // запуск и идущий прогон
+  h += `<section class="card"><div class="head"><h3>Проанализировать</h3>
+      <span class="sm muted">потрачено в этом месяце ${usd(A.month)} из ${usd(st.ai_month_usd)}</span></div>
+    <div style="padding:12px 16px 16px;display:flex;flex-direction:column;gap:12px">`;
+  if (!A.key) h += `<span class="sm">Нужен ключ API Anthropic — блок «Ключ API» ниже.</span>`;
+  else if (run) {
+    h += `<div class="row" style="gap:8px">${spinIcon(true)}<b>Агент работает</b><span class="sm muted">${esc(AI_TRIG[run.trigger] || "")}, ${esc(M[run.model] || run.model)}, ${usd(run.cost)}</span></div>
+      <ol class="sm ai-steps">${(run.steps || []).map((x) => `<li>${aiStep(x)}</li>`).join("") || "<li>думает…</li>"}</ol>`;
+  } else {
+    h += `<div class="row" style="gap:8px;align-items:stretch"><select id="ai-model" aria-label="Модель" title="Модель">${mopt(st.ai_model_manual)}</select>
+      <button class="btn primary" data-act="ai-run" style="min-height:40px">Проанализировать сейчас</button></div>
+      <span class="sm dim">Haiku — дешевле и быстрее, Sonnet — внимательнее к сложным поломкам. Прогон обычно 1–3 мин.</span>`;
+  }
+  h += `</div></section>`;
+  // отчёты
+  const L = A.list || [];
+  h += `<section class="card"><div class="head"><h3>Отчёты</h3><span class="sm muted">${L.length ? "последние " + L.length : "пока нет"}</span></div>`;
+  for (const r of L) {
+    const [cls, txt] = AI_LVL[r.level] || ["", r.level], open = AIV.open === r.id;
+    let rep = AIV.rep[r.id];
+    if (rep && rep.at !== r.at) { delete AIV.rep[r.id]; rep = null; }     // номер отчёта мог достаться новому (старый удалён)
+    h += `<div class="ai-row${open ? " on" : ""}" data-act="ai-open" data-id="${r.id}" role="button" tabindex="0" aria-expanded="${open}">
+        <span class="pill sm ${cls}">${esc(txt)}</span><span class="sm mono" style="white-space:nowrap">${esc(new Date(r.at * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }))}</span>
+        <span class="ai-sum">${esc(r.summary || "")}</span><span class="sm dim" style="white-space:nowrap">${esc(AI_TRIG[r.trigger] || "")}, ${esc(M[r.model] || r.model)}, ${usd(r.cost)}</span></div>`;
+    if (open) {
+      h += `<div class="ai-rep">${!rep ? `<span class="sm dim">Загружаю…</span>` : `${rep.err ? `<div class="sm" style="color:var(--bad)">${esc(rep.err)}</div>` : ""}
+        <div class="md">${mdLite(rep.body)}</div>
+        <details><summary class="sm muted" style="cursor:pointer">Что смотрел агент: ${(rep.steps || []).length} ${plural((rep.steps || []).length, "шаг", "шага", "шагов")}, ${rep.secs || 0} с, токенов ${(rep.tok_in || 0).toLocaleString("ru-RU")} + ${(rep.tok_out || 0).toLocaleString("ru-RU")}</summary>
+          <ol class="sm ai-steps">${(rep.steps || []).map((x) => `<li>${aiStep(x)}<pre class="mono">${esc(x.preview || "")}</pre></li>`).join("")}</ol></details>
+        <div class="row" style="gap:8px"><button class="btn sm" data-act="ai-copy" data-id="${r.id}">Скопировать текст</button><button class="btn sm" data-act="ai-del" data-id="${r.id}">Удалить отчёт</button></div>`}</div>`;
+    }
+  }
+  if (!L.length) h += `<div class="empty">Отчётов ещё нет.</div>`;
+  h += `</section>`;
+  // доступ «только чтение»
+  const srv = S.servers.filter((x) => x.role === "entry" || x.role === "exit");
+  h += `<section class="card"><div class="head"><h3>Доступ «только чтение»</h3><span class="sm muted">пользователь vpn-ro на серверах</span><div style="flex-grow:1"></div>
+      <button class="btn sm" data-act="ai-ro-all">Поставить или обновить везде</button></div>
+    <div class="sm muted" style="padding:12px 16px 4px">Агент заходит на серверы не под root, а под отдельным пользователем <b>vpn-ro</b> по ключу этой панели. Сервер пускает его только к
+      списку проверок (журналы, службы, рукопожатия, задержки, маски Reality…) — любая другая команда получает отказ. Так агента нельзя «уговорить» что-то поменять, даже если в журналах окажется
+      хитрый текст. Ставится один раз по кнопке, через root; ключи, UUID и пароли вырезаются ещё на сервере.</div>`;
+  for (const sv of srv) {
+    const [cls, txt] = roState(sv), ro = ((sv.state || {}).data || {}).ro, j = isRun("ro:" + sv.id);
+    h += `<div class="row ai-ro"><b style="min-width:160px">${esc(sv.name)}</b><span class="pill sm ${cls}">${esc(txt)}</span><div style="flex-grow:1"></div>
+      ${sv.has_password ? `<button class="btn sm" data-act="ai-ro" data-id="${esc(sv.id)}">${ro && ro.user ? "Переставить" : "Поставить"}</button>` : ""}
+      ${ro && ro.user ? `<button class="btn sm" data-act="ai-ro-rm" data-id="${esc(sv.id)}">Убрать</button>` : ""}</div>`;
+  }
+  h += `</section>`;
+  // расписание и лимиты
+  const hours = Array.from({ length: 24 }, (_, i) => `<option value="${i}" ${i === +st.ai_hour ? "selected" : ""}>${String(i).padStart(2, "0")}:00</option>`).join("");
+  h += `<section class="card"><div class="head"><h3>Когда и сколько</h3></div><div class="form setform" id="ai-set">
+    <label class="chk"><span class="row" style="gap:12px;flex-wrap:nowrap"><input type="checkbox" id="ai-daily" ${st.ai_daily ? "checked" : ""}><span>Отчёт каждый день</span></span>
+      <span class="sm dim">Короткий обход всего каскада.</span></label>
+    <label>Во сколько<select id="ai-hour">${hours}</select></label>
+    <label>Модель для ежедневного<select id="ai-m-daily">${mopt(st.ai_model_daily)}</select></label>
+    <label class="chk"><span class="row" style="gap:12px;flex-wrap:nowrap"><input type="checkbox" id="ai-alarm" ${st.ai_alarm ? "checked" : ""}><span>Разбирать тревогу сразу</span></span>
+      <span class="sm dim">Когда значок становится красным, агент сам ищет причину (не чаще раза в 2 ч).</span></label>
+    <label>Модель для тревоги<select id="ai-m-alarm">${mopt(st.ai_model_alarm)}</select></label>
+    <label>Потолок трат в месяц, $<input id="ai-month" type="number" min="0.5" max="200" step="0.5" value="${esc(st.ai_month_usd)}"></label>
+    <label>Потолок за один прогон, $<input id="ai-runusd" type="number" min="0.05" max="5" step="0.05" value="${esc(st.ai_run_usd)}"></label>
+    <label>Шагов за прогон, не больше<input id="ai-steps" type="number" min="4" max="30" step="1" value="${esc(st.ai_steps)}"></label>
+    <div class="row" style="gap:8px"><button class="btn primary" data-act="ai-save">Сохранить</button></div></div></section>`;
+  // ключ
+  h += `<section class="card"><div class="head"><h3>Ключ API</h3><span class="sm muted">Anthropic, оплата по факту</span></div>
+    <div style="padding:12px 16px 16px;display:flex;flex-direction:column;gap:12px">
+    <span class="sm">Ключ создаётся на <a href="https://console.anthropic.com" target="_blank" rel="noopener noreferrer">console.anthropic.com</a> → <b>API Keys</b> (это не подписка claude.ai, а отдельный счёт).
+      Там же в <b>Limits</b> поставь месячный потолок. Ключ хранится в Диспетчере учётных данных Windows и уходит только в api.anthropic.com.
+      В модель уходит только то, что видит агент: адреса заменены на имена серверов, ключи и UUID вырезаны.</span>
+    <span class="sm">${A.key ? '<b style="color:var(--ok)">Ключ сохранён.</b>' : '<span class="dim">Ключа нет.</span>'}</span>
+    ${REMOTE ? `<span class="sm dim">Ключ меняется только на домашнем компьютере.</span>` : `<div class="row" style="gap:8px"><input id="ai-key" type="password" autocomplete="off" spellcheck="false" class="mono" style="flex:1;min-width:220px"
+      placeholder="${A.key ? "новый ключ, если хочешь заменить" : "sk-ant-…"}" aria-label="Ключ API Anthropic">
+      <button class="btn primary" data-act="ai-key">Сохранить ключ</button>${A.key ? '<button class="btn" data-act="ai-key-clear">Удалить ключ</button>' : ""}</div>`}
+    </div></section>`;
+  const keep = document.activeElement && document.activeElement.id;
+  if (keep && /^ai-(key|month|runusd|steps)$/.test(keep)) return;     // не перерисовывать, пока вводят
+  $("#main").innerHTML = h;
+  if (AIV.open && !AIV.rep[AIV.open]) aiFetch(AIV.open);
+}
+async function aiFetch(id) {
+  if (AIV.loading === id) return;
+  AIV.loading = id;
+  try { const r = await api("/api/ai", { action: "get", id }); if (r.report) { AIV.rep[id] = r.report; renderAi(); } }
+  finally { AIV.loading = null; }
+}
+function aiStep(x) {
+  const i = x.input || {}, what = x.tool === "panel_overview" ? "обзор панели" : x.tool === "panel_events" ? "журнал панели"
+    : x.tool === "server_check" ? `${esc(i.server || "?")}: <span class="mono">${esc([i.check].concat(i.args || []).join(" "))}</span>` : esc(x.tool);
+  return `${what} <span class="dim">${x.ok ? "" : "— отказ/ошибка"}${x.ms != null ? " " + (x.ms / 1000).toFixed(1).replace(".", ",") + " с" : ""}</span>`;
+}
+async function aiAct(a, b) {
+  if (a === "ai-run") { const r = await api("/api/ai", { action: "run", model: ($("#ai-model") || {}).value }); if (r.error) toast(r.error, "bad"); S = await api("/api/state"); renderAi(); schedule(1500); return; }
+  if (a === "ai-open") {
+    const id = +b.dataset.id; AIV.open = AIV.open === id ? null : id; renderAi();
+    return;
+  }
+  if (a === "ai-copy") { const r = AIV.rep[+b.dataset.id]; if (r) { await navigator.clipboard.writeText(r.body || ""); toast("Скопировано", "ok"); } return; }
+  if (a === "ai-del") { if (!confirm("Удалить этот отчёт?")) return; await api("/api/ai", { action: "delete", id: +b.dataset.id }); delete AIV.rep[+b.dataset.id]; AIV.open = null; S = await api("/api/state"); renderAi(); return; }
+  if (a === "ai-save") {
+    const r = await api("/api/ai", { action: "settings", ai_daily: $("#ai-daily").checked, ai_hour: +$("#ai-hour").value, ai_alarm: $("#ai-alarm").checked,
+      ai_model_daily: $("#ai-m-daily").value, ai_model_alarm: $("#ai-m-alarm").value, ai_month_usd: $("#ai-month").value, ai_run_usd: $("#ai-runusd").value, ai_steps: $("#ai-steps").value });
+    toast(r.error || "Сохранено", r.error ? "bad" : "ok"); S = await api("/api/state"); renderAi(); return;
+  }
+  if (a === "ai-key" || a === "ai-key-clear") {
+    if (a === "ai-key-clear" && !confirm("Удалить ключ API из панели?")) return;
+    const r = await api("/api/ai", a === "ai-key" ? { action: "key", key: $("#ai-key").value } : { action: "clearkey" });
+    toast(r.error || r.msg, r.error ? "bad" : "ok"); if (!r.error) { S = await api("/api/state"); renderAi(); } return;
+  }
+  if (a === "ai-ro" || a === "ai-ro-rm") {
+    const sv = S.servers.find((x) => x.id === b.dataset.id);
+    if (!confirm(a === "ai-ro" ? `Поставить на «${sv.name}» пользователя vpn-ro (вход только по ключу панели, только список проверок через sudo)? Делается через root.`
+      : `Убрать с «${sv.name}» пользователя vpn-ro? Агент перестанет смотреть этот сервер.`)) return;
+    const r = await api("/api/ai", { action: "ro", id: sv.id, do: a === "ai-ro-rm" ? "remove" : "install" });
+    if (r.error) { toast(r.error, "bad"); return; }
+    openJob(r.job, (a === "ai-ro" ? "Доступ «только чтение», " : "Убрать vpn-ro, ") + sv.name); return;
+  }
+  if (a === "ai-ro-all") {
+    if (!confirm("Поставить или обновить пользователя vpn-ro на всех серверах, где его нет или он устарел?")) return;
+    const r = await api("/api/ai", { action: "ro_all" });
+    toast(r.error || r.msg, r.error ? "bad" : "ok");
+    if ((r.jobs || []).length) openJob(r.jobs[0], "Доступ «только чтение» (первый из " + r.jobs.length + ")");
+    return;
+  }
+}
 function renderAddr() {
   if (page !== "addr") return;
   const m = $("#main"), jobs = S.addrjobs || [];
@@ -2808,6 +2976,7 @@ document.addEventListener("click", async (ev) => {
     if (p1 !== p2) { m.className = "msg bad"; m.textContent = "Пароли не совпадают."; return; }
     await remoteLoad("set_pw", { password: p1 }); return;
   }
+  if (a && a.startsWith("ai-")) { await aiAct(a, b); return; }
   if (a === "abuse-key-save" || a === "abuse-key-clear") {
     const inp = $("#abuse-key"), m = $("#abuse-msg");
     if (a === "abuse-key-clear" && !confirm("Удалить ключ AbuseIPDB из панели?")) return;
@@ -3042,17 +3211,18 @@ async function load() {
     S = await api("/api/state");
     if (bootSeen && S.boot !== bootSeen && !srvDirty && !setDirty) { location.reload(); return; }   // панель перезапустилась (обновление)
     bootSeen = S.boot;
-    const p = location.hash.startsWith("#/servers") ? "servers" : location.hash.startsWith("#/settings") ? "settings" : location.hash.startsWith("#/new") ? "new" : location.hash.startsWith("#/sites") ? "sites" : location.hash.startsWith("#/fw") ? "fw" : location.hash.startsWith("#/quality") ? "quality" : location.hash.startsWith("#/addr") ? "addr" : location.hash.startsWith("#/awg") ? "awg" : location.hash.startsWith("#/zapret") ? "zapret" : "overview";
-    if (p !== page || (p === "servers" && !$("#srvlist"))) { page = p; if (p === "servers") { render(); renderServers(); } if (p === "settings") { render(); renderSettings(); } if (p === "new") { render(); await wzEnter(); } if (p === "sites") { render(); renderSites(); } if (p === "fw") { render(); renderFw(); } if (p === "quality") { render(); renderQuality(); } if (p === "addr") { render(); renderAddr(); } if (p === "awg") { render(); awgEnter(); } if (p === "zapret") { render(); renderZapret(); } }
+    const p = location.hash.startsWith("#/servers") ? "servers" : location.hash.startsWith("#/settings") ? "settings" : location.hash.startsWith("#/new") ? "new" : location.hash.startsWith("#/sites") ? "sites" : location.hash.startsWith("#/fw") ? "fw" : location.hash.startsWith("#/quality") ? "quality" : location.hash.startsWith("#/addr") ? "addr" : location.hash.startsWith("#/awg") ? "awg" : location.hash.startsWith("#/zapret") ? "zapret" : location.hash.startsWith("#/ai") ? "ai" : "overview";
+    if (p !== page || (p === "servers" && !$("#srvlist"))) { page = p; if (p === "servers") { render(); renderServers(); } if (p === "settings") { render(); renderSettings(); } if (p === "new") { render(); await wzEnter(); } if (p === "sites") { render(); renderSites(); } if (p === "fw") { render(); renderFw(); } if (p === "quality") { render(); renderQuality(); } if (p === "addr") { render(); renderAddr(); } if (p === "awg") { render(); awgEnter(); } if (p === "zapret") { render(); renderZapret(); } if (p === "ai") { render(); renderAi(); } }
     else if (p === "sites") { if (!BYP_EDIT && !NEWB) renderBypasses(); renderDpi(); }   // пока правите цепочку — обходы не перерисовывать
     else if (p === "fw") renderFw();
     else if (p === "addr") renderAddr();
+    else if (p === "ai") renderAi();
     page = p;
     render();
   } catch (e) {
     $("#main").innerHTML = `<div class="banner">Панель не отвечает: она остановлена (нет значка в трее). Запустите start.bat.</div>`;
   }
-  schedule(S && (S.running.length || (S.addrjobs || []).some((j) => j.status === "run")) ? 1500 : 6000);
+  schedule(S && (S.running.length || (S.addrjobs || []).some((j) => j.status === "run") || (S.ai && S.ai.run)) ? 1500 : 6000);
 }
 window.addEventListener("hashchange", () => {
   const dirtyHere = (srvDirty && page === "servers" && !location.hash.startsWith("#/servers")) || (setDirty && page === "settings" && !location.hash.startsWith("#/settings"));

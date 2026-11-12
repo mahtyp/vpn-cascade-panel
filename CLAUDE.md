@@ -124,6 +124,20 @@
   `ss -tin` живые соединения; 2 МБ с speed.cloudflare.com; трассировка своими ICMP с TTL). С ПК — `pc_run` (ping/tracert
   на Windows, TCP к порту VLESS). `Dash.quality_check` (`/api/quality`, одна за раз), итог в снимке `quality`. Набор маршрутов
   хранится в браузере. На стенде — заглушка ping и ветки curl, цифры задаёт `/etc/testbed-quality.json`.
+- «Аналитика» (`#/ai`, `renderAi`): `analyst.py` — агент на Claude API (Messages + tool use, urllib, `anthropic-version: 2023-06-01`,
+  кэш промпта на system/tools/последнем сообщении). Инструменты: `panel_overview` (что видит панель: статусы, каналы — в норме одной строкой, остальные подробно с доступностью за сутки,
+  e2e, схема, маски, DC, версии; не обрезается до `OVERVIEW_CHARS`), `panel_events` (журнал), `server_check` (проверки под vpn-ro),
+  `all_servers_check` (одна проверка из `ALL_CHECKS` на всех серверах параллельно, по `ALL_CHARS` от каждого — общий обход за шаг), `submit_report` (level ok/warn/bad, summary,
+  body Markdown). Всё, что уходит в модель, — через `redactor()` (адреса → имена/[адрес-N] на весь прогон, UUID/ключи скрыты), вывод проверки
+  обрезан до `TOOL_CHARS`. Ключ API — keyring `_anthropic_key`, меняется только с домашнего порта (`/api/ai` key/clearkey). Лимиты: шагов,
+  $ за прогон и за месяц (`cost()` по `MODELS` из usage). Отчёты — `history.db` → `reports` (180 дней). Запуск: кнопка; `tick()` из auto_loop —
+  ежедневно с часа `ai_hour` (догоняет, если ПК был выключен), при переходе `overall()` в bad (не чаще раза в 2 ч). Настройки `ai_*` в `settings`
+  (страница «Аналитика», не «Настройки»). На стенде ключ «stand» — `Analyst.fake` (сценарий из 4 шагов, включая запрещённую проверку).
+  Доступ «только чтение» — `readonly.py`: пользователь vpn-ro, ключ панели ECDSA в keyring `_ro_key`, в authorized_keys
+  `restrict,command="/usr/local/sbin/vpn-dash-ro"` → `printf %s "$SSH_ORIGINAL_COMMAND" | sudo -n python3 -I /usr/local/lib/vpn-dash-ro/ro.py` (строка
+  проверки — через stdin; в sudoers ровно эта команда без «*» и без Defaults: sudo-rs в Ubuntu 26.04 не понимает подстановок в аргументах и requiretty). `server-scripts/vpn-dash-ro.py` — список названных проверок (`CHECKS`, аргументы по регуляркам, `clean()` вырезает секреты на сервере),
+  рядом копия probe.py (MODE "lib" — как библиотека). Ставит/убирает задача `ro` (`start_ro`, `/api/ai` ro/ro_all) через root: INSTALL_SH, затем
+  проверка под vpn-ro (version, system, «id; touch» → отказ). probe `ro_info()` → `data.ro` (VERSION из ro.py на сервере, хвост ключа) против `readonly.version()` — VERSION поднимать, только когда меняются сами проверки.
 - `server-scripts/` — bash-скрипты для серверов (бэкап/восстановление входа, развёртывание выхода,
   цепочки резерва). `vpn-backup.sh` оттуда же использует кнопка бэкапа.
   `vpn-awg-common.sh` — общие функции AmneziaWG (`apt_begin`, `add_amnezia_ppa`, `reload_awg_module`) для
@@ -151,7 +165,7 @@
   фаервол (ufw, с замером до/после и автооткатом), перевод выхода с Docker на AmneziaWG без Docker, пакеты-маски AmneziaWG (I1) на туннеле входа (с откатом), zapret2 на входе (установка, подбор, включение, «напрямую»; автоматическое
   изменение — автовозврат цели на выходы, включается галочкой у цели), «сети госорганов» на входах (не пускать новые
   подключения из их подсетей; обновление списка раз в сутки — автоматически, только где включено, с замером и откатом), открыть порт 80
-  для продления сертификата Let's Encrypt (`ACME80_SH`: `ufw allow 80/tcp` + `acme.sh --renew` только того, чему уже пора, без --cron — он обновляет сам acme.sh; probe `acme_info` видит, что ufw его закрыл). поставить jq/curl/iproute2 для «как видят», если их нет (кнопка «Поставить … и проверить заново», `ipcheck.install_cmd`). Окно обновлений до кнопки
+  для продления сертификата Let's Encrypt (`ACME80_SH`: `ufw allow 80/tcp` + `acme.sh --renew` только того, чему уже пора, без --cron — он обновляет сам acme.sh; probe `acme_info` видит, что ufw его закрыл). поставить jq/curl/iproute2 для «как видят», если их нет (кнопка «Поставить … и проверить заново», `ipcheck.install_cmd`), поставить/убрать пользователя vpn-ro для «Аналитики» (только чтение, проверки из списка; сам агент ничего не меняет). Окно обновлений до кнопки
   только читает (`MODE = "pkgs"`; «Проверить заново» = apt-get update).
 - `start.bat` — CRLF, UTF-8, `chcp 65001`.
 - Каждое изменение — проверить на стенде и в браузере (Playwright, Chromium предустановлен),
