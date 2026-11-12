@@ -797,9 +797,11 @@ def web_info():
     path = "/" + (st.get("webBasePath") or "/").strip("/") + "/"
     addrs = web_listen_addrs(port)
     local = lambda a: a.startswith("127.") or a in ("[::1]", "localhost")
+    exposed = any(not local(a) for a in addrs)
     return {"port": port, "listen": st.get("webListen") or "", "path": path.replace("//", "/"),
             "https": bool(st.get("webCertFile") and st.get("webKeyFile")), "domain": st.get("webDomain") or "",
-            "up": bool(addrs), "exposed": any(not local(a) for a in addrs)}
+            "up": bool(addrs), "exposed": exposed, "fw_blocked": exposed and ufw_port_open(port) is False}
+
 
 
 # ------------------------------------------------------------------ выход

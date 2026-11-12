@@ -34,6 +34,14 @@ elif a[:1] == ["allow"] or a[:2] == ["route", "allow"]:
         st["added"].append(r)
     save()
     print("Rules updated")
+elif a[:1] == ["delete"]:
+    r = "ufw " + " ".join(a[1:])
+    if r in st["added"]:
+        st["added"].remove(r)
+        save()
+        print("Rule deleted")
+    else:
+        print("Could not delete non-existent rule")
 elif a[:1] == ["enable"]:
     st["active"] = True
     save()

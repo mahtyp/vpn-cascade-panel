@@ -2691,7 +2691,7 @@ def xui_path_ok(path):
 
 # Скрипт для сервера: webListen в базе 3X-UI → перезапуск x-ui → проверка; не вышло — откат. P = {"listen": "" | "127.0.0.1"}
 XUI_WEB_PY = r'''
-import json, os, shutil, sqlite3, ssl, subprocess, time, urllib.error, urllib.request
+import json, os, re, shlex, shutil, sqlite3, ssl, subprocess, time, urllib.error, urllib.request
 DB = "/etc/x-ui/x-ui.db"
 
 
@@ -2745,8 +2745,29 @@ def good():
             and (xray_running() or not had_xray) and ("webBasePath" not in P["set"] or answers()))
 
 
+def ufw_sync():
+    """Порт панели и в ufw: открыть — разрешить его, закрыть — убрать разрешения ровно этого порта. Без ufw — ничего."""
+    if "webListen" not in P["set"] or not shutil.which("ufw"):
+        return ""
+    rx = re.compile(r"^ufw allow %d(/tcp)?( |$)" % port)
+    mine = [x.strip() for x in sh("LC_ALL=C ufw show added 2>/dev/null").splitlines() if rx.match(x.strip())]
+    active = sh("LC_ALL=C ufw status 2>/dev/null").startswith("Status: active")
+    if listen:
+        for x in mine:
+            subprocess.run(["ufw", "delete"] + shlex.split(x)[1:], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return " Разрешение порта %d в фаерволе ufw убрано." % port if mine else ""
+    if mine:
+        return " В фаерволе ufw порт %d уже разрешён." % port if active else ""
+    r = subprocess.run(["ufw", "allow", "%d/tcp" % port, "comment", "vpn-dash: 3x-ui web"], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True)
+    if r.returncode:
+        return " Порт %d в фаерволе ufw открыть не вышло: %s" % (port, (r.stdout.strip().splitlines() or ["?"])[-1][:120])
+    return (" В фаерволе ufw порт %d разрешён." % port) if active else (" Порт %d добавлен в ufw (сам ufw сейчас выключен)." % port)
+
+
 if all((st.get(k) or "") == v for k, v in P["set"].items()) and good():
-    done(True, "уже так, ничего не менял")
+    extra = ufw_sync()
+    done(True, ("x-ui уже был настроен так, его не трогал." + extra) if extra else "уже так, ничего не менял")
 bak = DB + ".before-web-%d" % time.time()
 sh("systemctl stop x-ui")
 shutil.copy2(DB, bak)
@@ -2776,8 +2797,9 @@ else:
 os.remove(bak)
 if "webBasePath" in P["set"]:
     done(True, "у панели теперь свой путь в адресе (логин и пароль прежние)")
-done(True, "закрыта из интернета: слушает только сам сервер, открывается кнопкой «3X-UI» в панели" if listen else
-     "снова открыта в интернет (порт %d)" % port)
+extra = ufw_sync()
+done(True, ("закрыта из интернета: слушает только сам сервер, открывается кнопкой «3X-UI» в панели." if listen else
+            "снова открыта в интернет (порт %d)." % port) + extra)
 '''
 XUI_WEB_PY = probe_func("xray_running") + XUI_WEB_PY    # та же проверка «Xray запущен», что в probe.py
 
