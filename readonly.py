@@ -40,8 +40,16 @@ def version():
     return m.group(1) if m else ""
 
 
+_KEY_LOCK = threading.Lock()     # «везде» ставит параллельно: ключ должен создаться один, а не у каждой задачи свой
+
+
 def get_key(cfg, create=True):
     """Ключ панели для vpn-ro: из keyring; нет — создать (если create)."""
+    with _KEY_LOCK:
+        return _get_key(cfg, create)
+
+
+def _get_key(cfg, create):
     pem = cfg.get_pw(KR_KEY)
     if pem:
         try:

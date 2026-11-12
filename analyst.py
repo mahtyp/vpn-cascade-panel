@@ -33,7 +33,9 @@ TOOL_CHARS = 8000       # вывод одной проверки, который
 OVERVIEW_CHARS = 40000  # обзор панели целиком — по нему агент решает, куда смотреть; обрезать его нельзя
 ALL_CHARS = 2500        # проверка «на всех серверах»: столько от каждого сервера
 ALL_CHECKS = ("system", "services", "handshakes", "conns", "dmesg", "versions", "firewall", "dns", "mask", "e2e")
-TRIGGERS = {"manual": "по кнопке", "daily": "по расписанию", "alarm": "по тревоге"}
+TRIGGERS = {"manual": "по кнопке", "daily": "по расписанию", "alarm": "по тревоге", "ask": "свой вопрос"}
+BIG_CHECKS = {"xray-config": 24000, "diag": 16000}     # проверки, где длинный вывод — по делу (конфиг целиком)
+QUESTION_MAX = 2000
 
 
 def cost(model, u):
@@ -63,6 +65,13 @@ wgN на входе, исходящие AWG-ИМЯ). Резерв — цепоч
 - Фаервол: верь строке «фаервол ufw» и проверке firewall, а не состоянию службы ufw — она бывает inactive при включённых правилах.
 - Telegram DC: панель проверяет их с выходов; один DC молчит с одного выхода, а с других отвечает, — это маршрут хостера до этого DC,
   а не поломка канала. Отметь, но не раздувай.
+- Как настроен Xray входа (исходящие, все правила маршрутизации, цепочки, наблюдатель, входящие с Reality) — server_check xray-config.
+
+Свой вопрос. Если в запуске есть «Вопрос владельца» — отвечай именно на него: обход и проверки подбирай под вопрос (общий обход
+не обязателен), смотри только перечисленные серверы. Тогда body в submit_report — свободный Markdown, который отвечает на вопрос
+(разделы «Итог/Что не так/…» не обязательны), а level — по тому, что увидел. Если просят описание для другого человека или другого
+ИИ — пиши самодостаточно: что за серверы и их роли, как идёт трафик, что где стоит и как настроено, что выглядит странно.
+Адреса, ключи, UUID и пароли не восстанавливай — оставляй как [имя]/[адрес-N]/[скрыто].
 
 В конце обязательно вызови submit_report:
 - level: ok — всё работает; warn — работает, но есть что поправить или за чем следить; bad — у людей что-то не работает
@@ -82,6 +91,10 @@ class Analyst:
         self.db.execute("pragma journal_mode=wal")
         self.db.execute("create table if not exists reports(id integer primary key autoincrement, at real, trigger text, model text, "
                         "level text, summary text, body text, steps text, tok_in integer, tok_out integer, cost real, err text, secs real)")
+        cols = {c[1] for c in self.db.execute("pragma table_info(reports)")}
+        if "question" not in cols:          # свой вопрос и серверы, на которые он (добавлено позже — старые базы дополняем)
+            self.db.execute("alter table reports add column question text")
+            self.db.execute("alter table reports add column scope text")
         self.db.commit()
         self.run = None             # идущий прогон: {at, trigger, model, steps: [...], cost}
         self.last_daily = ""        # «ГГГГ-ММ-ДД» — ежедневный уже был
@@ -135,18 +148,20 @@ class Analyst:
 
     def list(self, n=40):
         with self.lock:
-            rows = self.db.execute("select id, at, trigger, model, level, summary, cost, err, secs from reports order by at desc limit ?", (n,)).fetchall()
+            rows = self.db.execute("select id, at, trigger, model, level, summary, cost, err, secs, question from reports "
+                                   "order by at desc limit ?", (n,)).fetchall()
         return [{"id": r[0], "at": r[1], "trigger": r[2], "model": r[3], "level": r[4], "summary": r[5],
-                 "cost": r[6], "err": r[7], "secs": r[8]} for r in rows]
+                 "cost": r[6], "err": r[7], "secs": r[8], "question": (r[9] or "")[:160]} for r in rows]
 
     def get(self, rid):
         with self.lock:
-            r = self.db.execute("select id, at, trigger, model, level, summary, body, steps, tok_in, tok_out, cost, err, secs "
+            r = self.db.execute("select id, at, trigger, model, level, summary, body, steps, tok_in, tok_out, cost, err, secs, question, scope "
                                 "from reports where id=?", (int(rid),)).fetchone()
         if not r:
             return None
         return {"id": r[0], "at": r[1], "trigger": r[2], "model": r[3], "level": r[4], "summary": r[5], "body": r[6],
-                "steps": json.loads(r[7] or "[]"), "tok_in": r[8], "tok_out": r[9], "cost": r[10], "err": r[11], "secs": r[12]}
+                "steps": json.loads(r[7] or "[]"), "tok_in": r[8], "tok_out": r[9], "cost": r[10], "err": r[11], "secs": r[12],
+                "question": r[13] or "", "scope": json.loads(r[14] or "[]")}
 
     def delete(self, rid):
         with self.lock:
@@ -155,12 +170,20 @@ class Analyst:
 
     def state(self):
         r = self.run
-        return {"key": self.has_key(), "run": r and {k: r[k] for k in ("at", "trigger", "model", "steps", "cost")},
+        return {"key": self.has_key(), "run": r and {k: r.get(k) for k in ("at", "trigger", "model", "steps", "cost", "question", "scope")},
                 "month": self.month_spent(), "list": self.list(),
                 "settings": {k: self.st(k) for k in DEFAULTS}, "models": {k: v["name"] for k, v in MODELS.items()}}
 
     # ---------------------------------------------------------------- запуск
-    def start(self, trigger="manual", model=None):
+    def start(self, trigger="manual", model=None, question="", servers=None):
+        """servers — id серверов, на которые смотреть (пусто — все); question — свой вопрос владельца (trigger «ask»)."""
+        question = re.sub(r"[\x00-\x08\x0b-\x1f]", "", str(question or "")).strip()[:QUESTION_MAX]
+        if question:
+            trigger = "ask"
+        ids = {s["id"] for s in self.d.cfg.servers}
+        scope = [x for x in (servers or []) if x in ids]
+        if servers and not scope:
+            raise ValueError("таких серверов нет")
         if self.run:
             raise ValueError("агент уже работает — дождитесь отчёта")
         if not self.has_key():
@@ -168,7 +191,8 @@ class Analyst:
         model = model if model in MODELS else self.st({"daily": "ai_model_daily", "alarm": "ai_model_alarm"}.get(trigger, "ai_model_manual"))
         if self.month_spent() >= float(self.st("ai_month_usd")):
             raise ValueError("месячный потолок трат ($%s) исчерпан — его можно поднять ниже" % self.st("ai_month_usd"))
-        self.run = {"at": time.time(), "trigger": trigger, "model": model, "steps": [], "cost": 0.0}
+        self.run = {"at": time.time(), "trigger": trigger, "model": model, "steps": [], "cost": 0.0, "question": question,
+                    "scope": [s["name"] for s in self.d.cfg.servers if s["id"] in scope], "scope_ids": scope}
         threading.Thread(target=self._go, daemon=True).start()
         return True
 
@@ -199,6 +223,17 @@ class Analyst:
             self.d.note("warn", "Аналитика не запустилась (%s): %s" % (TRIGGERS[trigger], e))
 
     # ---------------------------------------------------------------- инструменты
+    def servers(self):
+        """Серверы прогона: все или выбранные для своего вопроса."""
+        sc = (self.run or {}).get("scope_ids") or []
+        return [s for s in self.d.cfg.servers if not sc or s["id"] in sc]
+
+    def _foreign(self, text):
+        """Строка про сервер вне выбранных — в обзор и журнал своего вопроса не идёт."""
+        mine = {s["name"] for s in self.servers()}
+        return any(s["name"] in text for s in self.d.cfg.servers if s["name"] not in mine and
+                   not any(s["name"] in m for m in mine))
+
     def tools(self):
         import importlib.util
         import readonly
@@ -206,7 +241,7 @@ class Analyst:
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
         checks = {k: v[1] for k, v in m.CHECKS.items() if k not in ("version",)}
-        servers = [s["name"] for s in self.d.cfg.servers]
+        servers = [s["name"] for s in self.servers()]
         return [
             {"name": "panel_overview", "description": "Что видит панель сейчас: все серверы, каналы, сквозные проверки, схема входов, тревоги, "
              "доступность каналов за сутки, состояние доступа «только чтение».", "input_schema": {"type": "object", "properties": {}}},
@@ -236,11 +271,15 @@ class Analyst:
     def overview(self):
         d = self.d
         lvl, lines = d.overall()
-        out = ["Общий уровень: %s" % lvl] + ["- " + x for x in lines]
+        if (self.run or {}).get("scope_ids"):
+            lines = [x for x in lines if not self._foreign(x)]
+            out = ["Смотрим только: %s" % ", ".join(s["name"] for s in self.servers())] + ["- " + x for x in lines]
+        else:
+            out = ["Общий уровень: %s" % lvl] + ["- " + x for x in lines]
         pr = d.principle()
         hs = d.hist.summary() or {}
         snap_ro = {}       # имя сервера → стоит ли доступ «только чтение»
-        for s in d.cfg.servers:
+        for s in self.servers():
             st = d.status.get(s["id"]) or {}
             dt = st.get("data") or {}
             sysd = dt.get("system") or {}
@@ -301,7 +340,10 @@ class Analyst:
     def events(self, n):
         n = max(5, min(150, int(n or 60)))
         with self.d.lock:
-            ev = list(self.d.log[-n:])
+            ev = list(self.d.log[-n * 3:])
+        if (self.run or {}).get("scope_ids"):
+            ev = [e for e in ev if not self._foreign(str(e.get("text") or ""))]
+        ev = ev[-n:]
         return "\n".join("%s %s %s" % (time.strftime("%d.%m %H:%M", time.localtime(e.get("ts") or 0)), e.get("level"), e.get("text")) for e in ev) or "(пусто)"
 
     def call_tool(self, red, name, inp):
@@ -312,7 +354,7 @@ class Analyst:
             if chk not in ALL_CHECKS:
                 return "отказ: для всех серверов — только %s" % ", ".join(ALL_CHECKS)
             role = inp.get("role") if inp.get("role") in ("entry", "exit") else None
-            srvs = [x for x in self.d.cfg.servers if (not role or x["role"] == role)]
+            srvs = [x for x in self.servers() if (not role or x["role"] == role)]
             import concurrent.futures as cf
 
             def one(x):
@@ -330,15 +372,15 @@ class Analyst:
         if name == "panel_events":
             return red(self.events(inp.get("n")))
         if name == "server_check":
-            srv = next((s for s in self.d.cfg.servers if s["name"] == inp.get("server")), None)
+            srv = next((s for s in self.servers() if s["name"] == inp.get("server")), None)
             if not srv:
-                return "нет такого сервера"
+                return "нет такого сервера (смотреть можно: %s)" % ", ".join(s["name"] for s in self.servers())
             args = [str(a) for a in (inp.get("args") or [])][:3]
             line = " ".join([str(inp.get("check") or "")] + args)
             if not re.fullmatch(r"[a-z0-9-]+(?: [A-Za-z0-9@._-]{1,40}){0,3}", line):
                 return "отказ: аргументы — только буквы, цифры, @ . _ -"
             try:
-                return red(self.d.ro.run(srv, line, timeout=150))
+                return red(self.d.ro.run(srv, line, timeout=150), BIG_CHECKS.get(line.split()[0], TOOL_CHARS))
             except Exception as e:     # noqa: BLE001 — ошибку показываем модели как результат
                 return "не выполнилось: %s" % e
         return "нет такого инструмента"
@@ -406,10 +448,19 @@ class Analyst:
         """Стенд: заглушка модели — обзор, две проверки на первом входе, отчёт."""
         msgs = body["messages"]
         n = sum(1 for m in msgs if m["role"] == "assistant")
-        ent = next((s["name"] for s in self.d.cfg.servers if s["role"] == "entry"), self.d.cfg.servers[0]["name"])
+        srvs = self.servers()
+        ent = next((s["name"] for s in srvs if s["role"] == "entry"), srvs[0]["name"])
         script = [("panel_overview", {}), ("all_servers_check", {"check": "services"}),
                   ("server_check", {"server": ent, "check": "handshakes"}), ("server_check", {"server": ent, "check": "rm", "args": ["-rf"]})]
+        if (self.run or {}).get("question"):
+            script = [("panel_overview", {}), ("server_check", {"server": ent, "check": "xray-config"})]
         u = {"input_tokens": 3000 + 1500 * n, "output_tokens": 200, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        if (self.run or {}).get("question") and n >= len(script):
+            got = msgs[-1]["content"][0].get("content", "") if msgs[-1]["content"] else ""
+            return {"stop_reason": "tool_use", "usage": u, "content": [{"type": "tool_use", "id": "t%d" % n, "name": "submit_report", "input": {
+                "level": "ok", "summary": "Стенд: ответ на свой вопрос (заглушка модели).",
+                "body": "## Как устроено\nЭто ответ заглушки на вопрос: «%s».\n\n## Настройки Xray на %s\n```\n%s\n```" % (
+                    self.run["question"][:200], ent, str(got)[:1500])}}]}
         if (body.get("tool_choice") or {}).get("name") == "submit_report" or n >= len(script):
             last = json.dumps(msgs[-1]["content"], ensure_ascii=False)[:400]
             return {"stop_reason": "tool_use", "usage": u, "content": [
@@ -431,8 +482,12 @@ class Analyst:
         tools = self.tools()
         tools[-1]["cache_control"] = {"type": "ephemeral"}
         system = [{"type": "text", "text": SYSTEM.replace("{steps}", str(steps_max)), "cache_control": {"type": "ephemeral"}}]
-        prev = next(iter(self.list(1)), None)
+        prev = None if r.get("question") else next((x for x in self.list(5) if x["trigger"] != "ask"), None)
         first = "Запуск %s, сейчас %s." % (TRIGGERS[r["trigger"]], time.strftime("%d.%m.%Y %H:%M"))
+        if r.get("scope"):
+            first += "\nСмотреть только эти серверы: %s." % ", ".join(r["scope"])
+        if r.get("question"):
+            first += "\n\nВопрос владельца:\n%s" % r["question"]
         if r["trigger"] == "alarm":
             first += " Панель только что подняла тревогу: " + "; ".join(self.d.overall()[1][:6])
         if prev:
@@ -446,7 +501,7 @@ class Analyst:
             while True:
                 limit = calls >= steps_max or r["cost"] >= float(self.st("ai_run_usd")) or \
                     self.month_spent() >= float(self.st("ai_month_usd"))
-                body = {"model": r["model"], "max_tokens": 4000, "system": system, "tools": tools, "messages": msgs}
+                body = {"model": r["model"], "max_tokens": 8000 if r.get("question") else 4000, "system": system, "tools": tools, "messages": msgs}
                 if limit:
                     body["tool_choice"] = {"type": "tool", "name": "submit_report"}
                     msgs[-1]["content"].append({"type": "text", "text": "Лимит шагов или трат исчерпан — подведи итог сейчас по тому, что уже видел."})
@@ -486,11 +541,11 @@ class Analyst:
                 traceback.print_exc()
         lvl = (report or {}).get("level") if (report or {}).get("level") in ("ok", "warn", "bad") else ("err" if err else "warn")
         with self.lock:
-            self.db.execute("insert into reports(at, trigger, model, level, summary, body, steps, tok_in, tok_out, cost, err, secs) "
-                            "values(?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.db.execute("insert into reports(at, trigger, model, level, summary, body, steps, tok_in, tok_out, cost, err, secs, question, scope) "
+                            "values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (r["at"], r["trigger"], r["model"], lvl, (report or {}).get("summary") or ("не получилось: %s" % err if err else ""),
                              (report or {}).get("body") or "", json.dumps(r["steps"], ensure_ascii=False), tin, tout, round(r["cost"], 5), err,
-                             round(time.time() - t0, 1)))
+                             round(time.time() - t0, 1), r.get("question") or "", json.dumps(r.get("scope") or [], ensure_ascii=False)))
             self.db.execute("delete from reports where at < ?", (time.time() - 180 * 86400,))
             self.db.commit()
         self.run = None

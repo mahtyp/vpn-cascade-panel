@@ -110,7 +110,16 @@ h2{margin:0;font-size:24px;line-height:30px;font-weight:600;letter-spacing:-.015
 .ai-row{display:grid;grid-template-columns:auto auto 1fr auto;gap:8px 12px;align-items:baseline;padding:12px 16px;border-top:1px solid var(--border);cursor:pointer}
 .ai-row:hover,.ai-row.on{background:var(--hover)}.ai-sum{min-width:0}.ai-row .pill{justify-self:start}
 .ai-rep{padding:4px 16px 16px;display:flex;flex-direction:column;gap:12px;border-top:1px solid var(--border)}
+.ai-ask{display:flex;flex-direction:column;gap:8px}.ai-ask>summary{cursor:pointer;font-size:15px}.ai-ask[open]>summary{margin-bottom:8px}
+.ai-ask textarea{width:100%;box-sizing:border-box;resize:vertical}
+.ai-ask .btn.on,.ai-ask .btn.on:hover,.ai-ask .btn.on:not(:disabled):hover{background:var(--field);color:var(--on-field)}
+.ai-srvs{display:flex;flex-wrap:wrap;gap:8px 16px}.ai-srvs label{display:inline-flex;flex-direction:row;align-items:center;gap:8px;cursor:pointer;font-size:15px;color:var(--text)}
+.ai-srvs input{width:18px;height:18px;min-height:0;accent-color:var(--field)}
+.ai-q{white-space:pre-wrap;padding:8px 12px;background:var(--hover)}
 .md{font-size:15px;line-height:1.5;max-width:860px}.md .md-h{font-size:17px;margin:16px 0 4px}.md .md-h:first-child{margin-top:4px}
+.md-pre{font-size:13px;background:var(--hover);padding:8px 12px;margin:4px 0;overflow-x:auto;white-space:pre}
+.md-tbl{overflow-x:auto;margin:4px 0}.md-tbl table{border-collapse:collapse;font-size:13px}.md-tbl th,.md-tbl td{text-align:left;padding:4px 12px 4px 0;border-bottom:1px solid var(--border);vertical-align:top}
+.md hr{border:0;border-top:1px solid var(--border);margin:8px 0}
 .md p{margin:4px 0}.md ul,.md ol{margin:4px 0;padding-left:24px}.md li{margin:2px 0}.md code{font-size:13px;background:var(--hover);padding:0 4px}
 .ai-steps{margin:0;padding-left:24px;display:flex;flex-direction:column;gap:4px}.ai-steps pre{white-space:pre-wrap;max-height:120px;overflow:auto;margin:4px 0 8px;color:var(--muted);font-size:13px}
 .ai-ro{gap:8px 12px;padding:8px 16px;border-top:1px solid var(--border)}
@@ -1712,7 +1721,7 @@ function dnsView(n) {
   </div>`;
 }
 // ------------------------------------------------------------------ «Аналитика»: ИИ-агент и отчёты
-let AIV = { open: null, rep: {}, msg: "", jobs: [] };   // открытый отчёт, загруженные отчёты (id → отчёт), задачи vpn-ro
+let AIV = { open: null, rep: {}, msg: "", jobs: [], q: "", sel: [], askOpen: false };   // открытый отчёт, загруженные отчёты (id → отчёт), задачи vpn-ro
 async function aiJobsPoll() {
   // ход установки vpn-ro по серверам — прямо в списке «Доступ «только чтение»» (а не только в окне первой задачи)
   if (AIV.polling) return;
@@ -1730,23 +1739,37 @@ async function aiJobsPoll() {
   } finally { AIV.polling = false; }
 }
 function mdLite(t) {
-  // Markdown от модели: экранируем всё, потом заголовки, списки, жирный, `код`. Никакого HTML из текста не проходит.
+  // Markdown от модели: экранируем всё, потом заголовки, списки, таблицы, ```блоки```, жирный, `код`. Никакого HTML из текста не проходит.
   const inl = (x) => esc(x).replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, '<code class="mono">$1</code>');
-  let h = "", list = "";
+  const cells = (ln) => ln.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+  let h = "", list = "", code = null, tbl = null;
   const close = () => { if (list) { h += `</${list}>`; list = ""; } };
+  const closeTbl = () => {
+    if (!tbl) return;
+    const [head, ...rows] = tbl.filter((r) => !r.every((c) => /^:?-{2,}:?$/.test(c)));
+    h += `<div class="md-tbl"><table><thead><tr>${head.map((c) => `<th>${inl(c)}</th>`).join("")}</tr></thead><tbody>` +
+      rows.map((r) => `<tr>${r.map((c) => `<td>${inl(c)}</td>`).join("")}</tr>`).join("") + "</tbody></table></div>";
+    tbl = null;
+  };
   for (const ln of String(t || "").split("\n")) {
     let m;
-    if ((m = ln.match(/^#{1,3}\s+(.*)/))) { close(); h += `<h4 class="md-h">${inl(m[1])}</h4>`; }
+    if (code !== null) { if (/^\s*```/.test(ln)) { h += `<pre class="mono md-pre">${esc(code.join("\n"))}</pre>`; code = null; } else code.push(ln); continue; }
+    if (/^\s*```/.test(ln)) { close(); closeTbl(); code = []; continue; }
+    if (/^\s*\|.*\|\s*$/.test(ln)) { close(); (tbl = tbl || []).push(cells(ln)); continue; }
+    closeTbl();
+    if ((m = ln.match(/^#{1,4}\s+(.*)/))) { close(); h += `<h4 class="md-h">${inl(m[1])}</h4>`; }
     else if ((m = ln.match(/^\s*[-*]\s+(.*)/))) { if (list !== "ul") { close(); h += "<ul>"; list = "ul"; } h += `<li>${inl(m[1])}</li>`; }
     else if ((m = ln.match(/^\s*\d+[.)]\s+(.*)/))) { if (list !== "ol") { close(); h += "<ol>"; list = "ol"; } h += `<li>${inl(m[1])}</li>`; }
+    else if (/^\s*(-{3,}|\*{3,})\s*$/.test(ln)) { close(); h += "<hr>"; }
     else if (ln.trim()) { close(); h += `<p>${inl(ln)}</p>`; }
     else close();
   }
-  close();
+  if (code !== null) h += `<pre class="mono md-pre">${esc(code.join("\n"))}</pre>`;
+  close(); closeTbl();
   return h;
 }
 const AI_LVL = { ok: ["ok", "всё в порядке"], warn: ["warn", "есть замечания"], bad: ["bad", "что-то сломано"], err: ["bad", "не получилось"] };
-const AI_TRIG = { manual: "по кнопке", daily: "по расписанию", alarm: "по тревоге" };
+const AI_TRIG = { manual: "по кнопке", daily: "по расписанию", alarm: "по тревоге", ask: "свой вопрос" };
 const usd = (x) => "$" + (x || 0).toFixed(x >= 1 ? 2 : 3).replace(".", ",");
 function roState(sv) {
   const ro = ((sv.state || {}).data || {}).ro, R = S.ro || {};
@@ -1771,11 +1794,26 @@ function renderAi() {
   if (!A.key) h += `<span class="sm">Нужен ключ API Anthropic — блок «Ключ API» ниже.</span>`;
   else if (run) {
     h += `<div class="row" style="gap:8px">${spinIcon(true)}<b>Агент работает</b><span class="sm muted">${esc(AI_TRIG[run.trigger] || "")}, ${esc(M[run.model] || run.model)}, ${usd(run.cost)}</span></div>
+      ${run.question ? `<div class="sm ai-q">${esc(run.question)}</div>` : ""}${(run.scope || []).length ? `<span class="sm muted">Серверы: ${esc(run.scope.join(", "))}</span>` : ""}
       <ol class="sm ai-steps">${(run.steps || []).map((x) => `<li>${aiStep(x)}</li>`).join("") || "<li>думает…</li>"}</ol>`;
   } else {
+    const ss = S.servers.filter((x) => x.role === "entry" || x.role === "exit"), groups = {};
+    for (const x of ss) if (x.group) (groups[x.group] = groups[x.group] || []).push(x.id);
+    AIV.sel = AIV.sel.filter((id) => ss.some((x) => x.id === id));
+    const gname = (g) => (S.servers.find((x) => x.id === g) || {}).name || g;
     h += `<div class="row" style="gap:8px;align-items:stretch"><select id="ai-model" aria-label="Модель" title="Модель">${mopt(st.ai_model_manual)}</select>
-      <button class="btn primary" data-act="ai-run" style="min-height:40px">Проанализировать сейчас</button></div>
-      <span class="sm dim">Haiku — дешевле и быстрее, Sonnet — внимательнее к сложным поломкам. Прогон обычно 1–3 мин.</span>`;
+      <button class="btn primary" data-act="ai-run" id="ai-run" style="min-height:40px">${AIV.q.trim() ? "Спросить агента" : "Проанализировать сейчас"}</button></div>
+      <span class="sm dim">Haiku — дешевле и быстрее, Sonnet — внимательнее к сложным поломкам. Прогон обычно 1–3 мин.</span>
+      <details class="ai-ask" id="ai-ask" ${AIV.askOpen ? "open" : ""}><summary>Свой вопрос и выбор серверов${AIV.q.trim() || AIV.sel.length ? ` <span class="pill sm">${AIV.q.trim() ? "есть вопрос" : ""}${AIV.q.trim() && AIV.sel.length ? ", " : ""}${AIV.sel.length ? "серверов: " + AIV.sel.length : ""}</span>` : ""}</summary>
+        <label class="sm muted" for="ai-q">Вопрос агенту — он подберёт проверки под него и ответит своими словами. Пусто — обычный отчёт.</label>
+        <textarea id="ai-q" rows="4" maxlength="2000" spellcheck="true" placeholder="Например: опиши для другого ИИ, как устроены эти серверы: роли, как идёт трафик, что стоит, как настроены 3X-UI и маршрутизация, что выглядит странно">${esc(AIV.q)}</textarea>
+        <div class="row" style="gap:8px;flex-wrap:wrap"><span class="sm muted">Смотреть:</span>
+          <button class="btn sm${AIV.sel.length ? "" : " on"}" data-act="ai-sel" data-ids="">все серверы</button>
+          ${Object.entries(groups).map(([g, ids]) => `<button class="btn sm${ids.length === AIV.sel.length && ids.every((i) => AIV.sel.includes(i)) ? " on" : ""}" data-act="ai-sel" data-ids="${esc(ids.join(","))}">связка «${esc(gname(g))}»</button>`).join("")}</div>
+        <div class="ai-srvs">${ss.map((x) => `<label class="sm"><input type="checkbox" class="ai-srv" value="${esc(x.id)}" ${AIV.sel.includes(x.id) ? "checked" : ""}> ${esc(x.name)}</label>`).join("")}</div>
+        <span class="sm dim">Ничего не отмечено — смотрит все. Ответ можно скопировать или скачать файлом .md — например, отдать другому ИИ.
+          Адреса, ключи, UUID и пароли в ответ не попадают.</span>
+      </details>`;
   }
   h += `</div></section>`;
   // отчёты
@@ -1790,10 +1828,11 @@ function renderAi() {
         <span class="ai-sum">${esc(r.summary || "")}</span><span class="sm dim" style="white-space:nowrap">${esc(AI_TRIG[r.trigger] || "")}, ${esc(M[r.model] || r.model)}, ${usd(r.cost)}</span></div>`;
     if (open) {
       h += `<div class="ai-rep">${!rep ? `<span class="sm dim">Загружаю…</span>` : `${rep.err ? `<div class="sm" style="color:var(--bad)">${esc(rep.err)}</div>` : ""}
+        ${rep.question ? `<div class="sm ai-q"><b>Вопрос:</b> ${esc(rep.question)}</div>` : ""}${(rep.scope || []).length ? `<span class="sm muted">Серверы: ${esc(rep.scope.join(", "))}</span>` : ""}
         <div class="md">${mdLite(rep.body)}</div>
         <details><summary class="sm muted" style="cursor:pointer">Что смотрел агент: ${(rep.steps || []).length} ${plural((rep.steps || []).length, "шаг", "шага", "шагов")}, ${rep.secs || 0} с, токенов ${(rep.tok_in || 0).toLocaleString("ru-RU")} + ${(rep.tok_out || 0).toLocaleString("ru-RU")}</summary>
           <ol class="sm ai-steps">${(rep.steps || []).map((x) => `<li>${aiStep(x)}<pre class="mono">${esc(x.preview || "")}</pre></li>`).join("")}</ol></details>
-        <div class="row" style="gap:8px"><button class="btn sm" data-act="ai-copy" data-id="${r.id}">Скопировать текст</button><button class="btn sm" data-act="ai-del" data-id="${r.id}">Удалить отчёт</button></div>`}</div>`;
+        <div class="row" style="gap:8px"><button class="btn sm" data-act="ai-copy" data-id="${r.id}">Скопировать текст</button><button class="btn sm" data-act="ai-md" data-id="${r.id}">Скачать .md</button><button class="btn sm" data-act="ai-del" data-id="${r.id}">Удалить отчёт</button></div>`}</div>`;
     }
   }
   if (!L.length) h += `<div class="empty">Отчётов ещё нет.</div>`;
@@ -1843,7 +1882,7 @@ function renderAi() {
       <button class="btn primary" data-act="ai-key">Сохранить ключ</button>${A.key ? '<button class="btn" data-act="ai-key-clear">Удалить ключ</button>' : ""}</div>`}
     </div></section>`;
   const keep = document.activeElement && document.activeElement.id;
-  if (keep && /^ai-(key|month|runusd|steps)$/.test(keep)) return;     // не перерисовывать, пока вводят
+  if (keep && /^ai-(key|month|runusd|steps|q)$/.test(keep)) return;     // не перерисовывать, пока вводят
   $("#main").innerHTML = h;
   if (AIV.open && !AIV.rep[AIV.open]) aiFetch(AIV.open);
 }
@@ -1859,7 +1898,21 @@ function aiStep(x) {
   return `${what} <span class="dim">${x.ok ? "" : "— отказ/ошибка"}${x.ms != null ? " " + (x.ms / 1000).toFixed(1).replace(".", ",") + " с" : ""}</span>`;
 }
 async function aiAct(a, b) {
-  if (a === "ai-run") { const r = await api("/api/ai", { action: "run", model: ($("#ai-model") || {}).value }); if (r.error) toast(r.error, "bad"); S = await api("/api/state"); renderAi(); schedule(1500); return; }
+  if (a === "ai-run") {
+    const r = await api("/api/ai", { action: "run", model: ($("#ai-model") || {}).value, question: AIV.q.trim(), servers: AIV.sel });
+    if (r.error) toast(r.error, "bad"); S = await api("/api/state"); renderAi(); schedule(1500); return;
+  }
+  if (a === "ai-sel") { AIV.sel = b.dataset.ids ? b.dataset.ids.split(",") : []; renderAi(); return; }
+  if (a === "ai-md") {
+    const r = AIV.rep[+b.dataset.id]; if (!r) return;
+    const when = new Date(r.at * 1000), pad = (n) => String(n).padStart(2, "0");
+    const head = `# Аналитика панели каскада, ${when.toLocaleString("ru-RU")}\n\n` + (r.question ? `**Вопрос:** ${r.question}\n\n` : "") +
+      ((r.scope || []).length ? `**Серверы:** ${r.scope.join(", ")}\n\n` : "") + `**Итог:** ${r.summary || ""}\n\n---\n\n`;
+    const url = URL.createObjectURL(new Blob([head + (r.body || "") + "\n"], { type: "text/markdown;charset=utf-8" }));
+    const l = document.createElement("a"); l.href = url;
+    l.download = `analitika-${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())}-${pad(when.getHours())}${pad(when.getMinutes())}.md`;
+    document.body.appendChild(l); l.click(); l.remove(); setTimeout(() => URL.revokeObjectURL(url), 5000); return;
+  }
   if (a === "ai-open") {
     const id = +b.dataset.id; AIV.open = AIV.open === id ? null : id; renderAi();
     return;
@@ -2015,6 +2068,15 @@ function renderPkgs() {
   b.innerHTML = h;
 }
 document.addEventListener("change", (e) => { if (e.target.id === "pk-reboot" && PK) PK.reboot = e.target.checked; });
+document.addEventListener("input", (e) => {
+  if (e.target.id !== "ai-q") return;
+  AIV.q = e.target.value; const b = $("#ai-run"); if (b) b.textContent = AIV.q.trim() ? "Спросить агента" : "Проанализировать сейчас";
+});
+document.addEventListener("change", (e) => {
+  if (!e.target.classList || !e.target.classList.contains("ai-srv")) return;
+  AIV.sel = [...document.querySelectorAll(".ai-srv:checked")].map((x) => x.value); renderAi();
+});
+document.addEventListener("toggle", (e) => { if (e.target.id === "ai-ask") AIV.askOpen = e.target.open; }, true);
 function closePkgs() { $("#pkg-modal").classList.add("hidden"); clearTimeout(pkTimer); if (PK && !(PK.job && PK.job.status === "run") && !(PK.jobId && !PK.job)) PK = null; }
 $("#pkg-modal").addEventListener("click", (e) => { if (e.target.id === "pkg-modal") closePkgs(); });
 

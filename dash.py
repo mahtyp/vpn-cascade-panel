@@ -958,7 +958,9 @@ class Dash:
         a = body.get("action")
         try:
             if a == "run":
-                self.ai.start("manual", body.get("model"))
+                sv = body.get("servers") or []
+                self.ai.start("manual", body.get("model"), str(body.get("question") or ""),
+                              [str(x) for x in sv][:50] if isinstance(sv, list) else [])
                 return {"ok": True}
             if a == "get":
                 r = self.ai.get(body.get("id") or 0)

@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 LIB = os.path.dirname(os.path.abspath(__file__))
-VERSION = "2"     # поднимать, когда меняются сами проверки: панель предложит переставить
+VERSION = "3"     # поднимать, когда меняются сами проверки: панель предложит переставить
 MAX_OUT = 60000
 
 UNITS = re.compile(r"^(x-ui|fail2ban|ssh|sshd|zapret2|vpn-dash-govblock|ufw|awg-quick@(wg|awg)\d{1,2})$")
@@ -206,6 +206,176 @@ def c_dns(args):
                "for d in ya.ru google.com www.cloudflare.com; do printf '%s → ' $d; getent ahostsv4 $d | awk 'NR==1{print $1}'; done")
 
 
+def _short(v, n=25):
+    if isinstance(v, list) and len(v) > n:
+        return v[:n] + ["…ещё %d" % (len(v) - n)]
+    return v
+
+
+def _stream(st):
+    """Транспорт без секретов: сеть, защита, имя сайта, отпечаток (publicKey/shortId/пароли не выводятся)."""
+    st = st or {}
+    d = {"сеть": st.get("network") or "tcp", "защита": st.get("security") or "none"}
+    rs = st.get("realitySettings") or {}
+    if rs:
+        inner = rs.get("settings") or {}
+        for k, name in (("dest", "сайт маскировки"), ("target", "сайт маскировки"), ("serverNames", "имена"),
+                        ("serverName", "имя"), ("fingerprint", "отпечаток"), ("spiderX", "spiderX"), ("xver", "xver")):
+            v = rs.get(k, inner.get(k) if k in ("fingerprint", "spiderX", "serverName") else None)
+            if v not in (None, "", []):
+                d[name] = v
+        if rs.get("shortIds") is not None:
+            d["shortId, шт"] = len(rs.get("shortIds") or [])
+    ts = st.get("tlsSettings") or {}
+    for k, name in (("serverName", "имя"), ("fingerprint", "отпечаток"), ("alpn", "alpn")):
+        if ts.get(k):
+            d[name] = ts[k]
+    so = st.get("sockopt") or {}
+    for k in ("interface", "dialerProxy", "mark", "tcpMaxSeg", "domainStrategy", "tcpFastOpen"):
+        if so.get(k) not in (None, "", 0):
+            d["sockopt." + k] = so[k]
+    for k in ("xhttpSettings", "wsSettings", "grpcSettings", "httpupgradeSettings"):
+        x = st.get(k) or {}
+        if x.get("path") or x.get("serviceName") or x.get("mode"):
+            d[k] = {kk: x[kk] for kk in ("path", "serviceName", "mode", "host") if x.get(kk)}
+    return d
+
+
+def _outbound(o):
+    p, s = o.get("protocol"), o.get("settings") or {}
+    d = {"протокол": p}
+    if p == "freedom":
+        for k in ("domainStrategy", "redirect"):
+            if s.get(k):
+                d[k] = s[k]
+        if s.get("fragment"):
+            d["fragment"] = s["fragment"]
+        if s.get("noises"):
+            d["noises, шт"] = len(s["noises"])
+    elif p == "loopback":
+        d["inboundTag"] = s.get("inboundTag")
+    elif p in ("vless", "vmess"):
+        vn = (s.get("vnext") or [{}])[0] if s.get("vnext") else s
+        d["куда"] = "%s:%s" % (vn.get("address"), vn.get("port"))
+        u = (vn.get("users") or [{}])[0] if vn.get("users") else vn
+        for k in ("flow", "encryption"):
+            if u.get(k):
+                d[k] = u[k]
+    elif p in ("socks", "http", "trojan", "shadowsocks", "wireguard", "hysteria2"):
+        sv = s.get("servers") or s.get("peers") or []
+        d["куда"] = ["%s:%s" % (x.get("address") or x.get("endpoint"), x.get("port", "")) for x in sv][:6]
+    if o.get("streamSettings"):
+        d.update(_stream(o["streamSettings"]))
+    if (o.get("mux") or {}).get("enabled"):
+        d["mux"] = True
+    if o.get("proxySettings"):
+        d["proxySettings"] = o["proxySettings"]
+    return d
+
+
+def c_xray_config(args):
+    """Как настроен Xray входа сейчас: исходящие, маршрутизация целиком, цепочки, наблюдатель, входящие, DNS."""
+    import sqlite3
+    db = None
+    if os.path.exists("/etc/x-ui/x-ui.db"):
+        try:
+            db = sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True, timeout=5)
+        except Exception:
+            db = None
+    cfg, src = None, ""
+    try:
+        cfg = json.load(open("/usr/local/x-ui/bin/config.json", encoding="utf-8"))
+        src = "config.json (с ним Xray запущен сейчас, вместе с исходящими из подписок 3X-UI)"
+    except Exception:
+        pass
+    if cfg is None and db is not None:
+        try:
+            cfg = json.loads(db.execute("select value from settings where key='xrayTemplateConfig'").fetchone()[0])
+            src = "шаблон Xray в базе 3X-UI (config.json не прочитать)"
+        except Exception:
+            pass
+    if cfg is None:
+        return "3X-UI/Xray здесь нет"
+    xb = next((os.path.join("/usr/local/x-ui/bin", f) for f in sorted(os.listdir("/usr/local/x-ui/bin"))
+               if f.startswith("xray-linux")), "") if os.path.isdir("/usr/local/x-ui/bin") else ""
+    out = ["Источник: " + src]
+    if xb:
+        out.append("Xray: " + (run("%s version 2>/dev/null | head -1" % xb).strip() or "?"))
+    if os.access("/usr/local/x-ui/x-ui", os.X_OK):         # сама программа 3X-UI (не меню x-ui): -v — только версия
+        v = run("timeout 10 /usr/local/x-ui/x-ui -v 2>/dev/null | head -1", 15).strip()
+        out.append("3X-UI: " + (v or "?"))
+    lg = cfg.get("log") or {}
+    out.append("Журнал: уровень %s, ошибки %s, доступ %s" % (lg.get("loglevel"), lg.get("error") or "—", lg.get("access") or "—"))
+    dns = cfg.get("dns") or {}
+    if dns:
+        out.append("DNS Xray: %s" % json.dumps({k: _short(v, 10) for k, v in dns.items() if k in ("servers", "queryStrategy", "disableFallback", "hosts")},
+                                                ensure_ascii=False))
+    out.append("\n== Исходящие (%d)" % len(cfg.get("outbounds") or []))
+    for o in cfg.get("outbounds") or []:
+        out.append("%s: %s" % (o.get("tag"), json.dumps(_outbound(o), ensure_ascii=False)))
+    r = cfg.get("routing") or {}
+    out.append("\n== Маршрутизация: domainStrategy %s" % r.get("domainStrategy"))
+    for b in r.get("balancers") or []:
+        out.append("цепочка %s: %s → %s, запасной %s" % (b.get("tag"), (b.get("strategy") or {}).get("type") or "random",
+                                                        b.get("selector"), b.get("fallbackTag") or "—"))
+    bl = 0
+    for i, x in enumerate(r.get("rules") or []):
+        if any(str(t).startswith("_bl_") for t in x.get("inboundTag") or []):
+            bl += 1
+            continue
+        k = {f: _short(x[f]) for f in ("inboundTag", "domain", "ip", "port", "sourcePort", "network", "protocol", "source", "user", "attrs")
+             if f in x}
+        if "user" in k:
+            k["user"] = "%d адресатов" % len(x["user"]) if isinstance(x["user"], list) else "?"
+        out.append("правило %d%s %s → %s" % (i, " [%s]" % x["ruleTag"] if x.get("ruleTag") else "", json.dumps(k, ensure_ascii=False),
+                                              x.get("balancerTag") or x.get("outboundTag")))
+    if bl:
+        out.append("(служебных правил цепочек _bl_*: %d)" % bl)
+    for k in ("observatory", "burstObservatory"):
+        ob = cfg.get(k)
+        if ob:
+            pc = ob.get("pingConfig") or {}
+            out.append("%s: следит за %s, проверка %s, раз в %s" % (k, ob.get("subjectSelector"), ob.get("probeURL") or pc.get("destination"),
+                                                                ob.get("probeInterval") or pc.get("interval")))
+    out.append("\n== Входящие")
+    rows = []
+    if db is not None:
+        try:
+            rows = db.execute("select remark, enable, listen, port, protocol, settings, stream_settings, tag, sniffing from inbounds").fetchall()
+        except Exception:
+            rows = []
+    if rows:
+        for remark, en, listen, port, proto, st, ss, tag, sn in rows:
+            try:
+                st = json.loads(st or "{}")
+                ss = json.loads(ss or "{}")
+                sn = json.loads(sn or "{}")
+            except ValueError:
+                st, ss, sn = {}, {}, {}
+            cl = st.get("clients") or []
+            d = {"порт": port, "слушает": listen or "все адреса", "протокол": proto, "включён": bool(en), "тег": tag}
+            if cl:
+                d["клиентов"] = "%d, включено %d" % (len(cl), sum(1 for c in cl if c.get("enable", True)))
+                fl = sorted({c.get("flow") or "—" for c in cl})
+                d["flow"] = fl
+                if any(c.get("limitIp") for c in cl):
+                    d["с limitIp"] = sum(1 for c in cl if c.get("limitIp"))
+            if st.get("decryption") not in (None, "none"):
+                d["decryption"] = "задано"
+            d.update(_stream(ss))
+            if sn:
+                d["sniffing"] = sn.get("destOverride") if sn.get("enabled") else "выкл"
+            out.append("%s: %s" % (remark or tag, json.dumps(d, ensure_ascii=False)))
+    else:
+        for i in cfg.get("inbounds") or []:
+            if str(i.get("tag", "")).startswith(("api", "_bl_")):
+                continue
+            d = {"порт": i.get("port"), "слушает": i.get("listen") or "все адреса", "протокол": i.get("protocol")}
+            d.update(_stream(i.get("streamSettings")))
+            out.append("%s: %s" % (i.get("tag"), json.dumps(d, ensure_ascii=False)))
+    return "\n".join(out)
+
+
 CHECKS = {
     "system": (c_system, "время, нагрузка, память, диск, ядро, упавшие службы"),
     "services": (c_services, "состояние служб каскада и туннелей"),
@@ -215,6 +385,7 @@ CHECKS = {
     "journal": (c_journal, "журнал службы: journal <служба> [строк] [часов]"),
     "xray-errors": (c_xray_errors, "журнал ошибок Xray: xray-errors [строк]"),
     "routing": (c_routing, "маршрутизация Xray: правила, цепочки, DNS"),
+    "xray-config": (c_xray_config, "как настроен Xray: исходящие, все правила, цепочки, наблюдатель, входящие (без секретов)"),
     "conns": (c_conns, "соединения, conntrack, файлы Xray"),
     "channel": (c_channel, "задержка по каналу: channel wgN"),
     "mask": (c_mask, "сайт маскировки Reality: открывается ли, TLS, сертификат"),
