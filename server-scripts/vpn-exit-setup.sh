@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 # vpn-exit-setup.sh — делает из чистого VPS выходной сервер каскада:
-#   AmneziaWG 3.1 модулем ядра (сервер awg0, без Docker) + fail2ban для SSH.
+#   AmneziaWG 3.1 модулем ядра (сервер awg0, без Docker) + Sudoku (официальный установщик).
 #
 # Запуск на НОВОМ выходном сервере от root (Ubuntu 24.04):
 #   bash vpn-exit-setup.sh                установка
 #   bash vpn-exit-setup.sh client ИМЯ     клиент AWG для телефона/ноутбука (конфиг + QR-код)
 #   bash vpn-exit-setup.sh status         что работает и на каких портах
 #
-# После установки подключите выход к каждому входу:
+# После установки подключите выход к каждому входу (вход-1, вход-2):
 #   bash vpn-add-exit.sh ИМЯ IP_ВЫХОДА
 #
 # Переменные окружения (необязательно):
 #   AWG_SUBNET   подсеть туннеля, по умолчанию 10.9.0  (сервер 10.9.0.1)
 #   AWG_PORT     UDP-порт AWG, по умолчанию случайный 20000–59999
+#   SUDOKU_PORT  TCP-порт Sudoku, по умолчанию случайный (выбирает установщик Sudoku)
 #   SKIP_FAIL2BAN=1  не настраивать fail2ban
-#   ONLY_AWG=1   только AmneziaWG (перевод выхода с Amnezia в Docker): fail2ban не трогается
+#   ONLY_AWG=1   только AmneziaWG (перевод выхода с Amnezia в Docker, «Связать» в «Протоколах»): Sudoku и fail2ban
+#                не ставятся и не трогаются; нужны заголовки ядра, пакеты AmneziaWG и sysctl (пересылка пакетов, BBR)
+#   ONLY_SUDOKU=1  только Sudoku — запасной канал к выходу, на котором уже живёт что-то своё (например, 3X-UI):
+#                  без AmneziaWG, заголовков ядра, sysctl и fail2ban; порт Sudoku в ufw разрешает сам установщик
 
 set -euo pipefail
 
@@ -22,6 +26,7 @@ AWG_DIR=/etc/amnezia/amneziawg
 IF=awg0
 CONF="$AWG_DIR/$IF.conf"
 NET="${AWG_SUBNET:-10.9.0}"
+SUDOKU_INSTALLER=https://raw.githubusercontent.com/SUDOKU-ASCII/easy-install/main/install.sh
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -53,7 +58,10 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vpn-awg-common.sh" || { ec
 
 stage_packages() {
   apt_begin
-  apt-get install -y -q curl ca-certificates openssl jq python3 iputils-ping iptables fail2ban qrencode zstd \
+  local extra="fail2ban qrencode zstd"
+  [ "${ONLY_AWG:-0}" = 1 ] && extra=""        # только туннель: fail2ban на Ubuntu сразу включает защиту SSH — на чужом сервере не ставим
+  # shellcheck disable=SC2086
+  apt-get install -y -q curl ca-certificates openssl jq python3 iputils-ping iptables $extra \
     software-properties-common "linux-headers-$(uname -r)" \
     || die "не поставились пакеты. Если не нашлись linux-headers — обновите систему и перезагрузитесь"
   add_amnezia_ppa
@@ -85,7 +93,7 @@ EOF
 stage_awg() {
   say "AmneziaWG: сервер $IF"
   if [ -f "$CONF" ]; then
-    # конфиг с S4 < 16 модуль с HeaderProtectionKey не принимает («Invalid argument»).
+    # конфиг от прошлой попытки с S4 < 16: с HeaderProtectionKey модуль его не принимает («Invalid argument»).
     # Клиентов ещё нет — можно спокойно поправить
     local s4; s4=$(awk -F'= *' '/^S4 *=/ {print $2}' "$CONF")
     if [ -n "$s4" ] && [ "$s4" -lt 16 ] && ! grep -q '^\[Peer\]' "$CONF"; then
@@ -101,8 +109,8 @@ stage_awg() {
     # размеры мусорных префиксов: S1 + 56 не должно равняться S2 (иначе пакеты различимы)
     S1=$(rnd 15 150)
     S2=$(rnd 15 150); while [ $((S1 + 56)) -eq "$S2" ]; do S2=$(rnd 15 150); done
-    # S4 < 16 вместе с HeaderProtectionKey модуль не принимает («Invalid argument»): поэтому
-    # S4 от 16. S3 тоже не меньше 16
+    # S4 < 16 вместе с HeaderProtectionKey модуль не принимает («Invalid argument»): на некоторых версиях ядра S4 = 6 не принимался,
+    # 16 и выше работает. S3 тоже не меньше 16 — так проверено на работающих выходах
     S3=$(rnd 16 64); while [ $((S3 + 64)) -eq $((S2 + 92)) ]; do S3=$(rnd 16 64); done   # размеры пакетов не должны совпасть
     S4=$(rnd 16 32)
     HPK=$(openssl rand -base64 32)
@@ -149,6 +157,27 @@ EOF
   awg show "$IF" | grep -q 'header protection key' \
     || warn "awg show не показывает header protection key — возможно, старые awg-tools"
   ok "$IF работает, UDP $(awg show "$IF" listen-port)"
+}
+
+# ---------------------------------------------------------------- Sudoku
+
+stage_sudoku() {
+  say "Sudoku"
+  if systemctl is-active --quiet sudoku 2>/dev/null || systemctl is-active --quiet sudoku-sing-box 2>/dev/null; then
+    ok "Sudoku уже установлен — оставляю как есть"
+  else
+    local inst
+    inst=$(mktemp /tmp/sudoku-dash.XXXXXX.sh)
+    curl -fsSL "$SUDOKU_INSTALLER" -o "$inst" || die "не скачался установщик Sudoku"
+    echo "  Ставлю Sudoku официальным установщиком (без вопросов, настройки по умолчанию)…"
+    # SUDOKU_PORT, если задан в окружении, установщик подхватит сам
+    SUDOKU_YES=1 SUDOKU_LANG=en SUDOKU_WARP=false SERVER_IP="$(public_ip)" bash "$inst" </dev/null \
+      || die "установщик Sudoku завершился с ошибкой (вывод выше)"
+    rm -f "$inst"
+  fi
+  [ -f /etc/sudoku/config.json ] || die "нет /etc/sudoku/config.json"
+  [ -f /etc/sudoku/export-state.env ] || warn "нет /etc/sudoku/export-state.env — входу будет не из чего взять ключ клиента"
+  ok "Sudoku работает, TCP $(jq -r .local_port /etc/sudoku/config.json)"
 }
 
 # ---------------------------------------------------------------- fail2ban
@@ -213,10 +242,11 @@ PY
 cmd_status() {
   say "Выход $(hostname -s), $(public_ip)"
   local s
-  for s in "awg-quick@$IF" fail2ban; do
+  for s in "awg-quick@$IF" sudoku fail2ban; do
     if systemctl is-active --quiet "$s"; then ok "$s работает"; else warn "$s НЕ работает"; fi
   done
   [ -f "$CONF" ] && ok "AWG: UDP $(awg show "$IF" listen-port 2>/dev/null), клиентов $(grep -c '^\[Peer\]' "$CONF")"
+  [ -f /etc/sudoku/config.json ] && ok "Sudoku: TCP $(jq -r .local_port /etc/sudoku/config.json)"
   return 0
 }
 
@@ -228,20 +258,28 @@ main() {
     status) cmd_status ;;
     "")
       preflight
+      if [ "${ONLY_SUDOKU:-0}" = 1 ]; then
+        apt_begin
+        apt-get install -y -q curl ca-certificates jq python3 >/dev/null || die "не поставились curl/jq"
+        stage_sudoku
+        ok "Готово: только Sudoku (ONLY_SUDOKU=1). AmneziaWG, ядро, sysctl, fail2ban и остальное на сервере не трогал"
+        return 0
+      fi
       stage_packages
       stage_sysctl
       stage_awg
       if [ "${ONLY_AWG:-0}" = 1 ]; then
-        ok "AmneziaWG без Docker готов: UDP $(awg show "$IF" listen-port). fail2ban не трогал (ONLY_AWG=1)"
+        ok "AmneziaWG без Docker готов: UDP $(awg show "$IF" listen-port). Sudoku и fail2ban не трогал (ONLY_AWG=1)"
         return 0
       fi
+      stage_sudoku
       if [ "${SKIP_FAIL2BAN:-0}" = 1 ]; then warn "fail2ban пропущен (SKIP_FAIL2BAN=1)"; else stage_fail2ban; fi
       cmd_status
       cat <<EOF
 
   Готово. Теперь подключите этот выход к каждому входу. На каждом входе:
     bash /root/vpn-add-exit.sh ИМЯ $(public_ip)
-  (ИМЯ латиницей, например Frankfurt; скрипт спросит пароль root этого сервера)
+  (ИМЯ латиницей, например ExitA; скрипт спросит пароль root этого сервера)
 EOF
       ;;
     *) die "непонятная команда: $1 (можно: client ИМЯ, status)" ;;

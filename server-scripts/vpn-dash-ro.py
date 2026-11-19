@@ -21,7 +21,7 @@ LIB = os.path.dirname(os.path.abspath(__file__))
 VERSION = "3"     # поднимать, когда меняются сами проверки: панель предложит переставить
 MAX_OUT = 60000
 
-UNITS = re.compile(r"^(x-ui|fail2ban|ssh|sshd|zapret2|vpn-dash-govblock|ufw|awg-quick@(wg|awg)\d{1,2})$")
+UNITS = re.compile(r"^(x-ui|mihomo|sudoku|sing-box|fail2ban|ssh|sshd|zapret2|vpn-dash-govblock|ufw|awg-quick@(wg|awg)\d{1,2})$")
 
 
 def run(cmd, timeout=30):
@@ -84,7 +84,7 @@ def c_system(args):
 
 
 def c_services(args):
-    units = ["x-ui", "fail2ban", "vpn-dash-govblock", "zapret2"]
+    units = ["x-ui", "mihomo", "sudoku", "sing-box", "fail2ban", "vpn-dash-govblock", "zapret2"]
     out = []
     for u in units:
         if run("systemctl list-unit-files %s.service --no-legend 2>/dev/null" % u).strip():
@@ -122,7 +122,7 @@ def c_handshakes(args):
 def c_journal(args):
     unit = args[0] if args else ""
     if not UNITS.fullmatch(unit):
-        raise ValueError("служба не из списка: x-ui, fail2ban, ssh, zapret2, vpn-dash-govblock, ufw, awg-quick@wgN")
+        raise ValueError("служба не из списка: x-ui, mihomo, sudoku, sing-box, fail2ban, ssh, zapret2, vpn-dash-govblock, ufw, awg-quick@wgN")
     n = num(args[1] if len(args) > 1 else None, 10, 400, 120)
     h = num(args[2] if len(args) > 2 else None, 1, 72, 6)
     return run("journalctl -u %s --since '-%d hour' --no-pager -o short-iso | tail -n %d" % (unit, h, n), 40) or "(пусто)"
@@ -159,7 +159,7 @@ def c_conns(args):
 
 
 def c_channel(args):
-    """Задержка по каналу: туннель wgN (ping до .1 в туннеле)."""
+    """Задержка по каналу: туннель wgN (ping до .1 в туннеле) или SOCKS Mihomo (порт 1080–1099, запрос через него)."""
     ch = args[0] if args else ""
     if re.fullmatch(r"(wg|awg)\d{1,2}", ch):
         if ch not in tunnels():
@@ -169,7 +169,11 @@ def c_channel(args):
             return "у %s нет адреса" % ch
         peer = ".".join(addr.split("/")[0].split(".")[:3]) + ".1"
         return run("ping -I %s -c 5 -i 0.3 -W 2 %s | tail -3" % (ch, peer), 20)
-    raise ValueError("канал: wgN (туннель AmneziaWG)")
+    if re.fullmatch(r"10[89]\d", ch):
+        return run("for i in 1 2 3; do curl -s -o /dev/null --noproxy '' -m 10 --socks5-hostname 127.0.0.1:%s "
+                   "-w 'соединение %%{time_connect} с, первый байт %%{time_starttransfer} с, код %%{http_code}\\n' "
+                   "https://www.cloudflare.com/cdn-cgi/trace || echo 'нет ответа'; done" % ch, 40)
+    raise ValueError("канал: wgN (туннель AmneziaWG) или порт SOCKS 1080–1099")
 
 
 def c_mask(args):
@@ -387,10 +391,10 @@ CHECKS = {
     "routing": (c_routing, "маршрутизация Xray: правила, цепочки, DNS"),
     "xray-config": (c_xray_config, "как настроен Xray: исходящие, все правила, цепочки, наблюдатель, входящие (без секретов)"),
     "conns": (c_conns, "соединения, conntrack, файлы Xray"),
-    "channel": (c_channel, "задержка по каналу: channel wgN"),
+    "channel": (c_channel, "задержка по каналу: channel wgN | channel <порт SOCKS>"),
     "mask": (c_mask, "сайт маскировки Reality: открывается ли, TLS, сертификат"),
     "e2e": (c_e2e, "сквозная проверка через Xray входа (зарубежный и российский сайт)"),
-    "versions": (c_versions, "версия AmneziaWG и протокол туннелей"),
+    "versions": (c_versions, "версии AmneziaWG, Mihomo, Sudoku"),
     "dmesg": (c_dmesg, "сообщения ядра: conntrack, oom, туннели"),
     "firewall": (c_firewall, "ufw, таблицы nftables, сети госорганов, fail2ban"),
     "dns": (c_dns, "DNS сервера и как он видит имена"),

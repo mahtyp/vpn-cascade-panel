@@ -8,7 +8,7 @@
 #   bash vpn-zapret.sh off                                          выключить (zapret остаётся, правила сети убраны)
 #   bash vpn-zapret.sh remove                                       выключить и удалить совсем
 #
-# Zapret трогает только соединения к адресам из своих списков (hostlist) — туннели и клиентов входа
+# Zapret трогает только соединения к адресам из своих списков (hostlist) — туннели, Sudoku и клиентов входа
 # не касается. Подбор временно ставит свои правила только на адреса проверяемого сайта и убирает их сам.
 # STAND=1 — стенд панели: blockcheck2 и сеть не трогаются, ответы готовые.
 set -uo pipefail
@@ -72,7 +72,7 @@ check)
     exit 0
   fi
   cd "$Z" || exit 1
-  # DoH — сначала по IP: у некоторых российских хостеров имена cloudflare-dns.com, dns.google не находятся (DNS перехвачен),
+  # DoH — сначала по IP: у некоторых хостеров имена cloudflare-dns.com, dns.google не находятся (DNS перехвачен),
   # а https://1.1.1.1 отвечает. Без рабочего DoH blockcheck2 при подмене DNS прекращает подбор
   DOH_SERVERS="https://1.1.1.1/dns-query https://8.8.8.8/dns-query https://9.9.9.9/dns-query https://cloudflare-dns.com/dns-query https://dns.google/dns-query" \
   CURL_MAX_TIME_DOH=${CURL_MAX_TIME_DOH:-5} \

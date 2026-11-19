@@ -4,7 +4,7 @@
 # <имя входа>-wg0, <имя входа>-wg1 и т.д.
 #
 # Запуск на выходе от root:
-#   bash vpn-remove-client.sh Entry3         убрать всех клиентов Entry3-wg*
+#   bash vpn-remove-client.sh Entry3          убрать всех клиентов Entry3-wg*
 #   bash vpn-remove-client.sh Entry3 --dry    только показать, что будет удалено
 # Работает и с AmneziaWG без Docker (awg0.conf), и с Amnezia в Docker (контейнер amnezia-awg2).
 # Перед правкой конфиг копируется рядом (.bak-ДАТА).

@@ -61,6 +61,8 @@ def plan(srv, a):
             i = awg_by_port[port]
             r.update(verdict="keep", what="AmneziaWG %s" % i,
                      why=("туннель от входов" if i in servers else "туннель до выхода") + " — на чужие пакеты не отвечает", c="AmneziaWG %s" % i)
+        elif port == a.get("sudoku_port") or proc in ("sudoku", "sing-box"):
+            r.update(verdict="keep", what="Sudoku", why="канал от входов", c="Sudoku")
         elif proc == "docker-proxy" or port in docker_ports:
             r.update(verdict="auto", what="Docker" + (" (%s)" % proc if proc and proc != "docker-proxy" else ""),
                      why="Docker открывает свои порты сам, ufw их не касается")
