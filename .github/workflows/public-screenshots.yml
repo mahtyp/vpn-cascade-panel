@@ -32,7 +32,7 @@ jobs:
           set -euo pipefail
           sudo bash dev/testbed.sh up
           sudo chown -R "$(id -u):$(id -g)" dev/stand
-          bash dev/testbed.sh run 8790
+          bash -x dev/testbed.sh run 8790 || { echo '--- dash.out ---'; cat dev/stand/app/dash.out || true; echo '--- files ---'; ls -la dev/stand/app | head -30; exit 1; }
           .venv/bin/python dev/test_public_smoke.py
           .venv/bin/python dev/capture_public_screenshots.py
       - name: Commit only screenshot images to public release branch
