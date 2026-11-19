@@ -51,6 +51,29 @@ def tracked_files():
     return [pathlib.PurePosixPath(x.decode("utf-8")) for x in data.split(b"\0") if x]
 
 
+REQUIRED_SCREENSHOTS = (
+    "docs/screenshots/overview.png",
+    "docs/screenshots/servers.png",
+    "docs/screenshots/sudoku.png",
+    "docs/screenshots/schema.png",
+    "docs/screenshots/analytics.png",
+)
+
+
+def screenshot_problems():
+    """Не выпускать README с отсутствующими или испорченными PNG из фиктивного стенда."""
+    paths = {p.as_posix() for p in tracked_files()}
+    issues = []
+    for name in REQUIRED_SCREENSHOTS:
+        if name not in paths:
+            issues.append((name, 0, "нет обязательного скриншота в Git"))
+        else:
+            data = (ROOT / name).read_bytes()
+            if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 4096:
+                issues.append((name, 0, "скриншот не похож на полноценный PNG"))
+    return issues
+
+
 def license_problems():
     """Проверить, что лицензии всех встроенных сторонних библиотек отслеживаются Git."""
     paths = {p.as_posix() for p in tracked_files()}
@@ -104,6 +127,7 @@ def main():
     args = parser.parse_args()
     problems, warnings = scan(strict_ip=args.strict_ip)
     problems.extend(license_problems())
+    problems.extend(screenshot_problems())
     # Не печатать сами совпавшие секреты и IP!
     for name, line, label in problems:
         print("ERROR %s:%s: %s" % (name, line, label))
