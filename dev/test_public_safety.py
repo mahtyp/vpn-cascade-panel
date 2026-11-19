@@ -27,6 +27,11 @@ class PublicSafetyTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.root), "add", "--", path],
                        check=True, capture_output=True)
 
+    def test_missing_readme_screenshot_is_blocked(self):
+        self.add("README.md", "# Example")
+        missing = guard.screenshot_problems()
+        self.assertTrue(any(p[0] == "docs/screenshots/overview.png" for p in missing))
+
     def test_missing_third_party_license_is_blocked(self):
         self.add("LICENSE", "MIT License")
         missing = guard.license_problems()
