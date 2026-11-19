@@ -1,7 +1,7 @@
 """«Сайты и обходы»: проверка сайта через все входы и выходы и отдельные цепочки (обходы) для сайтов.
 
 Проверка только читает: на каждом входе probe.py (MODE "site") открывает адреса сервиса через каждый
-канал — туннель AWG (curl --interface wgN), — и прямо с каждого выхода. Обход — правило
+канал — AWG (curl --interface wgN) и Sudoku (SOCKS Mihomo), — и прямо с каждого выхода. Обход — правило
 3X-UI на входах «эти сайты → своя цепочка выходов», как DC5TG; ставится и убирается только по кнопке.
 """
 import concurrent.futures as cf
@@ -74,6 +74,56 @@ def service_for(target):
             "match": {"domain": ["domain:" + host]}}
 
 
+def recheck_target(b):
+    """Цель старой проверки необходимости; для работоспособности нужны ещё маршрут и цепочка."""
+    if b.get("service"):
+        return str(b["service"])
+    for d in b.get("match", {}).get("domain") or []:
+        host = str(d).strip().lower()
+        if host.startswith(("domain:", "full:")):
+            host = host.split(":", 1)[1]
+        if HOST_RE.match(host):
+            return host
+    return ""
+
+
+def route_targets(b, explicit=""):
+    """Конкретные адреса для «какое правило сработает»; geoip:… без адреса не угадываем."""
+    if explicit.strip():
+        return [explicit.strip()]
+    out = []
+    for d in b.get("match", {}).get("domain") or []:
+        host = str(d).strip().lower()
+        if host.startswith(("domain:", "full:")):
+            host = host.split(":", 1)[1]
+        if HOST_RE.match(host) and host not in out:
+            out.append(host)
+    if out:
+        return out[:6]
+    svc = SERVICES.get(str(b.get("service") or ""))
+    if svc:
+        for u, _ in svc["urls"]:
+            host = re.sub(r"^https?://", "", u).split("/")[0].split(":")[0]
+            if HOST_RE.match(host) and host not in out:
+                out.append(host)
+        if out:
+            return out[:6]
+    # У одиночной подсети можно взять первый обычный адрес. У geoip:au такого адреса нет:
+    # нужен явный пример от пользователя, иначе проверка была бы выдуманной.
+    ips = b.get("match", {}).get("ip") or []
+    if len(ips) == 1:
+        import ipaddress
+        try:
+            net = ipaddress.ip_network(str(ips[0]), strict=False)
+            if net.version == 4 and net.prefixlen <= 30:
+                return [str(next(net.hosts()))]
+            if net.version == 6 and net.prefixlen <= 126:
+                return [str(next(net.hosts()))]
+        except (ValueError, StopIteration):
+            pass
+    return []
+
+
 def judge(r, need):
     """Ответ curl → ok / denied / bad и короткий текст."""
     c, t = r.get("code") or 0, r.get("t") or 0
@@ -118,17 +168,21 @@ class Sites:
             raise RuntimeError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
         return json.loads(out)["site"]
 
-    def check(self, target):
+    def check(self, target, tags=None):
         svc = service_for(target)
         urls = [u for u, _ in svc["urls"]]
         cfg = self.d.cfg
         entries = [s for s in cfg.servers if s["role"] == "entry" and cfg.get_pw(s["id"])]
-        exits = [s for s in cfg.servers if s["role"] == "exit"]
+        wanted = set(tags or [])
+        exits = [s for s in cfg.servers if s["role"] == "exit" and (not wanted or any(
+            c.get("tag") in wanted and c.get("exit_id") == s["id"]
+            for e in entries for c in self.d.channels.get(e["id"], [])))]
         t0 = time.time()
 
         def on_entry(e):
-            chans = [c for c in self.d.channels.get(e["id"], []) if c.get("exit_id")]
-            spec = [{"key": c["key"], "iface": c["iface"]} for c in chans]
+            chans = [c for c in self.d.channels.get(e["id"], []) if c.get("exit_id") and (not wanted or c.get("tag") in wanted)]
+            spec = [{"key": c["key"], "iface": c["iface"]} if c["kind"] == "AWG" else {"key": c["key"], "socks": c["port"]}
+                    for c in chans]
             try:
                 return e["id"], self._probe(e, urls, spec)["res"], None
             except Exception as ex:  # noqa: BLE001
@@ -148,12 +202,16 @@ class Sites:
         ent_res = {sid: (res, err) for sid, res, err in ent}
         ext_res = {sid: (res, err) for sid, res, err in ext}
 
-        # строки: каналы основного входа в порядке цепочки (туннель до каждого выхода)
+        # Обычная таблица — по основному входу. Для проверки конкретной цепочки добавляем
+        # строки и с других входов, чтобы отсутствие канала на основном входе не скрывало результат.
         main = entries[0] if entries else None
         order = []
-        for c in sorted(self.d.channels.get(main["id"], []) if main else [], key=lambda c: (c.get("n") is None, c.get("n") or 0)):
-            if c.get("exit_id"):
-                order.append((c["exit_id"], c["kind"]))
+        sources = entries if wanted else ([main] if main else [])
+        for ent in sources:
+            for c in sorted(self.d.channels.get(ent["id"], []), key=lambda c: (c.get("n") is None, c.get("n") or 0)):
+                pair = (c.get("exit_id"), c.get("kind"))
+                if c.get("exit_id") and (not wanted or c.get("tag") in wanted) and pair not in order:
+                    order.append(pair)
         rows = []
         for xid, kind in order:
             x = cfg.by_id(xid) or {"name": xid}
@@ -178,14 +236,121 @@ class Sites:
                                       "tls": "не отвечает"}.get(sorted(why)[0], direct["text"])
                     direct["why"] = sorted(why)[0]
             rows.append({"exit_id": xid, "exit": x["name"], "kind": kind, "cells": cells, "direct": direct,
-                         "tag": next((c.get("tag") for c in self.d.channels.get(main["id"], [])
-                                      if c.get("exit_id") == xid and c["kind"] == kind), None)})
+                         "tag": next((c.get("tag") for e in ([main] if main and not wanted else entries) if e
+                                      for c in self.d.channels.get(e["id"], [])
+                                      if c.get("exit_id") == xid and c["kind"] == kind and (not wanted or c.get("tag") in wanted)), None)})
         result = {"target": svc["id"], "title": svc["title"], "code": svc["code"], "urls": urls, "parts": svc.get("parts"),
                   "note": svc.get("note", ""), "entries": [{"id": e["id"], "name": e["name"]} for e in entries],
                   "rows": rows, "secs": round(time.time() - t0), "at": time.time(),
                   "errors": {e["name"]: ent_res[e["id"]][1] for e in entries if ent_res[e["id"]][1]}}
         result.update(self.verdict(result, svc))
         return result
+
+    def check_bypass(self, code, explicit=""):
+        """Работоспособность обхода: нужное правило и цепочка + свежие каналы + сервис через каждое звено.
+
+        Ничего не меняет в Xray: основной канал не отключается ради проверки резерва.
+        """
+        import ipaddress
+        b = self.registry().get(code)
+        if not b:
+            raise ValueError("нет такого обхода")
+        targets = route_targets(b, explicit)
+        if not targets:
+            raise ValueError("укажите сайт или IP для проверки: у geoip:… и общих правил нет однозначного тестового адреса")
+        expected = [str(x) for x in b.get("chain") or []]
+        if not expected:
+            raise ValueError("у обхода не задана цепочка")
+        entries = [s for s in self.d.cfg.servers if s["role"] == "entry" and self.d.cfg.get_pw(s["id"])]
+        if not entries:
+            raise ValueError("нет входов с сохранённым паролем")
+
+        def route(e, target):
+            try:
+                r = self.d.route_trace(e["id"], target)
+                ok = not r.get("error") and r.get("comment") == code and r.get("chain") == expected
+                return dict(r, target=target, ok=ok)
+            except Exception as ex:  # noqa: BLE001
+                return {"target": target, "ok": False, "error": str(ex)[:200], "comment": "", "chain": []}
+
+        def fresh(e, tag):
+            ch = next((c for c in self.d.channels.get(e["id"], []) if c.get("tag") == tag), None)
+            if not ch:
+                return {"tag": tag, "ok": False, "error": "на входе нет такого канала", "status": "bad"}
+            try:
+                r = self.d.check_channel(e["id"], ch["key"]) or {}
+                ok = r.get("status") in ("ok", "warn")
+                return {"tag": tag, "key": ch["key"], "kind": ch.get("kind"), "exit_id": ch.get("exit_id"),
+                        "ok": ok, "status": r.get("status") or "bad", "ip": r.get("ip") or "",
+                        "ms": r.get("ms"), "error": "" if ok else (r.get("error") or "канал не прошёл проверку")}
+            except Exception as ex:  # noqa: BLE001
+                return {"tag": tag, "ok": False, "status": "bad", "error": str(ex)[:200]}
+
+        def inspect(e):
+            return e["id"], {"routes": [route(e, t) for t in targets],
+                             "links": [fresh(e, tag) for tag in expected]}
+        with cf.ThreadPoolExecutor(max_workers=min(8, len(entries))) as ex:
+            inspected = dict(ex.map(inspect, entries))
+
+        # HTTP-проверка есть только там, где известен адрес сервиса. Для IP-only правила
+        # корректный результат — правило + живая цепочка, а не выдуманная веб-страница.
+        site_target = str(b.get("service") or "") or recheck_target(b)
+        if not site_target and explicit:
+            try:
+                ipaddress.ip_address(explicit.strip())
+            except ValueError:
+                site_target = explicit.strip()
+        if site_target == "dc5":
+            site_target = ""
+        site_result = self.check(site_target, tags=expected) if site_target else None
+        pos = {e["id"]: i for i, e in enumerate(entries)}
+        out_entries = []
+        for e in entries:
+            got = inspected[e["id"]]
+            routes_ok = all(x["ok"] for x in got["routes"])
+            links = []
+            for link in got["links"]:
+                x = dict(link)
+                if site_result:
+                    row = next((r for r in site_result["rows"] if r["exit_id"] == link.get("exit_id")
+                                and r["kind"] == link.get("kind")), None)
+                    c = (row or {}).get("cells", [])[pos[e["id"]]] if row and pos[e["id"]] < len((row or {}).get("cells", [])) else None
+                    x["site"] = c or {"st": "none", "text": "нет результата"}
+                    x["site_ok"] = bool(c and c["st"] in ("ok", "slow"))
+                else:
+                    x["site"] = {"st": "none", "text": "нет HTTP-цели"}
+                    x["site_ok"] = True
+                x["ok"] = bool(link["ok"] and x["site_ok"])
+                links.append(x)
+            good = [x for x in links if x["ok"]]
+            status = "bad" if not routes_ok or not good else ("ok" if len(good) == len(links) else "warn")
+            out_entries.append({"id": e["id"], "name": e["name"], "status": status,
+                                "routes": got["routes"], "links": links, "active": good[0]["tag"] if good else ""})
+
+        bad_routes = [e for e in out_entries if not all(x["ok"] for x in e["routes"])]
+        no_path = [e for e in out_entries if not any(x["ok"] for x in e["links"])]
+        weak = [(e["name"], x["tag"]) for e in out_entries for x in e["links"] if not x["ok"]]
+        if bad_routes:
+            status, fine = "bad", False
+            e = bad_routes[0]
+            r = next(x for x in e["routes"] if not x["ok"])
+            reason = r.get("error") or ("сработало правило %s, цепочка %s" % (
+                r.get("comment") or "без имени", " → ".join(r.get("chain") or []) or "не определена"))
+            text = "маршрут не совпадает с настройкой (%s: %s)" % (e["name"], reason)
+        elif no_path:
+            status, fine = "bad", False
+            text = "правило и цепочка верные, но нет рабочего звена на: " + ", ".join(e["name"] for e in no_path)
+        elif weak:
+            status, fine = "warn", True
+            text = "обход работает как задумано, но не исправны: " + ", ".join("%s / %s" % x for x in weak)
+        else:
+            status, fine = "ok", True
+            text = "правило срабатывает, цепочка совпадает, все звенья исправны"
+            if site_result:
+                text += "; сервис открывается через каждое звено"
+        return {"kind": "route", "version": 1, "at": time.time(), "status": status, "fine": fine,
+                "text": text, "targets": targets, "expected": expected, "entries": out_entries,
+                "site_checked": bool(site_result)}
 
     def active_exit(self, entry_id):
         """Выход, через который сейчас идёт трафик входа: первый исправный канал основной цепочки."""
@@ -295,7 +460,7 @@ class Sites:
         wh = {k: v for k, v in self.where().items() if not k.startswith("Z-")}   # Z-… — правила раздела «Zapret»
         changed = False
         gone = self.d.cfg.data.get("bypass_gone") or {}
-        for code, w in wh.items():                       # правило с этим кодом поставлено вручную — берём под учёт
+        for code, w in wh.items():                       # правило поставили руками (как YT 23.10) — берём под учёт
             rule = w["rule"]
             if code in reg or not (rule.get("domain") or rule.get("ip")) or time.time() - gone.get(code, 0) <= 900:
                 continue
@@ -315,7 +480,12 @@ class Sites:
         items = []
         for code, b in reg.items():
             on = (wh.get(code) or {}).get("on", {})
-            items.append(dict(b, code=code, managed=True, on={e["id"]: bool(on.get(e["id"])) for e in ents}))
+            old_need = b.get("check") if (b.get("check") or {}).get("kind") != "route" else None
+            items.append(dict(b, code=code, managed=True, can_recheck=bool(recheck_target(b)),
+                              needs_target=not route_targets(b),
+                              need_check=b.get("need_check") or old_need,
+                              check=b.get("check") if (b.get("check") or {}).get("kind") == "route" else None,
+                              on={e["id"]: bool(on.get(e["id"])) for e in ents}))
         for code, w in wh.items():
             if code not in reg:
                 items.append({"code": code, "title": "Telegram DC5" if code == "DC5TG" else code, "managed": False,
@@ -399,10 +569,22 @@ def create(match, before=None):
         bals.append({"tag": n, "selector": [x], "fallbackTag": "_bl_" + names[i + 1] if i + 1 < len(names) else ""})
     for n in names[1:]:
         obs.append({"tag": "_bl_" + n, "protocol": "loopback", "settings": {"inboundTag": "_bl_" + n}})
-    bal_tags = {b["tag"] for b in bals}
+    # Начальные служебные/direct/private-правила и уже созданные панелью обходы не сдвигаем.
+    # Вставка — до первого обычного правила, которое может перехватить трафик нового обхода.
+    def protected(x):
+        ins = [str(j) for j in x.get("inboundTag") or []]
+        if any(j == "api" or j.startswith("_bl_") for j in ins):
+            return True
+        if "geoip:private" in (x.get("ip") or []):
+            return True
+        comment, bal = str(x.get("comment") or ""), str(x.get("balancerTag") or "")
+        if comment and bal.startswith(comment + "-1-"):
+            return True
+        matched = any(x.get(k) for k in ("domain", "ip", "source", "sourcePort", "port", "inboundTag",
+                                          "protocol", "user", "attrs"))
+        return not x.get("balancerTag") and x.get("outboundTag") in ("direct", "blocked") and matched
     pos = rules.index(before) if before is not None and before in rules else next(
-        (i for i, x in enumerate(rules) if x.get("balancerTag") in bal_tags and not x.get("ip") and not x.get("domain")
-         and not any(str(j).startswith("_bl_") for j in x.get("inboundTag") or [])), len(rules))
+        (i for i, x in enumerate(rules) if not protected(x)), len(rules))
     rule = {"type": "field", "enabled": True, "comment": code, "balancerTag": names[0]}
     rule.update(match)
     rules[pos:pos] = [{"type": "field", "inboundTag": ["_bl_" + n], "balancerTag": n} for n in names[1:]] + [rule]

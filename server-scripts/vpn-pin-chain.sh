@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# vpn-pin-chain.sh — даёт отдельному правилу маршрутизации 3X-UI (например, DC5 Telegram → AWG-Warsaw)
+# vpn-pin-chain.sh — даёт отдельному правилу маршрутизации 3X-UI (например, DC5 Telegram → AWG-ExitB)
 # свою резервную цепочку: если первый выход недоступен, трафик этого правила идёт на следующий.
 #
-# Запуск на входе от root, рядом должны лежать vpn-add-exit.sh и vpn-restore.sh:
-#   bash vpn-pin-chain.sh DC5TG AWG-Warsaw AWG-Frankfurt
+# Запуск на входе (вход-1, вход-2) от root, рядом должны лежать vpn-add-exit.sh и vpn-restore.sh:
+#   bash vpn-pin-chain.sh DC5TG AWG-ExitB Sudoku-ExitB AWG-ExitC
 #     DC5TG — комментарий правила в 3X-UI (поле comment), дальше — исходящие по порядку.
 # Повторный запуск с другим списком пересобирает цепочку. Вернуть как было (правило снова
 # ведёт прямо в первый выход):
-#   bash vpn-pin-chain.sh DC5TG --off AWG-Warsaw
+#   bash vpn-pin-chain.sh DC5TG --off AWG-ExitB
 # Дописать выход в конец уже существующей цепочки правила:
-#   bash vpn-pin-chain.sh DC5TG --append AWG-Amsterdam
+#   bash vpn-pin-chain.sh DC5TG --append AWG-ExitD
 #
 # Перед правкой база панели бэкапится; если Xray с новым шаблоном не поднимется — откат.
 

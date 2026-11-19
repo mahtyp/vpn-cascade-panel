@@ -169,6 +169,9 @@ def system():
         "hw": hardware(),
         "mem": round(100 * (total - avail) / total) if total else None,
         "mem_total_mb": total // 1024,
+        "mem_available_mb": avail // 1024,
+        "swap_total_mb": mem.get("SwapTotal", 0) // 1024,
+        "swap_used_mb": max(0, mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)) // 1024,
         "disk": round(100 * du.used / du.total),
         "disk_total_gb": round(du.total / 2**30, 1),
         "disk_free_gb": round(du.free / 2**30, 1),
@@ -253,6 +256,12 @@ def awg_view():
             hs = int(f[5]) if f[5].isdigit() else 0
             live[(f[0], f[1])] = {"endpoint": "" if f[3] == "(none)" else f[3], "handshake_age": (now - hs) if hs else None,
                                   "rx": int(f[6]) if f[6].isdigit() else 0, "tx": int(f[7]) if f[7].isdigit() else 0}
+    for tool in ("awg", "wg"):               # порт — отдельной командой: у AmneziaWG в строке интерфейса dump больше полей
+        if shutil.which(tool):
+            for line in sh("%s show all listen-port 2>/dev/null" % tool).splitlines():
+                p = line.split()
+                if len(p) == 2 and p[1].isdigit() and int(p[1]):
+                    ifl.setdefault(p[0], {})["port"] = int(p[1])
     out = []
     for path in sorted(glob.glob(AWG_DIR + "/*.conf")):
         name = os.path.basename(path)[:-5]
@@ -308,6 +317,58 @@ def awg_view():
     return {"ifaces": out, "sw": sw_versions().get("awg")}
 
 
+# ------------------------------------------------------------------ Mihomo на входе
+
+def mihomo():
+    txt = read("/etc/mihomo/config.yaml")
+    if not txt:
+        return None
+    listeners, proxies, rules = [], [], []
+    try:
+        import yaml  # есть не везде — ниже запасной разбор
+        y = yaml.safe_load(txt) or {}
+        listeners = [{"name": str(l.get("name")), "port": int(l.get("port"))}
+                     for l in y.get("listeners") or [] if l.get("port")]
+        proxies = [{"name": str(p.get("name")), "server": str(p.get("server")), "port": p.get("port"),
+                    "type": p.get("type")} for p in y.get("proxies") or []]
+        rules = [str(r) for r in y.get("rules") or []]
+    except Exception:
+        section, cur = None, None
+        for raw in txt.splitlines():
+            line = raw.split("#", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            if re.match(r"^\S", line):
+                section = line.split(":", 1)[0].strip()
+                cur = None
+                continue
+            s = line.strip()
+            if section in ("listeners", "proxies") and s.startswith("- "):
+                cur = {}
+                (listeners if section == "listeners" else proxies).append(cur)
+                s = s[2:].strip()
+            if section in ("listeners", "proxies") and cur is not None and ":" in s:
+                k, v = s.split(":", 1)
+                cur[k.strip()] = v.strip().strip('"').strip("'")
+            if section == "rules" and s.startswith("- "):
+                rules.append(s[2:].strip().strip('"'))
+        listeners = [{"name": l.get("name"), "port": int(l["port"])} for l in listeners if str(l.get("port", "")).isdigit()]
+        proxies = [{"name": p.get("name"), "server": p.get("server"), "port": p.get("port"), "type": p.get("type")} for p in proxies]
+    by_listener = {}
+    for r in rules:
+        p = [x.strip() for x in r.split(",")]
+        if len(p) >= 3 and p[0] == "IN-NAME":
+            by_listener[p[1]] = p[2]
+    pmap = {p["name"]: p for p in proxies}
+    socks = []
+    for l in listeners:
+        px = pmap.get(by_listener.get(l["name"], ""))
+        socks.append({"listener": l["name"], "port": l["port"],
+                      "proxy": px["name"] if px else "", "host": px["server"] if px else ""})
+    return {"active": unit_active("mihomo"), "socks": socks,
+            "version": first_line("/usr/local/bin/mihomo -v 2>/dev/null")}
+
+
 # ------------------------------------------------------------------ 3X-UI на входе
 
 def xui():
@@ -357,6 +418,9 @@ def xui():
         so = (o.get("streamSettings") or {}).get("sockopt") or {}
         if o.get("protocol") == "freedom" and so.get("interface"):
             return {"tag": tag, "kind": "AWG", "iface": so["interface"]}
+        if o.get("protocol") == "socks":
+            srv = ((o.get("settings") or {}).get("servers") or [{}])[0]
+            return {"tag": tag, "kind": "Sudoku", "port": srv.get("port"), "address": srv.get("address")}
         return {"tag": tag, "kind": o.get("protocol") or "?"}
 
     r = t.get("routing") or {}
@@ -375,7 +439,7 @@ def xui():
         for s in b.get("selector") or []:
             out["chain"].append(describe(s))
         b = byl.get(b.get("fallbackTag") or "")
-    # отдельные правила вида «IP → конкретный выход» (например, DC5 Telegram → один из выходов)
+    # отдельные правила вида «IP → конкретный выход» (например, DC5 → Франция)
     def bal_tags(tag):   # цепочка резерва отдельного правила (vpn-pin-chain.sh, обходы панели): A → B → C
         names, b, seen = [], bal_by.get(tag), set()
         while b is not None and b["tag"] not in seen and len(names) < 20:
@@ -546,6 +610,306 @@ def _e2e_run(xbin, port, remark, v):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ------------------------------------------------------------------ раздел «Протоколы» (только чтение)
+PROTO_SKIP = ("blackhole", "dns", "loopback")
+
+
+def _xray_cfg():
+    """Конфиг, с которым Xray запущен сейчас (в нём и исходящие из подписок 3X-UI), и шаблон из базы."""
+    run_cfg, tpl = None, {}
+    try:
+        run_cfg = json.loads(read("/usr/local/x-ui/bin/config.json"))
+    except Exception:
+        run_cfg = None
+    try:
+        db = sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True, timeout=5)
+        tpl = json.loads((db.execute("select value from settings where key='xrayTemplateConfig'").fetchone() or ["{}"])[0])
+        db.close()
+    except Exception:
+        tpl = {}
+    return run_cfg, tpl
+
+
+def _out_brief(o):
+    """Исходящее без секретов: чем и куда ходит."""
+    proto, st, se = o.get("protocol"), o.get("streamSettings") or {}, o.get("settings") or {}
+    so = st.get("sockopt") or {}
+    d = {"tag": o.get("tag"), "proto": proto, "kind": proto}
+    if proto == "freedom":
+        if not so.get("interface"):
+            return None                              # обычный «напрямую»
+        d.update(kind="AWG", iface=so["interface"])
+    elif proto == "socks" and ((se.get("servers") or [{}])[0].get("address") in ("127.0.0.1", "localhost")):
+        d.update(kind="Sudoku", socks=(se.get("servers") or [{}])[0].get("port"))
+    else:
+        srv = (se.get("vnext") or se.get("servers") or se.get("peers") or [{}])[0] if not se.get("address") else se
+        addr = srv.get("address") or (srv.get("endpoint") or "").rsplit(":", 1)[0]
+        d.update(addr=addr or "", port=srv.get("port") or ((srv.get("endpoint") or "").rsplit(":", 1)[-1] if srv.get("endpoint") else None))
+        u = (srv.get("users") or [{}])[0] if srv.get("users") else srv
+        if u.get("flow"):
+            d["flow"] = u["flow"]
+    d["net"] = st.get("network") or ("tcp" if proto not in ("freedom", "wireguard") else "")
+    d["sec"] = st.get("security") or ""
+    rs = st.get("realitySettings") or st.get("tlsSettings") or {}
+    for k, name in (("serverName", "sni"), ("fingerprint", "fp")):
+        if rs.get(k):
+            d[name] = rs[k]
+    if so.get("dialerProxy"):
+        d["via"] = so["dialerProxy"]
+    return d
+
+
+_SECRETISH = re.compile(r"key|pass|secret|token|uuid|private|psk|seed|\bid\b", re.I)
+
+
+def _plain(d):
+    """Простые настройки без секретов: только числа/строки/флажки, ключи с «key/pass/secret…» выбрасываются."""
+    return {str(k): v for k, v in (d or {}).items() if isinstance(v, (str, int, float, bool)) and not _SECRETISH.search(str(k))
+            and len(str(v)) <= 80}
+
+
+def _mihomo_proxies():
+    """Прокси Mihomo со всеми простыми настройками (без ключей) и портом локального SOCKS, который на него ведёт."""
+    txt = read("/etc/mihomo/config.yaml")
+    if not txt:
+        return []
+    proxies = []
+    try:
+        import yaml
+        proxies = [p for p in (yaml.safe_load(txt) or {}).get("proxies") or [] if isinstance(p, dict)]
+    except Exception:
+        section, cur = None, None
+        for raw in txt.splitlines():
+            line = raw.split("#", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            if re.match(r"^\S", line):
+                section, cur = line.split(":", 1)[0].strip(), None
+                continue
+            t = line.strip()
+            if section == "proxies" and t.startswith("- "):
+                cur = {}
+                proxies.append(cur)
+                t = t[2:].strip()
+            if section == "proxies" and cur is not None and ":" in t:
+                k, v = t.split(":", 1)
+                v = v.strip().strip('"').strip("'")
+                if v != "":
+                    cur[k.strip()] = int(v) if v.isdigit() else v
+    socks = {x.get("proxy"): x.get("port") for x in ((mihomo() or {}).get("socks") or [])}
+    return [dict(_plain(p), socks=socks.get(str(p.get("name")))) for p in proxies]
+
+
+def proto_view():
+    """Что на сервере стоит и чем он связан с другими: исходящие Xray (куда и каким протоколом), их место в правилах,
+    входящие, прокси Mihomo, туннели AmneziaWG, кто слушает порты, контейнеры. Только чтение, секреты не уходят."""
+    out = {"awg": awg_view(), "outs": [], "inbounds": [], "listen": [], "docker": [], "units": [], "mihomo": None,
+           "xui": None, "sudoku_port": None, "main": [], "pins": {}, "tun_ports": {}, "rules": [], "plain": {}}
+    for tool in ("awg", "wg"):               # порты всех туннелей ядра, в том числе тех, чьих конфигов мы не знаем
+        if shutil.which(tool):
+            for line in sh("%s show all listen-port 2>/dev/null" % tool).splitlines():
+                p = line.split()
+                if len(p) == 2 and p[1].isdigit() and int(p[1]):
+                    out["tun_ports"][p[1]] = p[0]
+    if os.path.exists("/etc/x-ui/x-ui.db"):
+        run_cfg, tpl = _xray_cfg()
+        cfg = run_cfg or tpl
+        tpl_tags = {o.get("tag") for o in tpl.get("outbounds") or []}
+        for o in cfg.get("outbounds") or []:
+            if o.get("protocol") in PROTO_SKIP or o.get("tag") == "api":
+                continue
+            b = _out_brief(o)
+            if b:
+                b["sub"] = bool(run_cfg) and b["tag"] not in tpl_tags          # пришло из подписки 3X-UI
+                out["outs"].append(b)
+        r = cfg.get("routing") or {}
+        bals = {b.get("tag"): b for b in r.get("balancers") or []}
+        byl = {"_bl_" + t: b for t, b in bals.items()}
+
+        def chain(tag):
+            names, b, seen = [], bals.get(tag), set()
+            while b is not None and b["tag"] not in seen and len(names) < 30:
+                seen.add(b["tag"])
+                names += b.get("selector") or []
+                b = byl.get(b.get("fallbackTag") or "")
+            return names
+        MATCH = ("ip", "domain", "port", "sourcePort", "source", "protocol", "user", "attrs")
+        plain = {o.get("tag") for o in cfg.get("outbounds") or [] if o.get("protocol") in ("freedom", "blackhole", "dns")
+                 and not ((o.get("streamSettings") or {}).get("sockopt") or {}).get("interface")}
+        kinds = {o.get("tag"): o.get("protocol") for o in cfg.get("outbounds") or []}
+        out["plain"] = {t: kinds[t] for t in plain if t}
+        out["first_out"] = ((cfg.get("outbounds") or [{}])[0]).get("tag") or ""
+        for x in r.get("rules") or []:
+            if any(str(i).startswith("_bl_") or i == "api" for i in x.get("inboundTag") or []):
+                continue
+            tags = chain(x["balancerTag"]) if x.get("balancerTag") else [x["outboundTag"]] if x.get("outboundTag") else []
+            # для схемы: все правила по порядку — что ловят (без секретов: это домены/подсети/протоколы) и куда ведут
+            out["rules"].append({"m": {k: [str(v)[:80] for v in (x.get(k) if isinstance(x.get(k), list) else [x.get(k)])][:8]
+                                       for k in MATCH + ("network",) if x.get(k)},
+                                 "n": {k: len(x[k]) for k in MATCH if isinstance(x.get(k), list) and len(x[k]) > 8},
+                                 "comment": str(x.get("comment") or x.get("ruleTag") or "")[:60],
+                                 "in": [str(i) for i in x.get("inboundTag") or []][:6],
+                                 "bal": x.get("balancerTag") or "", "out": x.get("outboundTag") or "", "tags": tags})
+            tags = [t for t in tags if t not in plain]
+            if not tags:
+                continue
+            if not any(x.get(k) for k in MATCH):
+                out["main"] = tags                              # общее правило «всё остальное»: его цепочка — основная
+            else:
+                what = x.get("comment") or x.get("ruleTag") or ", ".join(str(v) for v in (x.get("domain") or x.get("ip") or x.get("protocol") or [])[:2])
+                for t in tags:
+                    out["pins"].setdefault(t, [])
+                    if what and what not in out["pins"][t] and len(out["pins"][t]) < 6:
+                        out["pins"][t].append(str(what)[:60])
+        try:
+            db = sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True, timeout=5)
+            st = dict(db.execute("select key, value from settings where key in ('webPort','subPort','subEnable')").fetchall())
+            out["xui"] = {"web_port": int(st.get("webPort") or 2053),
+                          "sub_port": int(st.get("subPort") or 2096) if st.get("subEnable", "true") != "false" else None}
+            for port, listen, remark, proto, sv, ss, en, itag in db.execute(
+                    "select port, listen, remark, protocol, settings, stream_settings, enable, tag from inbounds"):
+                try:
+                    sv, ss = json.loads(sv or "{}"), json.loads(ss or "{}")
+                except ValueError:
+                    sv, ss = {}, {}
+                cl = sv.get("clients") or []
+                rs = ss.get("realitySettings") or {}
+                ts = ss.get("tlsSettings") or {}
+                out["inbounds"].append({"port": port, "listen": listen or "", "remark": remark or "", "proto": proto, "on": bool(en), "tag": itag or "",
+                                        "net": ss.get("network") or "tcp", "sec": ss.get("security") or "",
+                                        "clients": sum(1 for c in cl if c.get("enable", True) is not False), "clients_all": len(cl),
+                                        "flows": sorted({c.get("flow") for c in cl if c.get("flow")}),
+                                        "target": rs.get("target") or rs.get("dest") or "",
+                                        "names": (rs.get("serverNames") or ([ts["serverName"]] if ts.get("serverName") else []))[:8],
+                                        "fp": (rs.get("settings") or {}).get("fingerprint") or "",
+                                        "sids": len(rs.get("shortIds") or []) if rs else None,
+                                        "method": sv.get("method") or ""})
+            db.close()
+        except Exception as e:
+            out["xui"] = {"error": str(e)[:120]}
+    out["mihomo"] = mihomo()
+    out["mproxies"] = _mihomo_proxies()
+    try:
+        sc = json.loads(read("/etc/sudoku/config.json"))
+        out["sudoku_port"] = sc.get("local_port")
+        unit = next((u for u in ("sudoku", "sudoku-sing-box") if unit_active(u)), "sudoku")
+        m = re.search(r"^SUDOKU_VERSION=(\S+)", read("/etc/sudoku/versions.env"), re.M)
+        port = sc.get("local_port")
+        conns = len({l.split()[4].rsplit(":", 1)[0] for l in sh("ss -Htn state established '( sport = :%s )' 2>/dev/null" % port).splitlines()
+                     if len(l.split()) >= 5}) if str(port).isdigit() else None
+        out["sudoku"] = {"unit": unit, "active": unit_active(unit), "port": port, "ver": m.group(1).strip("'\"") if m else None,
+                         "conf": _plain(sc), "peers": conns}
+    except Exception:
+        pass
+    for line in sh("ss -Htulnp 2>/dev/null").splitlines():
+        f = line.split()
+        if len(f) < 5:
+            continue
+        addr, _, port = f[4].rpartition(":")
+        addr = addr.split("%", 1)[0].strip("[]")
+        m = re.search(r'\(\("([^"]+)",pid=(\d+)', line)
+        proc, pid, unit, exe = (m.group(1), m.group(2), "", "") if m else ("", "", "", "")
+        if pid:
+            cg = re.findall(r"([^/\n]+)\.service", read("/proc/%s/cgroup" % pid))
+            unit = cg[-1] if cg else ""
+            try:
+                exe = os.readlink("/proc/%s/exe" % pid)
+            except OSError:
+                exe = ""
+        item = {"proto": f[0], "addr": addr, "port": int(port) if port.isdigit() else 0, "proc": proc, "unit": unit, "exe": exe[-60:]}
+        if item not in out["listen"]:
+            out["listen"].append(item)
+    if shutil.which("docker"):
+        for line in sh("docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}' 2>/dev/null").splitlines():
+            n, _, rest = line.partition("\t")
+            img, _, ports = rest.partition("\t")
+            out["docker"].append({"name": n, "image": img[:60], "ports": ports[:160]})
+    out["units"] = [u.split()[0][:-8] for u in sh("systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null").splitlines()
+                    if u.split() and u.split()[0].endswith(".service")][:80]
+    return out
+
+
+def proto_test():
+    """Проверка каждого пути по отдельности: временный Xray с теми же исходящими, что у работающего, — у каждого свой
+    локальный вход; через каждый открывается страница «ваш адрес». Настройки сервера не меняются, процесс живёт секунды."""
+    import signal, socket, tempfile, threading
+    run_cfg, tpl = _xray_cfg()
+    cfg = run_cfg or tpl
+    outs = [o for o in cfg.get("outbounds") or [] if o.get("protocol") not in PROTO_SKIP and o.get("tag") and o.get("tag") != "api"]
+    todo = [o["tag"] for o in outs if _out_brief(o)][:24]
+    if not todo:
+        return {"tests": {}}
+    if os.path.exists("/etc/testbed-e2e.json"):                    # стенд: Xray там заглушка
+        try:
+            fake = json.load(open("/etc/testbed-proto.json"))
+        except Exception:
+            fake = {}
+        return {"tests": {t: dict(fake.get(t) or fake.get("*") or {"ok": True, "ip": "", "loc": "ZZ", "ms": 400 + 37 * i})
+                          for i, t in enumerate(todo)}}
+    xb = [b for b in sorted(glob.glob("/usr/local/x-ui/bin/xray-linux-*")) if ".before" not in b]
+    if not xb:
+        return {"error": "нет Xray"}
+    ports = {}
+    socks = []
+    for t in todo:
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        ports[t] = s.getsockname()[1]
+        socks.append(s)
+    for s in socks:
+        s.close()
+    test = {"log": {"loglevel": "none"},
+            "inbounds": [{"tag": "t-" + t, "listen": "127.0.0.1", "port": p, "protocol": "socks", "settings": {"udp": False}} for t, p in ports.items()],
+            "outbounds": outs,
+            "routing": {"rules": [{"type": "field", "inboundTag": ["t-" + t], "outboundTag": t} for t in todo]}}
+    d = tempfile.mkdtemp(prefix="vpn-dash-proto-")
+    res, p = {}, None
+    try:
+        path = os.path.join(d, "c.json")
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
+            json.dump(test, f)
+        env = dict(os.environ, XRAY_LOCATION_ASSET="/usr/local/x-ui/bin")
+        p = subprocess.Popen([xb[0], "run", "-c", path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True, env=env)
+        _CHILDREN.add(p)
+        first = next(iter(ports.values()))
+        for _ in range(50):
+            if p.poll() is not None:
+                return {"error": "временный Xray не запустился: " + (p.stderr.read() or "")[-200:].strip()}
+            try:
+                socket.create_connection(("127.0.0.1", first), 0.2).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+
+        def one(t):
+            t0 = time.time()
+            rc, body, _ = run("curl -s -m 10 --noproxy '' -w '\\ncode=%%{http_code}' --socks5-hostname 127.0.0.1:%d %s" % (ports[t], E2E_URL), 13)
+            kv = dict(l.split("=", 1) for l in body.splitlines() if "=" in l)
+            r = {"ms": int((time.time() - t0) * 1000)}
+            if kv.get("code") == "200" and kv.get("ip"):
+                r.update(ok=True, ip=kv["ip"], loc=kv.get("loc", ""))
+            else:
+                code = kv.get("code") or "000"
+                r.update(ok=False, err="HTTP %s" % code if code != "000" else "нет ответа за 10 с" if rc in (28, -9) else "соединение оборвалось")
+            res[t] = r
+        th = [threading.Thread(target=one, args=(t,)) for t in todo]
+        for x in th:
+            x.start()
+        for x in th:
+            x.join(20)
+        return {"tests": res}
+    finally:
+        if p is not None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            p.wait()
+            _CHILDREN.discard(p)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ------------------------------------------------------------------ диагностика (кнопка «диагностика»)
 
 def diag():
@@ -562,7 +926,7 @@ def diag():
 
     sec("время и нагрузка", "date -u; uptime; uname -r; free -m; df -h / | tail -1")
     sec("службы", "systemctl --no-pager --plain list-units --type=service --state=failed | head -20; echo; "
-        "for u in x-ui fail2ban ufw nftables vpn-dash-govblock zapret2; do "
+        "for u in x-ui mihomo sudoku sing-box fail2ban ufw nftables vpn-dash-govblock zapret2; do "
         "systemctl list-unit-files $u.service >/dev/null 2>&1 && printf '%-20s %s\\n' $u \"$(systemctl is-active $u)\"; done; "
         "for u in $(systemctl list-units --plain --no-legend 'awg-quick@*' | awk '{print $1}'); do printf '%-20s %s\\n' $u \"$(systemctl is-active $u)\"; done")
     x = sh("pgrep -f 'xray-linux' | head -1")
@@ -574,9 +938,11 @@ def diag():
     if shutil.which("awg") or shutil.which("wg"):
         sec("туннели AmneziaWG", "(awg show 2>/dev/null || wg show 2>/dev/null) | grep -E '^interface|endpoint|latest handshake|transfer|listening port'")
     ifs = [i for i in sh("awg show interfaces 2>/dev/null").split() if re.fullmatch(r"[\w.-]{1,15}", i) and os.path.exists("/sys/class/net/" + i)]
-    if ifs:
-        sec("наружу через туннели", "; ".join(
-            ["printf '%s: '; curl -s -m 8 --noproxy '*' --interface %s https://ifconfig.me || echo нет; echo" % (i, i) for i in ifs]), 60)
+    ports = sorted(set(re.findall(r"127\.0\.0\.1:(10[89]\d)\b", sh("ss -Htlnp 2>/dev/null | grep -i mihomo"))))
+    if ifs or ports:
+        sec("наружу через туннели и Sudoku", "; ".join(
+            ["printf '%s: '; curl -s -m 8 --noproxy '*' --interface %s https://ifconfig.me || echo нет; echo" % (i, i) for i in ifs] +
+            ["printf 'SOCKS %s: '; curl -s -m 8 --noproxy '' --socks5-hostname 127.0.0.1:%s https://ifconfig.me || echo нет; echo" % (p, p) for p in ports]), 60)
     if os.path.exists("/etc/x-ui/x-ui.db"):
         sec("журнал x-ui (2 ч)", "journalctl -u x-ui --since '-2 hour' --no-pager | grep -vE 'accepted|TLS handshake error'", 20, 50)
         try:
@@ -601,6 +967,9 @@ def diag():
             out.append(["маршрутизация Xray", "\n".join(lines)])
         except Exception as e:
             out.append(["маршрутизация Xray", "не прочитать: %s" % e])
+    for u in ("mihomo", "sudoku", "sing-box"):
+        if unit_exists(u):
+            sec("журнал %s (2 ч)" % u, "journalctl -u %s --since '-2 hour' --no-pager" % u, 20, 15)
     sec("ядро (dmesg)", "dmesg -T 2>/dev/null | grep -iE 'conntrack|oom|killed process|table full|segfault|amnezia|link is down|hung task' | tail -n 15")
     sec("фаервол", "ufw status 2>/dev/null | head -25; echo; nft list tables 2>/dev/null")
     print(json.dumps({"sections": out}, ensure_ascii=False))
@@ -668,9 +1037,18 @@ def awg_proto(text):
 
 
 def sw_versions():
-    """Версия AmneziaWG: пакеты и модуль ядра (в памяти и на диске — после обновления пакета они расходятся
-    до перезапуска), версия протокола в каждом конфиге."""
+    """Версии программ, которые ставятся не только через apt: Sudoku (versions.env установщика), Mihomo, AmneziaWG
+    (пакеты и модуль ядра: в памяти и на диске — после обновления пакета они расходятся до перезапуска)."""
     out = {}
+    if os.path.exists("/etc/sudoku/config.json"):
+        m = re.search(r"^SUDOKU_VERSION=(\S+)", read("/etc/sudoku/versions.env"), re.M)
+        out["sudoku"] = {"ver": m.group(1).strip("'\"") if m else None}
+    if os.path.exists("/etc/mihomo/config.yaml"):
+        exe = re.search(r"^ExecStart=(\S+)", sh("systemctl cat mihomo 2>/dev/null"), re.M)
+        exe = exe.group(1) if exe else "/usr/local/bin/mihomo"
+        v = re.findall(r"v?(\d+\.\d+\.\d+)", first_line("%s -v 2>/dev/null" % exe))
+        out["mihomo"] = {"ver": v[0] if v else None, "bin": exe,
+                         "avx2": " avx2" in (re.search(r"^flags\s*:(.*)$", read("/proc/cpuinfo"), re.M) or [None, ""])[1] + " "}
     if shutil.which("awg") or glob.glob(AWG_DIR + "/*.conf"):
         pk = {}
         for line in sh("dpkg-query -W -f='${Package} ${Version}\\n' amneziawg amneziawg-dkms amneziawg-tools 2>/dev/null").splitlines():
@@ -807,7 +1185,7 @@ def web_info():
 # ------------------------------------------------------------------ выход
 
 def exit_info():
-    res = {"awg": None, "xui_present": os.path.exists("/usr/local/x-ui/x-ui"), "xui": None}
+    res = {"awg": None, "sudoku": None, "xui_present": os.path.exists("/usr/local/x-ui/x-ui"), "xui": None}
     if res["xui_present"]:              # 3X-UI на выходе: работает ли, версия, сколько включённых входящих
         xi = {"active": unit_active("x-ui"),
               "version": (re.findall(r"\d+\.\d+\.\d+", sh("/usr/local/x-ui/x-ui -v 2>/dev/null")) or [""])[0], "inbounds": None}
@@ -858,13 +1236,22 @@ def exit_info():
             port = int(hp.rsplit(":", 1)[-1]) if hp.rsplit(":", 1)[-1].isdigit() else port
         res["awg"] = {"mode": mode, "container": container, "port": port, "peers": peers,
                       "up": (bool(container) if mode == "docker" else unit_active("awg-quick@awg0"))}
+    for unit in ("sudoku", "sudoku-sing-box"):
+        if unit_exists(unit):
+            port = None
+            try:
+                port = json.loads(read("/etc/sudoku/config.json")).get("local_port")
+            except Exception:
+                pass
+            res["sudoku"] = {"unit": unit, "active": unit_active(unit), "port": port}
+            break
     return res
 
 
 # ------------------------------------------------------------------ фаервол: что слушает и что уже есть (только чтение)
 
 def fw_audit():
-    out = {"listen": [], "awg": {}, "awg_server": [], "docker": [], "ssh_ports": [], "xui": None,
+    out = {"listen": [], "awg": {}, "awg_server": [], "docker": [], "ssh_ports": [], "xui": None, "sudoku_port": None,
            "ufw": None, "firewalld": unit_active("firewalld"), "ipt": {}, "nft_lines": 0, "ip_forward": read("/proc/sys/net/ipv4/ip_forward").strip(),
            "default_if": "", "fwd_ok": []}
     for line in sh("ss -Htulnp 2>/dev/null").splitlines():
@@ -904,6 +1291,10 @@ def fw_audit():
         except Exception as e:
             out["xui"] = {"error": str(e)}
     out["acme_standalone"] = any(kv.get("Le_Webroot") == "no" for kv in acme_conf())
+    try:
+        out["sudoku_port"] = json.loads(read("/etc/sudoku/config.json")).get("local_port")
+    except Exception:
+        pass
     if shutil.which("ufw"):
         st = sh("ufw status verbose 2>/dev/null")
         out["ufw"] = {"active": "Status: active" in st, "status": st[:3000],
@@ -1041,6 +1432,7 @@ def precheck():
     found = []
     for name, test in (("Docker", "command -v docker"), ("3X-UI", "test -e /usr/local/x-ui/x-ui"), ("nginx", "command -v nginx"),
                        ("Apache", "command -v apache2"), ("WireGuard", "command -v wg"), ("AmneziaWG", "command -v awg"),
+                       ("Mihomo", "test -e /usr/local/bin/mihomo"), ("Sudoku", "test -e /etc/sudoku/config.json"),
                        ("Marzban", "test -d /opt/marzban"), ("Outline", "test -d /opt/outline")):
         if subprocess.run(test, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
             found.append(name)
@@ -1147,6 +1539,13 @@ def config_snapshot():
                     for k in links:
                         x["clients"].setdefault(k, {})["inbounds"] = sorted(links[k])
         out["xui"] = x
+    txt = read("/etc/mihomo/config.yaml")
+    if txt:
+        try:
+            import yaml
+            out["mihomo"] = scrub(yaml.safe_load(txt))
+        except Exception:
+            out["mihomo"] = {"_text": fp(txt)}
     awg = {}
     for f in sorted(glob.glob(AWG_DIR + "/wg*.conf")):
         d = {}
@@ -1215,7 +1614,7 @@ def pkgs_info(refresh=False):
 # ------------------------------------------------------------------ проверка сайта через каналы (только чтение)
 
 def site_check(urls, channels, diag=False):
-    """Открыть каждый адрес через каждый канал: туннель до выхода (--interface wgN) или напрямую.
+    """Открыть каждый адрес через каждый канал: AWG (--interface wgN), Sudoku (SOCKS Mihomo) или напрямую.
     diag — для неоткрывшихся напрямую адресов выяснить почему: DNS, TCP или режут по имени сайта (SNI)."""
     import shlex
     import urllib.parse
@@ -1277,6 +1676,8 @@ def site_check(urls, channels, diag=False):
                     ip = None
                 if ip:
                     resolve = "%s:443:%s" % (host, ip)
+        if ch.get("socks"):
+            a += ["--socks5-hostname", "127.0.0.1:%d" % int(ch["socks"])]
         if resolve:
             a += ["--resolve", resolve]
         rc, o, _ = run(" ".join(shlex.quote(x) for x in a + [u]), 14)
@@ -1490,6 +1891,10 @@ elif MODE == "site":
                                          globals().get("DIAG", False))}))
 elif MODE == "pkgs":
     print(json.dumps({"pkgs": pkgs_info(globals().get("REFRESH", False))}, ensure_ascii=False))
+elif MODE == "proto":
+    print(json.dumps({"proto": proto_view()}, ensure_ascii=False))
+elif MODE == "prototest":
+    print(json.dumps({"prototest": proto_test()}, ensure_ascii=False))
 elif MODE == "awg":
     print(json.dumps({"awg": awg_view()}, ensure_ascii=False))
 elif MODE == "fw":
@@ -1511,12 +1916,11 @@ else:
     for u in ("fail2ban",):
         if unit_exists(u):
             data["services"][u] = unit_active(u)
-    data["exit"] = exit_info()
-    # вход — туннели до выходов или 3X-UI на сервере, который сам не выход AmneziaWG
-    if glob.glob(AWG_DIR + "/wg*.conf") or os.path.exists("/etc/x-ui/x-ui.db") and not data["exit"].get("awg"):
-        data["entry"] = {"awg": awg_clients(), "xui": xui(), "mask": reality_mask()}
+    if glob.glob(AWG_DIR + "/wg*.conf") or os.path.exists("/etc/x-ui/x-ui.db") and os.path.exists("/etc/mihomo"):
+        data["entry"] = {"awg": awg_clients(), "mihomo": mihomo(), "xui": xui(), "mask": reality_mask()}
         if os.path.exists("/etc/x-ui/x-ui.db"):
             data["entry"]["e2e"] = xray_e2e()
+    data["exit"] = exit_info()
     data["web"] = web_info()
     data["gov"] = gov_info()
     data["ro"] = ro_info()

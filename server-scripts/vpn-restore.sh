@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# vpn-restore.sh — поднимает ещё один вход из бэкапа основного входа (горячий резерв).
+# vpn-restore.sh — поднимает второй вход в РФ из бэкапа действующего входа (горячий резерв).
 #
 # Что делает (по этапам):
-#   sysctl    BBR и сетевые буферы, как на основном входе
+#   sysctl    BBR и сетевые буферы, как на исходном входе
 #   packages  пакеты: AmneziaWG 3.x (модуль ядра), fail2ban, утилиты
 #   awg       по SSH заходит на выходные серверы, создаёт там НОВОГО AWG-клиента
 #             для этого сервера и поднимает wg0, wg1, ... (по одному на выход из бэкапа)
+#   mihomo    клиент Sudoku: бинарник, конфиг, служба, ночной перезапуск (ключи Sudoku общие)
 #   xui       ставит 3X-UI той же версии и подкладывает базу из бэкапа
 #             (входящий, балансировщики, правило DC5 и т.д.)
 #   fail2ban  правила из бэкапа
@@ -33,7 +34,7 @@ set -euo pipefail
 AWG_CONTAINER="${AWG_CONTAINER:-amnezia-awg2}"
 SSH_PORT="${SSH_PORT:-22}"
 AWG_DIR=/etc/amnezia/amneziawg
-ALL_STAGES="sysctl packages awg xui fail2ban report"
+ALL_STAGES="sysctl packages awg mihomo xui fail2ban report"
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -78,6 +79,12 @@ rssh() {   # $1 = хост, дальше команда
 
 # туннели AWG этого сервера (wg0, wg1, ...)
 awg_ifaces() { local f; for f in "$AWG_DIR"/wg*.conf; do [ -e "$f" ] && basename "$f" .conf; done; return 0; }
+
+# порты SOCKS-слушателей Mihomo
+mihomo_ports() {
+  awk '/^listeners:/ {f=1; next} /^[^[:space:]#-]/ {f=0} f && /^[[:space:]]+port:/ {print $2}' \
+    /etc/mihomo/config.yaml 2>/dev/null || true
+}
 
 # Параметры обфускации, которые переносятся с сервера в конфиг клиента
 AWG_KEYS="Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5 HeaderProtectionKey ContentPaddingAddition RekeyAfterTime RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts RandomTrailers DisableCookies"
@@ -353,6 +360,30 @@ stage_awg() {
   [ "$found" = 1 ] || warn "в бэкапе нет конфигов AWG"
 }
 
+# ---------------------------------------------------------------- Mihomo
+
+stage_mihomo() {
+  say "Mihomo (клиент Sudoku)"
+  [ -f "$SRC/usr/local/bin/mihomo" ] || { warn "в бэкапе нет mihomo — пропускаю"; return; }
+  install -m 755 "$SRC/usr/local/bin/mihomo" /usr/local/bin/mihomo
+  mkdir -p /etc/mihomo
+  cp -a "$SRC/etc/mihomo/." /etc/mihomo/
+  chmod 700 /etc/mihomo
+  local u
+  for u in mihomo.service mihomo.timer mihomo-restart.service; do
+    [ -f "$SRC/etc/systemd/system/$u" ] && cp "$SRC/etc/systemd/system/$u" /etc/systemd/system/
+  done
+  systemctl daemon-reload
+  systemctl enable --now mihomo >/dev/null 2>&1
+  systemctl restart mihomo
+  [ -f /etc/systemd/system/mihomo.timer ] && systemctl enable --now mihomo.timer >/dev/null 2>&1
+  sleep 2
+  local p
+  for p in $(mihomo_ports); do
+    ok "SOCKS $p → $(curl -s -m 15 --socks5 "127.0.0.1:$p" https://ifconfig.me || echo 'нет ответа')"
+  done
+}
+
 # ---------------------------------------------------------------- 3X-UI
 
 # Xray той же версии, что на образце: установщик 3X-UI кладёт свой Xray, а на образце его могли обновить
@@ -395,7 +426,7 @@ stage_xui() {
   [ -f "$SRC/etc/x-ui/x-ui.db" ] || die "в бэкапе нет x-ui.db"
   if [ ! -x /usr/local/x-ui/x-ui ]; then
     local VER="${XUI_VERSION:-$OLD_XUI}"
-    [ -n "$VER" ] || read -rp "  Какая версия 3X-UI стоит на основном входе (например 3.8.5)? " VER
+    [ -n "$VER" ] || read -rp "  Какая версия 3X-UI стоит на исходном входе (например 3.8.5)? " VER
     VER=${VER#v}
     echo "  Ставлю 3X-UI v$VER официальным установщиком."
     echo "  На его вопросы можно отвечать как угодно: настройки панели заменятся настройками из бэкапа."
@@ -428,7 +459,7 @@ stage_xui() {
       if [ -f "$crt" ] && cert_ips "$crt" | grep -qxF "$NEW_IP"; then
         ok "сертификат $crt уже выпущен для $NEW_IP — оставляю его"; continue
       fi
-      warn "$crt выпущен для IP основного входа ($OLD_IP) — ставлю временно, новый нужно выпустить (см. итог)"
+      warn "$crt выпущен для IP исходного входа ($OLD_IP) — ставлю временно, новый нужно выпустить (см. итог)"
     fi
     install -D -m 600 "$SRC$crt" "$crt"
     [ -n "$key" ] && [ -f "$SRC$key" ] && install -D -m 600 "$SRC$key" "$key"
@@ -478,7 +509,7 @@ stage_fail2ban() {
 stage_report() {
   say "Проверка"
   local s
-  for s in x-ui $(awg_ifaces | sed 's/^/awg-quick@/') fail2ban; do
+  for s in x-ui mihomo $(awg_ifaces | sed 's/^/awg-quick@/') fail2ban; do
     if systemctl is-active --quiet "$s"; then ok "$s работает"; else warn "$s НЕ работает"; fi
   done
   for s in $(awg_ifaces); do
@@ -537,7 +568,7 @@ if (st.get("webListen") or "").startswith("127."):
     print("  Панель:   закрыта из интернета (как в бэкапе) — открывается кнопкой «3X-UI» в панели каскада")
 else:
     print("  Панель:   %s://%s:%s%s" % ("https" if https else "http", new, st.get("webPort", "?"), st.get("webBasePath", "/")))
-print("  Логин и пароль — те же, что на основном входе.")
+print("  Логин и пароль — те же, что на исходном входе.")
 if st.get("subEnable", "true") == "false":
     print("  Подписка выключена в настройках панели.")
 else:
@@ -572,14 +603,14 @@ else:
         print("  Подписка %-12s %s%s" % (email, base, sid))
     if not subs:
         print("  Ссылки подписки не нашлись. Колонки clients: %s" % ", ".join(cols))
-        print("  Возьмите ссылку с основного входа и замените в ней IP на %s." % new)
+        print("  Возьмите ссылку с исходного входа и замените в ней IP на %s." % new)
 PY
   cat <<'EOF'
 
   Что дальше:
    1. На устройствах добавьте ссылку подписки выше как ВТОРУЮ подписку (старую оставьте).
    2. В приложении Amnezia на выходах новые клиенты видны под именами <сервер>-wg0 / <сервер>-wg1.
-   3. Новый сервер — копия основного входа: если потом что-то меняете в панели одного, повторите на другом.
+   3. Новый сервер — копия исходного входа: если потом что-то меняете в панели одного, повторите на другом.
 EOF
 }
 

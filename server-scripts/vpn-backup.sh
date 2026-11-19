@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# vpn-backup.sh — снимает бэкап входного сервера (3X-UI + AmneziaWG + sysctl + fail2ban)
-# Запуск на основном входе:  bash vpn-backup.sh
+# vpn-backup.sh — снимает бэкап входного сервера (3X-UI + Mihomo/Sudoku + AmneziaWG + sysctl + fail2ban)
+# Запуск на сервере-источнике (входе):  bash vpn-backup.sh
 # Результат: /root/vpn-backup-<дата>.tar.gz (внутри ключи и пароли — храните как секрет)
 
 set -euo pipefail
@@ -62,6 +62,12 @@ else
   echo "  (в базе пути к сертификатам не заданы)"
 fi
 
+say "Mihomo (клиент Sudoku) и ночной перезапуск"
+copy /etc/mihomo /usr/local/bin/mihomo \
+     /etc/systemd/system/mihomo.service \
+     /etc/systemd/system/mihomo.timer \
+     /etc/systemd/system/mihomo-restart.service
+
 say "AmneziaWG: конфиги (только для справки — на новом сервере нужны НОВЫЕ клиенты)"
 copy /etc/amnezia/amneziawg
 
@@ -83,6 +89,7 @@ say "Версии компонентов"
   # sed -n 1p вместо head -1: head закрывает канал раньше времени, и с pipefail
   # вместе с версией печаталось ещё и «unknown»
   echo "xray=$( { [ -n "$XRAY_BIN" ] && "$XRAY_BIN" version 2>/dev/null; } | sed -n 1p)"
+  echo "mihomo=$(/usr/local/bin/mihomo -v 2>/dev/null | sed -n 1p)"
   echo "awg_tools=$(awg --version 2>/dev/null | sed -n 1p)"
   echo "awg_module=$(modinfo -F version amneziawg 2>/dev/null || echo unknown)"
 } | tee "$WORK/versions.txt"
@@ -98,7 +105,7 @@ IP=$(hostname -I | awk '{print $1}')
 cat <<EOF
 
 Готово: $ARCH ($SIZE)
-В архиве UUID, ключи REALITY и AWG — храните как пароль.
+В архиве UUID, ключи REALITY, ключи Sudoku и AWG — храните как пароль.
 
 Скачать на компьютер (PowerShell, в папку, где вы сейчас):
   scp root@$IP:$ARCH .

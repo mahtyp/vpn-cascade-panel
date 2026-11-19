@@ -204,20 +204,20 @@
 "tls": "TLSv1.3",
 "alpn": "h2",
 "cn": [
-"shop.example-neighbor.nl"
+"shop.example-neighbor.example"
 ],
 "san": [
-"shop.example-neighbor.nl",
-"www.shop.example-neighbor.nl"
+"shop.example-neighbor.example",
+"www.shop.example-neighbor.example"
 ],
 "issuer": [
 "Let's Encrypt"
 ],
 "own": [
-"shop.example-neighbor.nl"
+"shop.example-neighbor.example"
 ],
 "fit": {
-"name": "shop.example-neighbor.nl",
+"name": "shop.example-neighbor.example",
 "tls": "TLSv1.3",
 "alpn": "h2",
 "ok": true
@@ -228,19 +228,19 @@
 "tls": "TLSv1.3",
 "alpn": "h2",
 "cn": [
-"blog.example-host.nl"
+"blog.example-host.example"
 ],
 "san": [
-"blog.example-host.nl"
+"blog.example-host.example"
 ],
 "issuer": [
 "Let's Encrypt"
 ],
 "own": [
-"blog.example-host.nl"
+"blog.example-host.example"
 ],
 "fit": {
-"name": "blog.example-host.nl",
+"name": "blog.example-host.example",
 "tls": "TLSv1.3",
 "alpn": "http/1.1",
 "ok": false
@@ -251,19 +251,19 @@
 "tls": "TLSv1.3",
 "alpn": "h2",
 "cn": [
-"cloud.example-files.nl"
+"cloud.example-files.example"
 ],
 "san": [
-"cloud.example-files.nl"
+"cloud.example-files.example"
 ],
 "issuer": [
 "Let's Encrypt"
 ],
 "own": [
-"cloud.example-files.nl"
+"cloud.example-files.example"
 ],
 "fit": {
-"name": "cloud.example-files.nl",
+"name": "cloud.example-files.example",
 "tls": "TLSv1.3",
 "alpn": "h2",
 "ok": true
@@ -304,10 +304,10 @@
 "tls": "TLSv1.2",
 "alpn": "http/1.1",
 "cn": [
-"mail.example-corp.nl"
+"mail.example-corp.example"
 ],
 "san": [
-"mail.example-corp.nl"
+"mail.example-corp.example"
 ],
 "issuer": [
 "Let's Encrypt"

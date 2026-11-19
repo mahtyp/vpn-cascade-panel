@@ -301,7 +301,7 @@ class Zapret:
         match = {"domain": ["domain:" + h for h in t["hosts"]], "network": "tcp"}
         code = self.code(tid)
         # своё исходящее «напрямую», которое узнаёт адреса через DNS самого Xray; в нём адреса цели — через DoH
-        # (DNS хостера и обычные запросы к 1.1.1.1/8.8.8.8 бывают перехвачены — так бывает у некоторых российских хостеров)
+        # (DNS хостера и обычные запросы к 1.1.1.1/8.8.8.8 бывают перехвачены — так бывает в отдельных сетях)
         log = self.d.sites.apply(code, [e], "create" if on else "remove", match=match, chain=[code + "-out"],
                                  out=code + "-out", doh=DOH_SERVERS)
         r = log[0] if log else {"ok": False, "msg": "нет ответа"}

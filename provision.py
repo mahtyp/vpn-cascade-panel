@@ -432,7 +432,7 @@ class Provisioner:
 
     def start_migrate(self, srv, awg_net):
         """Выход с Amnezia в Docker → AmneziaWG без Docker (как у выходов, поставленных мастером). Одна задача за раз."""
-        if any(j.kind in ("migrate", "install") and j.status == "run" for j in self.jobs.values()):
+        if any(j.kind in ("migrate", "install", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
             raise ValueError("уже идёт установка или перевод другого выхода — дождитесь окончания")
         if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$", awg_net or ""):
             raise ValueError("подсеть туннелей в виде 10.11.0")
@@ -467,7 +467,7 @@ class Provisioner:
             if not cfg.get_pw(e["id"]):
                 raise Stop("нет пароля от %s" % e["name"])
         steps = [("setup", "AmneziaWG без Docker на выходе — сборка модуля ядра 5–10 мин", srv["name"])]
-        steps += [("link-" + e["id"], "Туннель переводится на новый AmneziaWG (3X-UI не меняется)", e["name"]) for e in entries]
+        steps += [("link-" + e["id"], "Туннель переводится на новый AmneziaWG (Sudoku и 3X-UI не меняются)", e["name"]) for e in entries]
         steps += [("docker", "Остановить и удалить контейнер Amnezia (%s)" % container, srv["name"]),
                   ("panel", "Проверка выхода и каналов", "панель")]
         job.plan(steps)
@@ -540,6 +540,905 @@ class Provisioner:
             srv["name"], port, ", ".join(done) or "—"))
         job.end("panel", "ok" if all(x["ok"] == x["n"] for x in post) else "warn")
 
+    def start_sudoku_backup(self, srv):
+        """Запасной канал Sudoku к выходу связки, где есть только свой путь (например, VLESS из подписки 3X-UI).
+        На выходе — только Sudoku (без AmneziaWG и обновления системы), на входах связки — прокси Mihomo и звено цепочки."""
+        if any(j.kind in ("migrate", "install", "sudoku", "swupdate", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
+            raise ValueError("уже идёт установка или изменение другого выхода — дождитесь окончания")
+        if srv["role"] != "exit" or not srv.get("group"):
+            raise ValueError("запасной канал так ставится только к выходу отдельной связки")
+        job = Job(self, "sudokubk", {"sid": srv["id"], "name": srv["name"]})
+        self.jobs[job.id] = job
+        return self._spawn(job, self._sudoku_backup, None)
+
+    def _sudoku_backup(self, job, _password):
+        cfg = self.d.cfg
+        srv = cfg.by_id(job.params["sid"])
+        if not srv or srv["role"] != "exit":
+            raise Stop("выхода больше нет в панели")
+        pw = cfg.get_pw(srv["id"])
+        if not pw:
+            raise Stop("нет пароля от %s" % srv["name"])
+        entries = [e for e in cfg.servers if e["role"] == "entry" and e.get("group") == srv.get("group")]
+        if not entries:
+            raise Stop("в связке «%s» нет входов" % srv["name"])
+        for e in entries:
+            if not cfg.get_pw(e["id"]):
+                raise Stop("нет пароля от %s" % e["name"])
+        tag = latin(srv["name"]).capitalize()[:20]
+        if not TAG_RE.match(tag):
+            tag = "Exit" + re.sub(r"[^A-Za-z0-9]", "", srv["id"])[:12]
+        steps = [("before", "Какие каналы работают сейчас", ", ".join(e["name"] for e in entries)),
+                 ("setup", "Sudoku на выходе (официальный установщик; AmneziaWG, ядро и 3X-UI не трогаются)", srv["name"])]
+        steps += [("link-" + e["id"], "Прокси Sudoku в Mihomo и запасное звено в цепочке 3X-UI", e["name"]) for e in entries]
+        steps += [("panel", "Проверка: старые каналы и новый запасной", "панель")]
+        job.plan(steps)
+
+        job.begin("before")
+        was = self.working_now(job, [(e, c) for e in entries for c in self.d.channels.get(e["id"], [])])
+        job.end("before", note="работают: %d" % len(was))
+
+        job.begin("setup")
+        self.put(srv, self.scripts / "vpn-exit-setup.sh", "/root/vpn-exit-setup.sh")
+        rc = self.detached(job, srv, "sudoku-setup", "ONLY_SUDOKU=1 bash /root/vpn-exit-setup.sh\n", timeout=1800)
+        if rc != 0:
+            raise Stop("Sudoku на выходе не встал (код %d) — журнал выше. Входы не трогал." % rc)
+        rc, out, _ = self.sh(srv, "jq -r .local_port /etc/sudoku/config.json 2>/dev/null")
+        port = out.strip()
+        if not port.isdigit():
+            raise Stop("у Sudoku на выходе не нашёлся порт — журнал выше. Входы не трогал.")
+        job.result["sudoku_port"] = port
+        job.end("setup", note="TCP %s" % port)
+
+        done = []
+        try:
+            for e in entries:
+                key = "link-" + e["id"]
+                job.begin(key)
+                for f in ("vpn-restore.sh", "vpn-add-exit.sh"):
+                    self.put(e, self.scripts / f, "/root/" + f)
+                self.sh(e, "mkdir -p %s/pw && chmod 700 %s/pw" % (REMOTE, REMOTE))
+                self.put(e, pw.encode("utf-8"), "%s/pw/%s" % (REMOTE, srv["host"]), 0o600)
+                self.put(e, str(int(srv.get("port") or 22)).encode(), "%s/pw/%s.port" % (REMOTE, srv["host"]), 0o600)
+                rc = self.detached(job, e, "sudoku-link", "export VPN_PWDIR=%s/pw SUDOKU_ONLY=1\nbash /root/vpn-add-exit.sh %s %s\n"
+                                   % (REMOTE, tag, srv["host"]), timeout=900)
+                if rc != 0:
+                    raise Stop("%s: запасной канал не подключился (код %d) — журнал выше. Изменения в 3X-UI скрипт откатывает сам%s." % (
+                        e["name"], rc, ("; уже подключены: %s" % ", ".join(done)) if done else ""))
+                done.append(e["name"])
+                job.end(key)
+        finally:
+            for e in entries:
+                try:
+                    self.sh(e, "rm -rf %s/pw" % REMOTE, timeout=30)
+                except Stop:
+                    job.log("не удалось удалить временный пароль на %s: удалите %s/pw вручную" % (e["name"], REMOTE))
+
+        job.begin("panel")
+        for e in entries:
+            self.d.check_server(e["id"])
+        self.d.check_server(srv["id"])
+        for _ in range(120):
+            if "all" not in self.d.running:
+                break
+            time.sleep(1)
+        self.d.check_all(True)
+        broke = [(e, c) for e, c in was
+                 if (self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
+        for e, c in broke:
+            job.log("%s → %s %s: работал до, а сейчас нет" % (e["name"], c.get("kind") or "канал", c.get("exit") or ""))
+        new_ok = []
+        for e in entries:
+            for c in self.d.channels.get(e["id"], []):
+                if c.get("exit_id") == srv["id"] and c.get("kind") == "Sudoku":
+                    st = (self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}).get("status")
+                    job.log("%s → Sudoku %s: %s" % (e["name"], srv["name"], {"ok": "работает", "warn": "работает, медленно"}.get(st, "не работает")))
+                    if st in ("ok", "warn"):
+                        new_ok.append(e["name"])
+        self.d.note("ok" if new_ok and not broke else "warn", "%s: добавлен запасной канал Sudoku (TCP %s), входы: %s" % (
+            srv["name"], port, ", ".join(done) or "—"))
+        job.end("panel", "ok" if len(new_ok) == len(entries) and not broke else "warn",
+                "запасной канал работает" if len(new_ok) == len(entries) and not broke else
+                ("перестали работать: %d — журнал выше" % len(broke)) if broke else "новый канал не ответил — журнал выше")
+
+    # ------------------------------------------------------------------ «Протоколы» → «Настройка»: связать два сервера
+    LINK_PROTO = {"awg": "AmneziaWG", "sudoku": "Sudoku", "vless": "VLESS"}
+    LINK_KIND = {"awg": "AWG", "sudoku": "Sudoku", "vless": "VLESS"}
+
+    def _link_name(self, entry, exit_):
+        """Имя выхода в тегах 3X-UI на этом входе: если вход уже связан с ним другим протоколом — то же имя."""
+        for c in self.d.channels.get(entry["id"], []):
+            if c.get("exit_id") == exit_["id"] and c.get("tag") and "-" in c["tag"]:
+                return c["tag"].split("-", 1)[1]
+        tag = latin(exit_["name"]).capitalize()[:20]
+        return tag if TAG_RE.match(tag) else "Exit" + re.sub(r"[^A-Za-z0-9]", "", exit_["id"])[:12]
+
+    def link_plan(self, eid, xid, proto, pos="end", port=""):
+        """Что будет сделано, если связать вход с выходом этим протоколом. Ничего не меняет.
+        → {ok, errors, warns, steps: [{srv, text}], chain: [теги цепочки входа], name, cross}"""
+        cfg, d = self.d.cfg, self.d
+        e, x = cfg.by_id(eid), cfg.by_id(xid)
+        errors, warns, steps = [], [], []
+        if not e or not x or e is x:
+            return {"ok": False, "errors": ["выберите вход и выход"], "warns": [], "steps": [], "chain": []}
+        if proto not in self.LINK_PROTO:
+            return {"ok": False, "errors": ["такой протокол связывать пока не умею"], "warns": [], "steps": [], "chain": []}
+        pn = self.LINK_PROTO[proto]
+        if e["role"] != "entry":
+            errors.append("«%s» — не вход: связь ставится со входа (сервер с 3X-UI, куда подключаются устройства)" % e["name"])
+        if x["role"] != "exit" and proto != "vless":
+            errors.append("«%s» — не выход" % x["name"])
+        for s in (e, x):
+            if not cfg.get_pw(s["id"]):
+                errors.append("нет пароля от «%s»" % s["name"])
+        est = (d.status.get(e["id"]) or {})
+        xst = (d.status.get(x["id"]) or {})
+        for s, st in ((e, est), (x, xst)):
+            if not st.get("ok"):
+                errors.append("«%s» сейчас не отвечает панели — сначала проверка на Обзоре" % s["name"])
+        ed, xd = (est.get("data") or {}).get("entry") or {}, (xst.get("data") or {}).get("exit") or {}
+        chans = list(d.channels.get(e["id"], []))
+        kind = self.LINK_KIND[proto]
+        if any(c.get("exit_id") == x["id"] and c.get("kind") == kind for c in chans):
+            errors.append("связь «%s» → «%s» по %s уже есть" % (e["name"], x["name"], pn))
+        if est.get("ok") and not ed.get("xui"):
+            errors.append("на «%s» нет 3X-UI" % e["name"])
+        if proto == "sudoku" and est.get("ok") and not ed.get("mihomo"):
+            errors.append("на «%s» нет Mihomo — связь по Sudoku ставится только на вход с Mihomo" % e["name"])
+        cross = (e.get("group") or "") != (x.get("group") or "")
+        if cross:
+            warns.append("«%s» и «%s» — из разных связок: трафик этого входа сможет выходить через этот выход" % (e["name"], x["name"]))
+        chain = [c for c in sorted((c for c in chans if c.get("n")), key=lambda c: c["n"])]
+        name = self._link_name(e, x) if e and x else ""
+        # выход
+        vin = None
+        if proto == "vless" and not errors:
+            vin, verr = self._vless_look(e, x, name)
+            if verr:
+                errors.append(verr)
+            elif port and not any(str(i["port"]) == str(port) and i["ok"] for i in vin):
+                errors.append("на «%s» нет включённого входящего VLESS Reality на порту %s" % (x["name"], port))
+        if proto == "vless":
+            if x["role"] == "entry":
+                warns.append("«%s» — тоже вход: трафик пойдёт в его 3X-UI и дальше по его правилам и цепочке" % x["name"])
+            ib = next((i for i in vin or [] if i["ok"] and (str(i["port"]) == str(port) if port else i["ours"])), None) or \
+                next((i for i in vin or [] if i["ok"]), None)
+            if ib:
+                steps.append({"srv": x["name"], "text": ("во входящем «%s» (порт %s) клиент для «%s» уже есть — возьмём его" if ib["ours"] else
+                              "во входящий «%s» (порт %s) добавится клиент %s — через API 3X-UI, без перезапуска; остальные клиенты не трогаются")
+                              % ((ib["remark"] or "без имени", ib["port"], e["name"]) if ib["ours"] else (ib["remark"] or "без имени", ib["port"], self._vless_email(e)))})
+        elif proto == "awg":
+            a = xd.get("awg")
+            if a and a.get("mode") == "docker":
+                steps.append({"srv": x["name"], "text": "AmneziaWG уже есть (в Docker, контейнер %s): в него добавится клиент для «%s». Больше ничего не меняется" % (a.get("container") or "?", e["name"])})
+            elif a:
+                steps.append({"srv": x["name"], "text": "AmneziaWG уже стоит (awg0, UDP %s): в его конфиг добавится один клиент для «%s». Больше ничего не меняется" % (a.get("port") or "?", e["name"])})
+            else:
+                steps.append({"srv": x["name"], "text": "поставится AmneziaWG: пакеты и модуль ядра (сборка 5–10 минут), туннель awg0 на свободном порту UDP, "
+                              "включится пересылка трафика и BBR (файл /etc/sysctl.d/99-vpn-exit.conf). Обновления системы не будет; 3X-UI, fail2ban и остальное не трогаются. "
+                              "Если включён ufw — порт туннеля в нём разрешится"})
+                warns.append("на «%s» ещё нет AmneziaWG: модуль ядра собирается под ядро сервера. На очень новых ядрах сборка может не пройти — "
+                             "тогда установка остановится на выходе, а вход останется нетронутым" % x["name"])
+        else:
+            sd = xd.get("sudoku")
+            if sd:
+                steps.append({"srv": x["name"], "text": "Sudoku уже стоит (TCP %s) — на выходе ничего не меняется" % (sd.get("port") or "?")})
+            else:
+                steps.append({"srv": x["name"], "text": "поставится Sudoku официальным установщиком: свой порт TCP из 50001–65535 (если включён ufw — порт в нём разрешится). "
+                              "Обновления системы не будет; AmneziaWG, ядро, 3X-UI и остальное не трогаются"})
+        # вход
+        where = ("в конец цепочки, запасным" if pos == "end" else "первым, основным путём" if pos == "first" else
+                 "после «%s»" % pos[6:] if pos.startswith("after:") else pos)
+        how = ("новый туннель wgN до «%s»" % x["name"] if proto == "awg" else "в Mihomo — прокси до Sudoku на «%s» и локальный SOCKS" % x["name"]
+               if proto == "sudoku" else "туннель и Mihomo не нужны")
+        main_tags = [c.get("tag") for c in chain]
+        if chain:
+            cht = "в цепочку встанет звено %s-%s %s" % (kind, name, where)
+        else:
+            cht = ("цепочки на входе ещё нет: нынешний общий путь станет первым звеном, %s-%s — запасным за ним "
+                   "(правила «всё остальное» и DNS переводятся на цепочку)" % (kind, name))
+        steps.append({"srv": e["name"], "text": "%s; в 3X-UI — исходящее %s-%s, %s. Перед изменением — копия базы 3X-UI; "
+                      "x-ui перезапустится (VPN прервётся на 5–10 секунд); не поднимется Xray — база вернётся как была" % (how, kind, name, cht)})
+        steps.append({"srv": "панель", "text": "проверка: каналы, которые работали до, работают и после; новый путь отвечает"})
+        if pos.startswith("after:") and pos[6:] not in main_tags:
+            errors.append("в цепочке входа нет звена «%s»" % pos[6:])
+        if any(j.kind in ("migrate", "install", "sudoku", "swupdate", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
+            errors.append("уже идёт установка или изменение — дождитесь окончания")
+        return {"ok": not errors, "errors": errors, "warns": warns, "steps": steps, "chain": main_tags, "name": name, "cross": cross,
+                "proto": pn, "entry": e["name"], "exit": x["name"]}
+
+    def start_link(self, eid, xid, proto, pos="end", cross_ok=False, port=""):
+        port = str(port or "")
+        if port and not port.isdigit():
+            raise ValueError("непонятный порт")
+        plan = self.link_plan(eid, xid, proto, pos, port)
+        if not plan["ok"]:
+            raise ValueError("; ".join(plan["errors"]))
+        if plan["cross"] and not cross_ok:
+            raise ValueError("серверы из разных связок — подтвердите это отдельной галочкой")
+        if not re.match(r"^(end|first|after:[A-Za-z0-9_.-]{1,60})$", pos):
+            raise ValueError("непонятное место в цепочке")
+        e, x = self.d.cfg.by_id(eid), self.d.cfg.by_id(xid)
+        job = Job(self, "link", {"sid": xid, "eid": eid, "name": "%s → %s" % (e["name"], x["name"]), "proto": proto, "pos": pos,
+                                 "tag": plan["name"], "port": port})
+        self.jobs[job.id] = job
+        return self._spawn(job, self._link, None)
+
+    def _link(self, job, _password):
+        cfg, p = self.d.cfg, job.params
+        e, x = cfg.by_id(p["eid"]), cfg.by_id(p["sid"])
+        if not e or not x:
+            raise Stop("сервера больше нет в панели")
+        pw, proto, kind = cfg.get_pw(x["id"]), p["proto"], self.LINK_KIND[p["proto"]]
+        pn = self.LINK_PROTO[proto]
+        if proto == "vless":
+            return self._link_vless(job, e, x)
+        job.plan([("before", "Какие каналы работают сейчас", e["name"]),
+                  ("setup", "%s на выходе" % pn, x["name"]),
+                  ("link", "Вход: новый путь и место в цепочке 3X-UI", e["name"]),
+                  ("panel", "Проверка: старые каналы и новый путь", "панель")])
+        job.begin("before")
+        was = self.working_now(job, [(e, c) for c in self.d.channels.get(e["id"], [])])
+        job.end("before", note="работают: %d" % len(was))
+
+        job.begin("setup")
+        if proto == "awg":
+            rc, out, _ = self.sh(x, "(awg show awg0 listen-port 2>/dev/null || docker ps --format '{{.Names}}' 2>/dev/null | grep -i amnezia-awg) | head -1")
+            if out.strip():
+                job.log("AmneziaWG на выходе уже есть — ставить не нужно")
+                job.end("setup", note="уже стоит")
+            else:
+                self.put(x, self.scripts / "vpn-exit-setup.sh", "/root/vpn-exit-setup.sh")
+                rc = self.detached(job, x, "link-setup", "ONLY_AWG=1 bash /root/vpn-exit-setup.sh\n", timeout=3600)
+                if rc != 0:
+                    raise Stop("AmneziaWG на выходе не встал (код %d) — журнал выше. Вход не трогал." % rc)
+                rc, out, _ = self.sh(x, "awg show awg0 listen-port; ufw status 2>/dev/null | head -n1; "
+                                        "ip -o route show default | awk '{for(i=1;i<NF;i++) if($i==\"dev\"){print $(i+1); exit}}'")
+                lines = (out.splitlines() + ["", "", ""])[:3]
+                port, ufw, wan = lines[0].strip(), lines[1].strip(), lines[2].strip() or "eth0"
+                if not port.isdigit():
+                    raise Stop("awg0 на выходе не поднялся — журнал выше. Вход не трогал.")
+                if "Status: active" in ufw:
+                    self.sh(x, "ufw allow %s/udp comment 'AmneziaWG awg0' && ufw route allow in on awg0 out on %s" % (port, shlex.quote(wan)))
+                    job.log("ufw на выходе: открыт UDP %s, разрешена пересылка awg0 → %s" % (port, wan))
+                job.end("setup", note="UDP %s" % port)
+        else:
+            self.put(x, self.scripts / "vpn-exit-setup.sh", "/root/vpn-exit-setup.sh")
+            rc = self.detached(job, x, "link-setup", "ONLY_SUDOKU=1 bash /root/vpn-exit-setup.sh\n", timeout=1800)
+            if rc != 0:
+                raise Stop("Sudoku на выходе не встал (код %d) — журнал выше. Вход не трогал." % rc)
+            rc, out, _ = self.sh(x, "jq -r .local_port /etc/sudoku/config.json 2>/dev/null")
+            if not out.strip().isdigit():
+                raise Stop("у Sudoku на выходе не нашёлся порт — журнал выше. Вход не трогал.")
+            job.end("setup", note="TCP %s" % out.strip())
+
+        job.begin("link")
+        try:
+            for f in ("vpn-restore.sh", "vpn-add-exit.sh"):
+                self.put(e, self.scripts / f, "/root/" + f)
+            self.sh(e, "mkdir -p %s/pw && chmod 700 %s/pw" % (REMOTE, REMOTE))
+            self.put(e, pw.encode("utf-8"), "%s/pw/%s" % (REMOTE, x["host"]), 0o600)
+            self.put(e, str(int(x.get("port") or 22)).encode(), "%s/pw/%s.port" % (REMOTE, x["host"]), 0o600)
+            env = "export VPN_PWDIR=%s/pw %s=1 POSITION=%s\n" % (REMOTE, "AWG_ONLY" if proto == "awg" else "SUDOKU_ONLY", shlex.quote(p["pos"]))
+            rc = self.detached(job, e, "link-entry", env + "bash /root/vpn-add-exit.sh %s %s\n" % (p["tag"], x["host"]), timeout=900)
+            if rc != 0:
+                raise Stop("%s: новый путь не подключился (код %d) — журнал выше. Изменения в 3X-UI скрипт откатывает сам." % (e["name"], rc))
+            job.end("link")
+        finally:
+            try:
+                self.sh(e, "rm -rf %s/pw" % REMOTE, timeout=30)
+            except Stop:
+                job.log("не удалось удалить временный пароль на %s: удалите %s/pw вручную" % (e["name"], REMOTE))
+
+        job.begin("panel")
+        self.d.check_server(e["id"])
+        self.d.check_server(x["id"])
+        for _ in range(120):
+            if "all" not in self.d.running:
+                break
+            time.sleep(1)
+        self.d.check_all(True)
+        broke = [(s, c) for s, c in was if (self.d.results.get("%s:%s" % (s["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
+        for s, c in broke:
+            job.log("%s → %s %s: работал до, а сейчас нет" % (s["name"], c.get("kind") or "канал", c.get("exit") or ""))
+        st = None
+        for c in self.d.channels.get(e["id"], []):
+            if c.get("exit_id") == x["id"] and c.get("kind") == kind:
+                st = (self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}).get("status")
+                job.log("%s → %s %s: %s%s" % (e["name"], kind, x["name"], {"ok": "работает", "warn": "работает, медленно"}.get(st, "не работает"),
+                                              ", место в цепочке %s" % c["n"] if c.get("n") else ""))
+        good = st in ("ok", "warn") and not broke
+        self.d.note("ok" if good else "warn", "Связаны %s → %s по %s (%s)" % (e["name"], x["name"], pn, "работает" if good else "нужна проверка"))
+        job.end("panel", "ok" if good else "warn", "новый путь работает" if good else
+                ("перестали работать: %d — журнал выше" % len(broke)) if broke else "новый путь не ответил — журнал выше")
+
+    # клиент VLESS для входа во входящем VLESS Reality сервера-цели — через API 3X-UI (как vpn-entry-new.sh), без перезапуска x-ui.
+    # find — какие входящие подходят (без секретов); add — завести (или взять уже заведённого) клиента и вывести параметры
+    # одной строкой JSON (это секрет: в журнал не пишется); rm — убрать клиента с этим email из всех входящих VLESS.
+    VLESS_CLIENT_PY = r"""
+import glob, json, re, secrets, ssl, sqlite3, subprocess, sys, urllib.error, urllib.request, uuid
+act, email, want = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
+DB, XUI = "/etc/x-ui/x-ui.db", "/usr/local/x-ui/x-ui"
+def load():
+    db = sqlite3.connect("file:%s?mode=ro" % DB, uri=True, timeout=10)
+    st = dict(db.execute("select key, value from settings").fetchall())
+    rows = []
+    for iid, port, remark, proto, sv, ss, en in db.execute("select id, port, remark, protocol, settings, stream_settings, enable from inbounds"):
+        try:
+            sv, ss = json.loads(sv or "{}"), json.loads(ss or "{}")
+        except ValueError:
+            continue
+        if proto == "vless":
+            rows.append({"id": iid, "port": port, "remark": remark or "", "on": bool(en), "sv": sv, "ss": ss,
+                         "ok": bool(en) and ss.get("security") == "reality" and ss.get("network", "tcp") in ("tcp", "raw")})
+    return st, rows
+def token():
+    o = subprocess.run([XUI, "setting", "-getApiToken"], capture_output=True, text=True, timeout=30).stdout
+    m = re.findall(r"apiToken:\s*(\S+)", o)
+    if not m:
+        sys.exit("3X-UI не выдала токен API (нужна версия 3X-UI с токенами API)")
+    return m[-1]
+def api(st, path, body):
+    base = "%s://127.0.0.1:%s%s" % ("https" if st.get("webCertFile") else "http", st.get("webPort") or "2053", st.get("webBasePath") or "/")
+    base += "" if base.endswith("/") else "/"
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                 headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    try:
+        r = json.loads(op.open(req, timeout=30).read())
+    except urllib.error.HTTPError as e:
+        sys.exit("API 3X-UI ответил %s — %s" % (e.code, "токен не подошёл" if e.code in (401, 403) else "такого запроса эта версия 3X-UI не знает" if e.code == 404 else "ошибка"))
+    except (OSError, ValueError) as e:
+        sys.exit("API 3X-UI не ответил: %s" % e)
+    finally:
+        subprocess.run([XUI, "setting", "-getApiToken"], capture_output=True, timeout=30)   # перевыпуск: токен нигде не остаётся
+    if not r.get("success"):
+        sys.exit("3X-UI: %s" % r.get("msg"))
+st, rows = load()
+mine = lambda r: next((c for c in r["sv"].get("clients") or [] if c.get("email") == email), None)
+if act == "find":
+    print(json.dumps({"inbounds": [{"port": r["port"], "remark": r["remark"], "ok": r["ok"], "on": r["on"], "clients": len(r["sv"].get("clients") or []),
+                                    "ours": bool(mine(r)), "sni": ((r["ss"].get("realitySettings") or {}).get("serverNames") or [""])[0]} for r in rows]}))
+    sys.exit(0)
+if act == "rm":
+    gone = 0
+    for r in rows:
+        c = mine(r)
+        if c:
+            api(st, "panel/api/inbounds/%s/delClient/%s" % (r["id"], c["id"]), {})
+            gone += 1
+    print("RM-OK клиент %s убран из входящих: %d" % (email, gone) if gone else "RM-SKIP клиента %s нет — убирать нечего" % email)
+    sys.exit(0)
+r = next((r for r in rows if r["ok"] and str(r["port"]) == want), None) if want else next((r for r in rows if r["ok"] and mine(r)), None) or next((r for r in rows if r["ok"]), None)
+if not r:
+    sys.exit("нет включённого входящего VLESS Reality (TCP) в 3X-UI")
+c, reused = mine(r), True
+if not c:
+    reused = False
+    c = {"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision", "email": email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True,
+         "tgId": 0, "subId": secrets.token_hex(8), "reset": 0, "comment": "путь между серверами (панель vpn-dash)"}
+    api(st, "panel/api/inbounds/addClient", {"id": r["id"], "settings": json.dumps({"clients": [c]})})
+    st, rows = load()
+    r = next(x for x in rows if x["id"] == r["id"])
+    if not mine(r):
+        sys.exit("3X-UI ответила «успешно», но клиента во входящем нет")
+rs = r["ss"].get("realitySettings") or {}
+pbk = (rs.get("settings") or {}).get("publicKey") or ""
+if not pbk and rs.get("privateKey"):
+    xb = [x for x in glob.glob("/usr/local/x-ui/bin/xray-linux-*") if ".before" not in x]
+    o = subprocess.run([xb[0], "x25519", "-i", rs["privateKey"]], capture_output=True, text=True, timeout=30).stdout if xb else ""
+    m = re.search(r"(?:Public key|Password[^:]*):\s*(\S+)", o)
+    pbk = m.group(1) if m else ""
+if not pbk:
+    sys.exit("не узнал открытый ключ Reality входящего")
+print(json.dumps({"port": r["port"], "remark": r["remark"], "reused": reused, "uuid": c["id"], "flow": c.get("flow") or "xtls-rprx-vision",
+                  "pbk": pbk, "sid": next((x for x in rs.get("shortIds") or [] if x), ""), "sni": (rs.get("serverNames") or [""])[0],
+                  "fp": (rs.get("settings") or {}).get("fingerprint") or "firefox"}))
+"""
+
+    @staticmethod
+    def _vless_email(e):
+        return "vpn-dash-" + (re.sub(r"[^A-Za-z0-9_-]", "", e["id"])[:24] or "entry")
+
+    def _vless_look(self, e, x, name):
+        """Для плана VLESS: какие входящие есть на цели и нет ли уже VLESS-ИМЯ на входе. → (входящие, ошибка)"""
+        try:
+            rc, out, err = self.sh(x, "python3 - find %s" % shlex.quote(self._vless_email(e)), stdin=self.VLESS_CLIENT_PY, timeout=40)
+            if rc != 0:
+                return None, "«%s»: %s" % (x["name"], (err.strip().splitlines() or ["код %s" % rc])[-1][:200])
+            vin = json.loads(out.strip().splitlines()[-1])["inbounds"]
+            rc, out, _ = self.sh(e, "python3 -c %s" % shlex.quote(
+                "import json,sqlite3;t=json.loads(sqlite3.connect('file:/etc/x-ui/x-ui.db?mode=ro',uri=True).execute("
+                "\"select value from settings where key='xrayTemplateConfig'\").fetchone()[0]);"
+                "print(int(any(o.get('tag')=='VLESS-%s' for o in t.get('outbounds') or [])))" % name), timeout=40)
+        except (Stop, ValueError, KeyError, IndexError) as ex:
+            return None, "не прочитал: %s" % ex
+        if out.strip() == "1":
+            return vin, "на «%s» уже есть исходящее VLESS-%s — связь по VLESS уже стоит" % (e["name"], name)
+        if not vin:
+            return vin, "на «%s» в 3X-UI нет входящих VLESS — связать по VLESS можно только с сервером, где есть входящий VLESS Reality" % x["name"]
+        if not any(i["ok"] for i in vin):
+            return vin, "на «%s» нет включённого входящего VLESS Reality по TCP (есть только выключенные или с другим транспортом)" % x["name"]
+        return vin, ""
+
+    def _link_vless(self, job, e, x):
+        cfg, p, email = self.d.cfg, job.params, self._vless_email(e)
+        tag = "VLESS-" + p["tag"]
+        job.plan([("before", "Какие каналы работают сейчас", e["name"]),
+                  ("setup", "Клиент для входа во входящем VLESS Reality", x["name"]),
+                  ("link", "Вход: исходящее %s и место в цепочке 3X-UI" % tag, e["name"]),
+                  ("panel", "Проверка: старые каналы и новый путь", "панель")])
+        job.begin("before")
+        was = self.working_now(job, [(e, c) for c in self.d.channels.get(e["id"], [])])
+        job.end("before", note="работают: %d" % len(was))
+        job.begin("setup")
+        rc, out, err = self.sh(x, "python3 - add %s %s" % (shlex.quote(email), shlex.quote(p.get("port") or "")), stdin=self.VLESS_CLIENT_PY, timeout=90)
+        if rc != 0:
+            raise Stop("на «%s» клиент не завёлся: %s. Вход не трогал." % (x["name"], (err.strip().splitlines() or ["код %s" % rc])[-1][:200]))
+        try:
+            v = json.loads(out.strip().splitlines()[-1])           # секрет (uuid): в журнал не пишется
+        except (ValueError, IndexError):
+            raise Stop("«%s» не вернула параметры клиента. Вход не трогал." % x["name"])
+        job.log("клиент %s %s во входящем «%s» (порт %s)" % (email, "уже был" if v.get("reused") else "добавлен", v.get("remark") or "без имени", v.get("port")))
+        job.end("setup", note="порт %s" % v.get("port"))
+        job.begin("link")
+        try:
+            for f in ("vpn-restore.sh", "vpn-add-exit.sh"):
+                self.put(e, self.scripts / f, "/root/" + f)
+            self.sh(e, "mkdir -p %s && chmod 700 %s" % (REMOTE, REMOTE))
+            self.put(e, json.dumps(v).encode(), "%s/vless.json" % REMOTE, 0o600)
+            env = "export VLESS_ONLY=1 VLESS_FILE=%s/vless.json POSITION=%s\n" % (REMOTE, shlex.quote(p["pos"]))
+            rc = self.detached(job, e, "link-entry", env + "bash /root/vpn-add-exit.sh %s %s\n" % (p["tag"], x["host"]), timeout=600)
+            if rc != 0:
+                if not v.get("reused"):                              # клиента завели зря — убрать
+                    self.sh(x, "python3 - rm %s" % shlex.quote(email), stdin=self.VLESS_CLIENT_PY, timeout=60)
+                    job.log("клиент %s на «%s» убран обратно" % (email, x["name"]))
+                raise Stop("%s: путь не подключился (код %d) — журнал выше. Изменения в 3X-UI скрипт откатывает сам." % (e["name"], rc))
+            job.end("link")
+        finally:
+            try:
+                self.sh(e, "rm -f %s/vless.json" % REMOTE, timeout=30)
+            except Stop:
+                job.log("не удалось удалить %s/vless.json на %s — удалите вручную" % (REMOTE, e["name"]))
+        job.begin("panel")
+        for _ in range(120):
+            if "all" not in self.d.running:
+                break
+            time.sleep(1)
+        self.d.check_all(True)
+        broke = [(s, c) for s, c in was if (self.d.results.get("%s:%s" % (s["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
+        for s, c in broke:
+            job.log("%s → %s %s: работал до, а сейчас нет" % (s["name"], c.get("kind") or "канал", c.get("exit") or ""))
+        t = ((self.d.proto_test(e["id"]) or {}).get("tests") or {}).get(tag) or {}
+        job.log("%s → %s по VLESS: %s" % (e["name"], x["name"], "работает, сайт видит %s" % (t.get("srv") or t.get("ip") or "?") if t.get("ok") else
+                                             "не ответил%s" % (": " + t["err"] if t.get("err") else "")))
+        good = bool(t.get("ok")) and not broke
+        self.d.note("ok" if good else "warn", "Связаны %s → %s по VLESS (%s)" % (e["name"], x["name"], "работает" if good else "нужна проверка"))
+        job.end("panel", "ok" if good else "warn", "новый путь работает" if good else
+                ("перестали работать: %d — журнал выше" % len(broke)) if broke else "новый путь не ответил — журнал выше")
+
+    # ------------------------------------------------------------------ «Настройка»: отвязать
+    PEER_RM_PY = r"""
+import os, re, shutil, subprocess, sys, time
+pub = sys.argv[1]
+conf = "/etc/amnezia/amneziawg/awg0.conf"
+if not os.path.exists(conf):
+    print("RM-SKIP нет awg0 без Docker — клиент на выходе не трогаю"); sys.exit(0)
+lines = open(conf).read().split("\n")
+starts = [i for i, l in enumerate(lines) if re.match(r"\s*\[", l)] + [len(lines)]
+cut = None
+for a, b in zip(starts, starts[1:]):
+    if lines[a].strip().lower() == "[peer]" and any(re.match(r"\s*PublicKey\s*=\s*" + re.escape(pub) + r"\s*$", l) for l in lines[a:b]):
+        s = a
+        while s > 0 and lines[s - 1].strip().startswith("#"):       # имя клиента — комментарий над [Peer]
+            s -= 1
+        e = b
+        while e > a and e < len(lines) and lines[e - 1].strip().startswith("#") and e != len(lines):   # комментарий следующего — не наш
+            e -= 1
+        cut = (s, e)
+        break
+if not cut:
+    print("RM-SKIP такого клиента в awg0 нет — убирать нечего"); sys.exit(0)
+bak = conf + ".before-unlink-" + time.strftime("%Y-%m-%d_%H%M%S")
+shutil.copy2(conf, bak)
+new = lines[:cut[0]] + lines[cut[1]:]
+txt = re.sub(r"\n{3,}", "\n\n", "\n".join(new))
+with open(conf + ".tmp", "w") as f:
+    f.write(txt)
+os.chmod(conf + ".tmp", 0o600)
+os.replace(conf + ".tmp", conf)
+subprocess.run(["awg", "set", "awg0", "peer", pub, "remove"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
+"""
+
+    def _chan(self, eid, xid, proto):
+        kind = self.LINK_KIND.get(proto)
+        return next((c for c in self.d.channels.get(eid, []) if c.get("exit_id") == xid and c.get("kind") == kind), None)
+
+    def unlink_plan(self, eid, xid, proto, tag=""):
+        """Что будет, если отвязать. Ничего не меняет; окончательно «можно ли» скажет скрипт на входе (CHECK=1) первым шагом задачи."""
+        cfg, d = self.d.cfg, self.d
+        e, x = cfg.by_id(eid), cfg.by_id(xid)
+        if not e or not x or proto not in self.LINK_PROTO:
+            return {"ok": False, "errors": ["выберите связь"], "warns": [], "steps": []}
+        if proto == "vless":
+            return self._unlink_plan_vless(e, x, tag)
+        pn, kind = self.LINK_PROTO[proto], "AWG" if proto == "awg" else "Sudoku"
+        errors, warns, steps = [], [], []
+        c = self._chan(eid, xid, proto)
+        if not c:
+            errors.append("связи «%s» → «%s» по %s нет" % (e["name"], x["name"], pn))
+        if not cfg.get_pw(e["id"]):
+            errors.append("нет пароля от «%s»" % e["name"])
+        chain = sorted((ch for ch in d.channels.get(eid, []) if ch.get("n")), key=lambda ch: ch["n"])
+        if c and c.get("n") and len(chain) == 1:
+            errors.append("это единственный путь входа «%s»: без него трафику некуда идти. Сначала свяжите вход с другим выходом" % e["name"])
+        if any(j.kind in ("migrate", "install", "sudoku", "swupdate", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
+            errors.append("уже идёт установка или изменение — дождитесь окончания")
+        if c:
+            nxt = next((ch for ch in chain if ch["n"] == (c.get("n") or 0) + 1), None)
+            where = ("он основной (1-й) — основным станет %s %s" % (nxt.get("kind"), nxt.get("exit") or "") if c.get("n") == 1 and nxt else
+                     "он %d-й в цепочке — соседи сомкнутся" % c["n"] if c.get("n") else "в цепочке его нет")
+            what = "туннель %s выключится (конфиг сохранится с пометкой .removed)" % (c.get("iface") or "wgN") if proto == "awg" else \
+                   "прокси до Sudoku и локальный SOCKS %s уберутся из Mihomo (старый конфиг сохранится)" % (c.get("port") or "")
+            steps.append({"srv": e["name"], "text": "проверка, что путь можно убрать: он не используется в обходах «Сайтов и обходов», DC5TG и прямых правилах"})
+            steps.append({"srv": e["name"], "text": "из 3X-UI уберутся исходящее %s и его звено цепочки: %s. Перед изменением — копия базы 3X-UI; "
+                          "x-ui перезапустится (VPN прервётся на 5–10 секунд); не поднимется Xray — база вернётся. Потом %s"
+                          % (c.get("tag") or kind + "-…", where, what)})
+            if proto == "awg":
+                if cfg.get_pw(x["id"]):
+                    steps.append({"srv": x["name"], "text": "из awg0 уберётся клиент этого входа (копия конфига сохранится). Остальные клиенты и сам AmneziaWG остаются"})
+                else:
+                    warns.append("нет пароля от «%s» — клиент этого входа останется в awg0 на выходе (он безвреден, но лишний)" % x["name"])
+            else:
+                steps.append({"srv": x["name"], "text": "ничего: сервер Sudoku остаётся — им могут пользоваться другие входы"})
+            steps.append({"srv": "панель", "text": "проверка: остальные каналы входа работают как до"})
+        return {"ok": not errors, "errors": errors, "warns": warns, "steps": steps, "proto": pn, "entry": e["name"], "exit": x["name"]}
+
+    def start_unlink(self, eid, xid, proto, tag=""):
+        plan = self.unlink_plan(eid, xid, proto, tag)
+        if not plan["ok"]:
+            raise ValueError("; ".join(plan["errors"]))
+        e, x = self.d.cfg.by_id(eid), self.d.cfg.by_id(xid)
+        if proto == "vless":
+            job = Job(self, "unlink", {"sid": xid, "eid": eid, "name": "%s → %s" % (e["name"], x["name"]), "proto": proto, "kind": "VLESS", "sel": tag[6:]})
+            self.jobs[job.id] = job
+            return self._spawn(job, self._unlink, None)
+        c = self._chan(eid, xid, proto)
+        kind = "AWG" if proto == "awg" else "Sudoku"
+        tag = c.get("tag") or ""
+        sel = tag.split("-", 1)[1] if tag.startswith(kind + "-") else "@" + str(c.get("iface") if proto == "awg" else c.get("port"))
+        if not re.match(r"^([A-Za-z][A-Za-z0-9_-]{0,39}|@wg\d{1,3}|@\d{2,5})$", sel):
+            raise ValueError("не понял, какой это путь на входе")
+        job = Job(self, "unlink", {"sid": xid, "eid": eid, "name": "%s → %s" % (e["name"], x["name"]), "proto": proto, "kind": kind, "sel": sel})
+        self.jobs[job.id] = job
+        return self._spawn(job, self._unlink, None)
+
+    def _unlink(self, job, _password):
+        cfg, p = self.d.cfg, job.params
+        e, x = cfg.by_id(p["eid"]), cfg.by_id(p["sid"])
+        if not e or not x:
+            raise Stop("сервера больше нет в панели")
+        pn = self.LINK_PROTO[p["proto"]]
+        job.plan([("before", "Какие каналы работают сейчас", e["name"]),
+                  ("check", "Можно ли убрать этот путь", e["name"]),
+                  ("entry", "Вход: убрать звено цепочки и исходящее%s" % {"awg": ", туннель", "sudoku": ", прокси Mihomo"}.get(p["proto"], ""), e["name"]),
+                  ("exit", "Выход: убрать клиента этого входа" if p["proto"] in ("awg", "vless") else "Выход: ничего не меняется", x["name"]),
+                  ("panel", "Проверка: остальные каналы", "панель")])
+        job.begin("before")
+        c0 = self._chan(e["id"], x["id"], p["proto"])
+        was = [(s, c) for s, c in self.working_now(job, [(e, c) for c in self.d.channels.get(e["id"], [])]) if not c0 or c["key"] != c0["key"]]
+        job.end("before", note="работают: %d" % len(was))
+
+        job.begin("check")
+        for f in ("vpn-restore.sh", "vpn-add-exit.sh", "vpn-unlink.sh"):
+            self.put(e, self.scripts / f, "/root/" + f)
+        rc = self.detached(job, e, "unlink-check", "CHECK=1 bash /root/vpn-unlink.sh %s %s\n" % (p["kind"], shlex.quote(p["sel"])), timeout=120)
+        if rc != 0:
+            raise Stop("этот путь сейчас убрать нельзя — причина в журнале выше. Ничего не менял.")
+        job.end("check")
+
+        job.begin("entry")
+        n0 = len(job.lines)
+        rc = self.detached(job, e, "unlink", "bash /root/vpn-unlink.sh %s %s\n" % (p["kind"], shlex.quote(p["sel"])), timeout=600)
+        if rc != 0:
+            raise Stop("на входе не получилось — журнал выше. Изменения в 3X-UI скрипт откатывает сам.")
+        job.end("entry")
+
+        job.begin("exit")
+        pub = next((l.split("=", 1)[1].strip() for l in reversed(job.lines[n0:]) if l.startswith("UNLINK-PEER=")), "")
+        if p["proto"] == "vless":
+            if not cfg.get_pw(x["id"]):
+                job.end("exit", "warn", "нет пароля от «%s» — клиент %s там остался (без пути он не нужен, уберите в 3X-UI)" % (x["name"], self._vless_email(e)))
+            else:
+                rc, o, err = self.sh(x, "python3 - rm %s" % shlex.quote(self._vless_email(e)), stdin=self.VLESS_CLIENT_PY, timeout=90)
+                msg = (o.strip().splitlines() or [(err.strip().splitlines() or ["?"])[-1]])[-1]
+                job.log(msg)
+                job.end("exit", "ok" if msg.startswith(("RM-OK", "RM-SKIP")) else "warn", msg.split(" ", 1)[-1][:160])
+        elif p["proto"] != "awg":
+            job.end("exit", note="Sudoku остаётся")
+        elif not pub or not re.match(r"^[A-Za-z0-9+/]{42,44}=?$", pub):
+            job.end("exit", "warn", "не узнал ключ туннеля — клиент на выходе остался (безвреден)")
+        elif not cfg.get_pw(x["id"]):
+            job.end("exit", "warn", "нет пароля от выхода — клиент на выходе остался (безвреден)")
+        else:
+            rc, o, err = self.sh(x, "python3 - %s" % shlex.quote(pub), stdin=self.PEER_RM_PY, timeout=60)
+            msg = (o.strip().splitlines() or [err.strip() or "?"])[-1]
+            job.log(msg)
+            job.end("exit", "ok" if msg.startswith("RM-OK") else "warn", msg.split(" ", 1)[-1])
+
+        job.begin("panel")
+        self.d.check_server(e["id"])
+        for _ in range(120):
+            if "all" not in self.d.running:
+                break
+            time.sleep(1)
+        self.d.check_all(True)
+        broke = [(s, c) for s, c in was if (self.d.results.get("%s:%s" % (s["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
+        for s, c in broke:
+            job.log("%s → %s %s: работал до, а сейчас нет" % (s["name"], c.get("kind") or "канал", c.get("exit") or ""))
+        self.d.note("ok" if not broke else "warn", "Отвязано: %s → %s по %s" % (e["name"], x["name"], pn))
+        job.end("panel", "ok" if not broke else "warn", "остальные каналы работают" if not broke else "перестали работать: %d — журнал выше" % len(broke))
+
+    def reorder_plan(self, eid, order):
+        """Новый порядок основной цепочки входа. Ничего не меняет; окончательно «можно ли» скажет скрипт (CHECK=1)."""
+        cfg, d = self.d.cfg, self.d
+        e = cfg.by_id(eid)
+        if not e or e["role"] != "entry":
+            return {"ok": False, "errors": ["выберите вход"], "warns": [], "steps": []}
+        chain = sorted((c for c in d.channels.get(eid, []) if c.get("n") and c.get("tag")), key=lambda c: c["n"])
+        cur = [c["tag"] for c in chain]
+        order = [str(t) for t in order or []]
+        errors, warns, steps = [], [], []
+        if not cfg.get_pw(eid):
+            errors.append("нет пароля от «%s»" % e["name"])
+        if sorted(order) != sorted(cur) or len(order) < 2:
+            errors.append("список звеньев не совпадает с нынешней цепочкой — обновите схему")
+        elif order == cur:
+            errors.append("порядок не изменился")
+        if any(not re.match(r"^[A-Za-z0-9_.@:+-]{1,60}$", t) for t in order):
+            errors.append("непонятное имя звена")
+        if any(j.kind in ("migrate", "install", "sudoku", "swupdate", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
+            errors.append("уже идёт установка или изменение — дождитесь окончания")
+        by = {c["tag"]: c for c in chain}
+        name = lambda t: "%s %s" % (by[t].get("kind") or "", by[t].get("exit") or t) if t in by else t
+        if not errors:
+            first = order[0]
+            st = (d.results.get("%s:%s" % (eid, by[first].get("key"))) or {}).get("status")
+            if st not in ("ok", "warn"):
+                warns.append("новое первое звено (%s) сейчас %s — трафик сразу уйдёт на следующее за ним" % (name(first), "не работает" if st else "не проверялось"))
+            steps.append({"srv": e["name"], "text": "проверка, что порядок можно поменять: на середину цепочки не ведут свои правила"})
+            steps.append({"srv": e["name"], "text": "цепочка станет: %s (было: %s). Те же звенья, меняется только кто за кем; DC5TG и обходы не трогаются. "
+                          "Перед изменением — копия базы 3X-UI; x-ui перезапустится (VPN прервётся на 5–10 секунд); не поднимется Xray — база вернётся"
+                          % (" → ".join(name(t) for t in order), " → ".join(name(t) for t in cur))})
+            steps.append({"srv": "панель", "text": "проверка: каналы, что работали до, работают и после"})
+        return {"ok": not errors, "errors": errors, "warns": warns, "steps": steps, "entry": e["name"]}
+
+    def start_reorder(self, eid, order):
+        plan = self.reorder_plan(eid, order)
+        if not plan["ok"]:
+            raise ValueError("; ".join(plan["errors"]))
+        e = self.d.cfg.by_id(eid)
+        job = Job(self, "reorder", {"sid": eid, "eid": eid, "name": e["name"], "order": ",".join(order)})
+        self.jobs[job.id] = job
+        return self._spawn(job, self._reorder, None)
+
+    def _reorder(self, job, _password):
+        cfg, p = self.d.cfg, job.params
+        e = cfg.by_id(p["eid"])
+        if not e:
+            raise Stop("сервера больше нет в панели")
+        job.plan([("before", "Какие каналы работают сейчас", e["name"]),
+                  ("check", "Можно ли поменять порядок", e["name"]),
+                  ("entry", "Новый порядок цепочки в 3X-UI", e["name"]),
+                  ("panel", "Проверка: каналы работают как до", "панель")])
+        job.begin("before")
+        was = self.working_now(job, [(e, c) for c in self.d.channels.get(e["id"], [])])
+        job.end("before", note="работают: %d" % len(was))
+        job.begin("check")
+        for f in ("vpn-restore.sh", "vpn-add-exit.sh", "vpn-reorder.sh"):
+            self.put(e, self.scripts / f, "/root/" + f)
+        rc = self.detached(job, e, "reorder-check", "CHECK=1 bash /root/vpn-reorder.sh %s\n" % shlex.quote(p["order"]), timeout=120)
+        if rc != 0:
+            raise Stop("порядок сейчас поменять нельзя — причина в журнале выше. Ничего не менял.")
+        job.end("check")
+        job.begin("entry")
+        rc = self.detached(job, e, "reorder", "bash /root/vpn-reorder.sh %s\n" % shlex.quote(p["order"]), timeout=600)
+        if rc != 0:
+            raise Stop("на входе не получилось — журнал выше. Базу 3X-UI скрипт возвращает сам.")
+        job.end("entry")
+        job.begin("panel")
+        for _ in range(120):
+            if "all" not in self.d.running:
+                break
+            time.sleep(1)
+        self.d.check_all(True)
+        broke = [(s, c) for s, c in was if (self.d.results.get("%s:%s" % (s["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
+        for s, c in broke:
+            job.log("%s → %s %s: работал до, а сейчас нет" % (s["name"], c.get("kind") or "канал", c.get("exit") or ""))
+        self.d.note("ok" if not broke else "warn", "Новый порядок цепочки: %s" % e["name"])
+        job.end("panel", "ok" if not broke else "warn", "каналы работают" if not broke else "перестали работать: %d — журнал выше" % len(broke))
+
+    def _unlink_plan_vless(self, e, x, tag):
+        errors, warns, steps = [], [], []
+        if not re.match(r"^VLESS-[A-Za-z][A-Za-z0-9]{0,19}$", tag or ""):
+            errors.append("этот путь VLESS заведён не панелью — убрать его можно в 3X-UI на «%s»" % e["name"])
+        if not self.d.cfg.get_pw(e["id"]):
+            errors.append("нет пароля от «%s»" % e["name"])
+        if any(j.kind in ("migrate", "install", "sudoku", "swupdate", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
+            errors.append("уже идёт установка или изменение — дождитесь окончания")
+        if not errors:
+            steps.append({"srv": e["name"], "text": "проверка, что путь можно убрать: он не используется в обходах, DC5TG и прямых правилах и он не единственный в цепочке"})
+            steps.append({"srv": e["name"], "text": "из 3X-UI уберутся исходящее %s и его звено цепочки — соседи сомкнутся. Перед изменением — копия базы 3X-UI; "
+                          "x-ui перезапустится (VPN прервётся на 5–10 секунд); не поднимется Xray — база вернётся" % tag})
+            if self.d.cfg.get_pw(x["id"]):
+                steps.append({"srv": x["name"], "text": "из входящего VLESS уберётся клиент %s — через API 3X-UI, без перезапуска; остальные клиенты не трогаются" % self._vless_email(e)})
+            else:
+                warns.append("нет пароля от «%s» — клиент %s там останется" % (x["name"], self._vless_email(e)))
+            steps.append({"srv": "панель", "text": "проверка: остальные каналы входа работают как до"})
+        return {"ok": not errors, "errors": errors, "warns": warns, "steps": steps, "proto": "VLESS", "entry": e["name"], "exit": x["name"]}
+
+    def start_sudoku_direct(self, srv):
+        """Выход: Sudoku внутри sudoku-sing-box → обычный sudoku (как у остальных выходов). Одна задача за раз."""
+        if any(j.kind in ("migrate", "install", "sudoku", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
+            raise ValueError("уже идёт установка или перевод выхода — дождитесь окончания")
+        job = Job(self, "sudoku", {"sid": srv["id"], "name": srv["name"]})
+        self.jobs[job.id] = job
+        return self._spawn(job, self._sudoku_direct, None)
+
+    def _sudoku_direct(self, job, _password):
+        cfg = self.d.cfg
+        srv = cfg.by_id(job.params["sid"])
+        if not srv or srv["role"] != "exit":
+            raise Stop("выхода больше нет в панели")
+        if not cfg.get_pw(srv["id"]):
+            raise Stop("нет пароля от %s" % srv["name"])
+        sd = (((self.d.status.get(srv["id"]) or {}).get("data") or {}).get("exit") or {}).get("sudoku") or {}
+        if sd.get("unit") != "sudoku-sing-box":
+            raise Stop("на %s Sudoku и так обычный — переводить нечего" % srv["name"])
+        chans = [(e, c) for e in cfg.servers if e["role"] == "entry" and cfg.get_pw(e["id"])
+                 for c in self.d.channels.get(e["id"], []) if c.get("exit_id") == srv["id"] and c.get("kind") == "Sudoku"]
+        job.plan([("switch", "Свежий sudoku с GitHub, проверка конфига, sing-box → sudoku (ключ, порт и заглушка те же)", srv["name"]),
+                  ("check", "Канал Sudoku → %s со всех входов" % srv["name"], ", ".join(sorted({e["name"] for e, _ in chans})) or "—"),
+                  ("finish", "sudoku — в автозапуск, sudoku-sing-box — из автозапуска", srv["name"])])
+        script = "/root/vpn-sudoku-direct.sh"
+        self.put(srv, self.scripts / "vpn-sudoku-direct.sh", script)
+
+        job.begin("switch")
+        was = self.working_now(job, chans)   # каналы, что работают до переключения, — после него должны работать они же
+        if chans and not was:
+            raise Stop("Sudoku до %s и сейчас не работает ни с одного входа — сначала разберёмся с этим, ничего не менял" % srv["name"])
+        chans = was
+        rc, out, err = self.sh(srv, "bash %s switch 2>&1" % script, timeout=300)
+        for line in (out + err).strip().splitlines():
+            job.log(line)
+        if rc != 0:
+            raise Stop("переключение не прошло — sudoku-sing-box работает как раньше (журнал выше)")
+        job.end("switch")
+
+        job.begin("check")
+        bad = []
+        for e, c in chans:
+            for attempt in range(3):       # входам нужно пару секунд, чтобы Mihomo переподключился
+                self.d.check_channel(e["id"], c["key"])
+                r = self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}
+                if r.get("status") in ("ok", "warn"):
+                    job.log("%s → Sudoku %s: работает (%.2f с)" % (e["name"], srv["name"], r.get("ms") or 0))
+                    break
+                time.sleep(4)
+            else:
+                bad.append(e["name"])
+                job.log("%s → Sudoku %s: %s" % (e["name"], srv["name"], r.get("error") or "нет ответа"))
+        if bad:
+            rc, out, err = self.sh(srv, "bash %s rollback 2>&1" % script, timeout=120)
+            for line in (out + err).strip().splitlines():
+                job.log(line)
+            for e, c in chans:
+                self.d.check_channel(e["id"], c["key"])
+            raise Stop("через обычный sudoku не заработал канал с %s — вернул sudoku-sing-box%s" % (
+                ", ".join(bad), "" if rc == 0 else " (но возврат сообщил об ошибке — журнал выше)"))
+        job.end("check", note="%d из %d" % (len(chans), len(chans)) if chans else "нет входов с этим каналом")
+
+        job.begin("finish")
+        rc, out, err = self.sh(srv, "bash %s finish 2>&1; rm -f %s" % (script, script), timeout=120)
+        for line in (out + err).strip().splitlines():
+            job.log(line)
+        job.end("finish", "ok" if rc == 0 else "warn")
+        self.d.note("ok", "%s: Sudoku теперь обычный, без sudoku-sing-box (каналы со входов в норме)" % srv["name"])
+        self.d.check_server(srv["id"])
+
+    def start_sw_update(self, srv, what):
+        """Обновить Sudoku (выход) или Mihomo (вход) до последней версии с GitHub. Одна задача за раз."""
+        if what not in ("sudoku", "mihomo"):
+            raise ValueError("что обновить?")
+        if any(j.kind in ("migrate", "install", "sudoku", "swupdate", "sudokubk", "link", "unlink", "reorder") and j.status == "run" for j in self.jobs.values()):
+            raise ValueError("уже идёт установка или обновление — дождитесь окончания")
+        if not (self.d.sw_latest.get(what) or {}).get("tag"):
+            raise ValueError("панель ещё не узнала последнюю версию с GitHub — попробуйте через минуту")
+        job = Job(self, "swupdate", {"sid": srv["id"], "name": srv["name"], "what": what})
+        self.jobs[job.id] = job
+        return self._spawn(job, self._sw_update, None)
+
+    def _sw_update(self, job, _password):
+        cfg, what = self.d.cfg, job.params["what"]
+        srv = cfg.by_id(job.params["sid"])
+        if not srv:
+            raise Stop("сервера больше нет в панели")
+        if not cfg.get_pw(srv["id"]):
+            raise Stop("нет пароля от %s" % srv["name"])
+        data = (self.d.status.get(srv["id"]) or {}).get("data") or {}
+        sw = (data.get("sw") or {}).get(what) or {}
+        arch = (((data.get("system") or {}).get("hw") or {}).get("arch") or "x86_64")
+        a = "arm64" if arch in ("aarch64", "arm64") else "amd64"
+        lt = self.d.sw_latest.get(what) or {}
+        tag, assets = lt.get("tag") or "", lt.get("assets") or {}
+        if not re.match(r"^v?\d+(\.\d+)*(-\d+)?$", tag):     # v0.5.2.0, v1.19.33, и «исправленный» v0.5.2-1
+            raise Stop("странная версия на GitHub: %r" % tag)
+        if what == "sudoku":
+            if srv["role"] != "exit" or (((data.get("exit") or {}).get("sudoku") or {}).get("unit")) != "sudoku":
+                raise Stop("на %s нет обычного Sudoku" % srv["name"])
+            name = "sudoku-linux-%s.tar.gz" % a
+            url = assets.get(name) or "https://github.com/SUDOKU-ASCII/sudoku/releases/download/%s/%s" % (tag, name)
+            chans = [(e, c) for e in cfg.servers if e["role"] == "entry" and cfg.get_pw(e["id"])
+                     for c in self.d.channels.get(e["id"], []) if c.get("exit_id") == srv["id"] and c.get("kind") == "Sudoku"]
+            run = "bash /root/vpn-sw-update.sh sudoku %s %s 2>&1" % (shlex.quote(url), shlex.quote(tag))
+            back = "bash /root/vpn-sw-update.sh sudoku-rollback 2>&1"
+            title, where = "Sudoku %s → %s" % ((sw.get("ver") or "?").lstrip("v"), tag.lstrip("v")), "Канал Sudoku → %s со всех входов" % srv["name"]
+        else:
+            if srv["role"] != "entry":
+                raise Stop("Mihomo стоит только на входах")
+            pref = ["mihomo-linux-arm64-%s.gz" % tag] if a == "arm64" else \
+                   ["mihomo-linux-amd64-compatible-%s.gz" % tag, "mihomo-linux-amd64-%s.gz" % tag]
+            url = next((assets[n] for n in pref if n in assets), None)
+            if not url:
+                raise Stop("в релизе %s нет файла %s" % (tag, pref[0]))
+            binp = sw.get("bin") or "/usr/local/bin/mihomo"
+            if not re.match(r"^/[\w./-]+$", binp):
+                raise Stop("странный путь к mihomo: %r" % binp)
+            chans = [(srv, c) for c in self.d.channels.get(srv["id"], []) if c.get("kind") == "Sudoku"]
+            run = "bash /root/vpn-sw-update.sh mihomo %s %s 2>&1" % (shlex.quote(url), binp)
+            back = "bash /root/vpn-sw-update.sh mihomo-rollback %s 2>&1" % binp
+            title, where = "Mihomo %s → %s" % ((sw.get("ver") or "?").lstrip("v"), tag.lstrip("v")), "Каналы Sudoku с %s" % srv["name"]
+        job.plan([("update", title + " (конфиг не меняется)", srv["name"]),
+                  ("check", where, ", ".join(sorted({e["name"] for e, _ in chans})) or "—")])
+        self.put(srv, self.scripts / "vpn-sw-update.sh", "/root/vpn-sw-update.sh")
+
+        job.begin("update")
+        was = self.working_now(job, chans)   # что работало до обновления — то же должно работать после
+        if chans and not was:
+            raise Stop("каналы Sudoku и сейчас не работают — сначала разберёмся с этим, ничего не менял")
+        rc, out, err = self.sh(srv, run, timeout=420)
+        for line in (out + err).strip().splitlines():
+            job.log(line)
+        if rc != 0:
+            raise Stop("обновление не прошло — работает прежняя версия (журнал выше)")
+        job.end("update", note=tag)
+
+        job.begin("check")
+        bad = []
+        for e, c in was:
+            for _ in range(3):
+                self.d.check_channel(e["id"], c["key"])
+                r = self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}
+                if r.get("status") in ("ok", "warn"):
+                    job.log("%s → %s %s: работает (%.2f с)" % (e["name"], c["kind"], c.get("exit"), r.get("ms") or 0))
+                    break
+                time.sleep(4)
+            else:
+                bad.append("%s → %s" % (e["name"], c.get("exit")))
+        if bad:
+            rc, out, err = self.sh(srv, back, timeout=120)
+            for line in (out + err).strip().splitlines():
+                job.log(line)
+            for e, c in was:
+                self.d.check_channel(e["id"], c["key"])
+            raise Stop("после обновления не заработало: %s — вернул прежнюю версию" % ", ".join(bad))
+        job.end("check", note="%d из %d" % (len(was), len(was)) if was else "нечего проверять")
+        self.sh(srv, "rm -f /root/vpn-sw-update.sh", timeout=30)
+        self.d.note("ok", "%s: %s обновлён до %s, каналы в норме" % (srv["name"], "Sudoku" if what == "sudoku" else "Mihomo", tag))
+        self.d.check_server(srv["id"])
+
+    # ------------------------------------------------------------ zapret2 на входе (раздел «Zapret»)
     def start_zapret(self, srv, action, tid=None, strat=None):
         """install / check (подбор для цели) / apply (включить цель с выбранной стратегией) / disable (выключить цель) /
         off (выключить zapret целиком) / remove. Одна задача на вход."""
@@ -714,6 +1613,19 @@ class Provisioner:
             return self.d.ssh.run(srv, cmd, stdin=stdin, timeout=timeout)
         except self.h["CheckError"] as e:
             raise Stop("%s: %s" % (srv.get("name") or srv["host"], e))
+
+    def working_now(self, job, chans):
+        """Проверить каналы [(вход, канал)] сейчас и вернуть те, что работают; про остальные — строка в журнал."""
+        was = []
+        for e, c in chans:
+            self.d.check_channel(e["id"], c["key"])
+            r = self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}
+            if r.get("status") in ("ok", "warn"):
+                was.append((e, c))
+            else:
+                job.log("%s → %s %s уже сейчас не работает (%s) — по нему результат не проверяю" % (
+                    e["name"], c.get("kind") or "канал", c.get("exit") or "", r.get("error") or "нет ответа"))
+        return was
 
     def put(self, srv, local_or_bytes, remote, mode=0o700):
         c = self.d.ssh.client(srv)
@@ -1062,7 +1974,8 @@ class Provisioner:
             job.end(key, "ok" if dm and um and not stall else "warn", "%s → %s %s, %s → %s %s%s" % (
                 b["name"], an, f(link["down"]), an, b["name"], f(link["up"]),
                 ": обычный поток TCP в эту сторону завис — так бывает, когда ТСПУ режет TCP до зарубежных хостеров. "
-                "Канала AWG это обычно не касается: он идёт по UDP — проверьте скорость в «Связи» после установки" if stall else ""))
+                "Каналов это обычно не касается: AWG идёт по UDP, а Sudoku маскирует трафик — проверьте скорость в «Связи» "
+                "после установки" if stall else ""))
 
     # ------------------------------------------------------------ установка выхода
     def _install(self, job, password):
@@ -1090,10 +2003,10 @@ class Provisioner:
             raise Stop("сервер с адресом %s уже есть в панели" % p["host"])
         srv = self.new_srv(job, password)
         steps = first_steps(comps, name)
-        steps.append(("setup", "AmneziaWG" + (", fail2ban" if comps.get("f2b", True) else "") + " — сборка модуля ядра 5–10 мин", name))
+        steps.append(("setup", "AmneziaWG, Sudoku" + (", fail2ban" if comps.get("f2b", True) else "") + " — сборка модуля ядра 5–10 мин", name))
         for e in entries:
-            steps.append(("link-" + e["id"], ("Замена «%s» → «%s»: туннель, цепочки 3X-UI, старый убирается" % (old["name"], name))
-                          if old else "Подключение выхода: туннель и цепочка в 3X-UI", e["name"]))
+            steps.append(("link-" + e["id"], ("Замена «%s» → «%s»: туннель, Sudoku, цепочки 3X-UI, старый убирается" % (old["name"], name))
+                          if old else "Подключение выхода: туннель, Sudoku, цепочка в 3X-UI", e["name"]))
         if p.get("dc5") and entries:
             steps.append(("dc5", "Цепочка Telegram DC5: добавить AWG-" + tag, ", ".join(e["name"] for e in entries)))
         steps += [("panel", "Добавление в панель и проверка каналов", "панель")]
@@ -1112,9 +2025,9 @@ class Provisioner:
         rc = self.detached(job, srv, "setup", "%s bash /root/vpn-exit-setup.sh\n" % " ".join(env), timeout=3600)
         if rc != 0:
             raise Stop("установка выхода не прошла (код %d) — журнал выше. Повторный запуск пропустит уже сделанное." % rc)
-        rc, out, _ = self.sh(srv, "awg show awg0 listen-port; awg show awg0 public-key")
-        vals = (out.split() + ["", ""])[:2]
-        job.result.update({"awg_port": vals[0], "awg_pub": vals[1]})
+        rc, out, _ = self.sh(srv, "awg show awg0 listen-port; awg show awg0 public-key; jq -r .local_port /etc/sudoku/config.json 2>/dev/null")
+        vals = (out.split() + ["", "", ""])[:3]
+        job.result.update({"awg_port": vals[0], "awg_pub": vals[1], "sudoku_port": vals[2]})
         job.end("setup")
 
         # пароль выхода нужен входам на время подключения (скрипт ходит с входа на выход по SSH)
@@ -1137,11 +2050,13 @@ class Provisioner:
                                    % (REMOTE, shlex.quote(pos), (" REPLACE=" + old["host"]) if old else "", tag, p["host"]), timeout=1200)
                 if rc != 0:
                     raise Stop("%s: подключение выхода не прошло (код %d) — журнал выше. Изменения в 3X-UI скрипт откатывает сам." % (e["name"], rc))
-                rc, out, _ = self.sh(e, "grep -l 'Endpoint *= *%s:' /etc/amnezia/amneziawg/wg*.conf 2>/dev/null | head -n1 | xargs -r basename | sed 's/.conf$//'"
-                                     % re.escape(p["host"]))
-                iface = (out.split() + ["?"])[0]
-                linked.append({"entry": e["name"], "iface": iface})
-                job.end(key, note=iface)
+                rc, out, _ = self.sh(e, "grep -l 'Endpoint *= *%s:' /etc/amnezia/amneziawg/wg*.conf 2>/dev/null | head -n1 | xargs -r basename | sed 's/.conf$//'; "
+                                        "python3 -c \"import yaml;c=yaml.safe_load(open('/etc/mihomo/config.yaml'));"
+                                        "print(next((l['port'] for l in c.get('listeners') or [] if l.get('name')=='socks-%s'),''))\""
+                                     % (re.escape(p["host"]), tag.lower()))
+                iface, sport = (out.split() + ["?", "?"])[:2]
+                linked.append({"entry": e["name"], "iface": iface, "socks": sport})
+                job.end(key, note="%s, SOCKS %s" % (iface, sport))
         finally:
             for e in entries:
                 try:
@@ -1163,6 +2078,8 @@ class Provisioner:
         sid = self.unique_id(latin(tag).lower()[:12])
         new = {"id": sid, "name": name, "host": p["host"], "port": int(p.get("port") or 22), "user": p.get("user") or "root",
                "role": "exit", "provider": p.get("provider") or "", "note": "", "cc": (p.get("cc") or "")[:3].upper()}
+        if p.get("group"):           # отдельная связка (вход «с нуля» и его выходы) — не ваш каскад
+            new["group"] = str(p["group"])[:40]
         with self.d.lock:
             ids = [x["id"] for x in cfg.data["servers"]]
             at = ids.index(old["id"]) if old and old["id"] in ids else len(ids)   # на место старого в списке
@@ -1192,11 +2109,12 @@ class Provisioner:
         job.result["post"] = post
         if post and all(x["n"] and not x["ok"] for x in post):
             lg = "\n".join(job.lines)
-            ap = re.findall(r"AWG: UDP (\d+)", lg)
-            job.result["awg_port"] = (ap or [""])[-1]
-            job.log("! ни один вход не достучался до нового выхода по порту AWG, хотя SSH открывается. "
-                    "Чаще всего это фаервол в панели хостера (Network/Firewall): откройте там UDP %s "
-                    "(или все входящие) — каналы оживут сами, переустанавливать не нужно" % (job.result.get("awg_port") or "порт AWG"))
+            ap, sp = re.findall(r"AWG: UDP (\d+)", lg), re.findall(r"Sudoku: TCP (\d+)", lg)
+            job.result["awg_port"], job.result["sudoku_port"] = (ap or [""])[-1], (sp or [""])[-1]
+            job.log("! ни один вход не достучался до нового выхода по портам AWG и Sudoku, хотя SSH открывается. "
+                    "Чаще всего это фаервол в панели хостера (Network/Firewall): откройте там UDP %s и TCP %s "
+                    "(или все входящие) — каналы оживут сами, переустанавливать не нужно" % (
+                        job.result.get("awg_port") or "порт AWG", job.result.get("sudoku_port") or "порт Sudoku"))
         job.end("panel")
 
     def _prepare(self, job, srv, comps):
@@ -1227,8 +2145,10 @@ class Provisioner:
             job.end("opt", "ok" if rc == 0 else "warn", "" if rc == 0 else "не всё получилось — журнал выше, на установку не влияет")
 
     def _install_entry(self, job, password):
-        """Новый вход — копия образца из бэкапа (как резервный вход): vpn-restore.sh на новом сервере."""
+        """Новый вход — копия образца из бэкапа выбранного действующего входа: vpn-restore.sh на новом сервере."""
         p = job.params
+        if (p.get("source") or {}).get("kind") == "fresh":
+            return self._install_entry_fresh(job, password)
         cfg, tag, name = self.d.cfg, p["tag"], p["name"]
         if not TAG_RE.match(tag):
             raise Stop("имя латиницей: буквы и цифры, начинается с буквы, до 20 символов")
@@ -1241,7 +2161,7 @@ class Provisioner:
         steps = first_steps(comps, name)
         src_srv = cfg.by_id(src.get("id") or "") if src.get("kind") == "server" else None
         steps += [("backup", "Свежий бэкап образца" if src_srv else "Бэкап из файла", src_srv["name"] if src_srv else "панель"),
-                  ("restore", "Установка из бэкапа: AmneziaWG, клиенты на выходах, 3X-UI, fail2ban", name),
+                  ("restore", "Установка из бэкапа: AmneziaWG, клиенты на выходах, Mihomo, 3X-UI, fail2ban", name),
                   ("panel", "Добавление в панель и проверка каналов", "панель")]
         job.plan(steps)
         self._prepare(job, srv, comps)
@@ -1339,6 +2259,98 @@ class Provisioner:
         job.log("%s: каналы до выходов — в норме %d из %d" % (name, okn, len(res)))
         job.end("panel")
 
+    def _install_entry_fresh(self, job, password):
+        """Новый вход «с нуля» — отдельная связка: свои ключи, клиенты, учётная запись 3X-UI (vpn-entry-new.sh).
+        Выходы к нему подключаются потом мастером «Выход» с галочкой только у этого входа."""
+        p = job.params
+        cfg, tag, name = self.d.cfg, p["tag"], p["name"]
+        if not TAG_RE.match(tag):
+            raise Stop("имя латиницей: буквы и цифры, начинается с буквы, до 20 символов")
+        if cfg.by_host(p["host"]):
+            raise Stop("сервер с адресом %s уже есть в панели" % p["host"])
+        mask = (p.get("mask") or "").strip().lower()
+        clients = ",".join(x.strip() for x in (p.get("clients") or "").split(",") if x.strip())
+        if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", mask):
+            raise Stop("сайт маскировки — домен, например www.example.ru")
+        if not re.match(r"^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$", clients):
+            raise Stop("имена клиентов: латиница, цифры, - и _, через запятую")
+        comps = p.get("comps") or {}
+        srv = self.new_srv(job, password)
+        steps = first_steps(comps, name)
+        steps += [("setup", "AmneziaWG, Mihomo, 3X-UI со своим входом VLESS Reality и подпиской, fail2ban", name),
+                  ("panel", "Добавление в панель", "панель")]
+        job.plan(steps)
+        # версии — как на ваших входах (с ними всё проверено); Mihomo — свежий релиз с GitHub
+        main = next((s for s in cfg.servers if s["role"] == "entry" and not s.get("group")), None)
+        xui = ((((self.d.status.get(main["id"]) if main else None) or {}).get("data") or {}).get("entry") or {}).get("xui") or {}
+        if not (self.d.sw_latest.get("mihomo") or {}).get("assets"):
+            try:
+                self.d.fetch_sw_latest()
+            except Exception as e:  # noqa: BLE001
+                job.log("не удалось узнать свежий Mihomo на GitHub: %s" % e)
+        lt = self.d.sw_latest.get("mihomo") or {}
+        tagm, assets = lt.get("tag") or "", lt.get("assets") or {}
+        murl = next((assets[n] for n in ("mihomo-linux-amd64-compatible-%s.gz" % tagm, "mihomo-linux-amd64-%s.gz" % tagm) if n in assets), "")
+        if not murl:
+            raise Stop("не удалось найти Mihomo на GitHub (MetaCubeX) — проверьте интернет на этом компьютере и повторите")
+        self._prepare(job, srv, comps)
+
+        job.begin("setup")
+        for f in ("vpn-entry-new.sh", "vpn-restore.sh", "vpn-awg-common.sh", "vpn-backup.sh"):
+            self.put(srv, self.scripts / f, "/root/" + f)
+        env = {"MASK": mask, "CLIENTS": clients, "VLESS_PORT": str(int(p.get("vless_port") or 443)), "MIHOMO_URL": murl,
+               "XUI_VERSION": xui.get("version") or "", "XRAY_VERSION": xui.get("xray") or "",
+               "XUI_SSL_MODE": "ip", "XUI_SERVER_IP": p["host"], "RESULT": REMOTE + "/entry-result.json"}
+        if STAND:
+            env["VPN_DASH_STAND"] = "1"
+        rc = self.detached(job, srv, "setup", "".join("export %s=%s\n" % (k, shlex.quote(v)) for k, v in env.items())
+                           + "bash /root/vpn-entry-new.sh\n", timeout=3600)
+        res = {}
+        try:
+            _, out, _ = self.sh(srv, "cat %s/entry-result.json 2>/dev/null; rm -f %s/entry-result.json" % (REMOTE, REMOTE), timeout=30)
+            res = json.loads(out.strip() or "{}")
+        except (Stop, ValueError):
+            res = {}
+        if rc != 0:
+            raise Stop("установка входа не прошла (код %d) — журнал выше. Повторный запуск пропустит уже сделанное." % rc)
+        if not res.get("subs"):
+            raise Stop("установка прошла, но итог (логин 3X-UI, подписки) не забрался — пришлите журнал")
+        try:
+            self.sh(srv, "rm -f %s/entry-result.json.keep" % REMOTE, timeout=30)
+        except Stop:
+            pass
+        job.result["subs"] = res["subs"]
+        job.result["xui_user"], job.result["xui_password"] = res.get("user", ""), res.get("password", "")
+        job.result["xui_port"], job.result["xui_path"] = res.get("port"), res.get("path", "")
+        job.result["mask"] = mask
+        job.end("setup", note="подписок: %d" % len(res["subs"]))
+
+        job.begin("panel")
+        sid = self.unique_id(latin(tag).lower()[:12])
+        new = {"id": sid, "name": name, "host": p["host"], "port": int(p.get("port") or 22), "user": p.get("user") or "root",
+               "role": "entry", "provider": p.get("provider") or "", "note": "отдельная связка", "cc": (p.get("cc") or "")[:3].upper(),
+               "group": sid}
+        with self.d.lock:
+            cfg.data["servers"].append(new)
+            cfg.save()
+        cfg.set_pw(sid, password)
+        self.d.note("ok", "Мастер: вход %s (%s) поставлен с нуля — отдельная связка" % (name, p["host"]))
+        job.result["server_id"] = sid
+        self.secrets_dir.mkdir(exist_ok=True)
+        f = self.secrets_dir / ("%s-%s.txt" % (re.sub(r"[^\w-]", "_", name), datetime.now().strftime("%Y-%m-%d_%H%M")))
+        lines = ["Вход %s, %s — поставлен с нуля (отдельная связка)" % (name, p["host"]),
+                 "Установлен панелью %s" % datetime.now().strftime("%d.%m.%Y %H:%M"), "",
+                 "Панель 3X-UI: закрыта из интернета — открывается кнопкой «3X-UI» в панели каскада",
+                 "  (или по SSH-туннелю: ssh -L %s:127.0.0.1:%s root@%s, потом http://127.0.0.1:%s%s)" % (res.get("port"), res.get("port"), p["host"], res.get("port"), res.get("path")),
+                 "  логин: %s" % res.get("user"), "  пароль: %s" % res.get("password"), "",
+                 "Вход VLESS Reality: порт %s, маскировка %s" % (res.get("vless_port"), mask), ""]
+        lines += ["Подписка %s: %s" % (x["name"], x["url"]) for x in res["subs"]]
+        lines += ["", "Дальше: мастер «Новый сервер» → «Выход», связка «%s» — выход подключится только к этому входу." % name]
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        job.result["secrets_file"] = str(f)
+        job.end("panel")
+        self.d.check_all(True)
+
     def save_secrets_entry(self, job, srv, archive):
         r = job.result
         self.secrets_dir.mkdir(exist_ok=True)
@@ -1375,12 +2387,13 @@ class Provisioner:
         r = job.result
         self.secrets_dir.mkdir(exist_ok=True)
         f = self.secrets_dir / ("%s-%s.txt" % (re.sub(r"[^\w-]", "_", srv["name"]), datetime.now().strftime("%Y-%m-%d_%H%M")))
-        lines = ["Выход %s (тег AWG-%s), %s" % (srv["name"], job.params["tag"], srv["host"]),
+        lines = ["Выход %s (теги AWG-%s / Sudoku-%s), %s" % (srv["name"], job.params["tag"], job.params["tag"], srv["host"]),
                  "Установлен панелью %s" % datetime.now().strftime("%d.%m.%Y %H:%M")
                  + (" вместо выхода «%s»" % r["replaced"] if r.get("replaced") else ""), "",
-                 "AmneziaWG: UDP %s, публичный ключ awg0 %s" % (r.get("awg_port"), r.get("awg_pub")), ""]
+                 "AmneziaWG: UDP %s, публичный ключ awg0 %s" % (r.get("awg_port"), r.get("awg_pub")),
+                 "Sudoku: TCP %s" % r.get("sudoku_port"), ""]
         for x in r.get("linked") or []:
-            lines.append("Вход %s: туннель %s" % (x["entry"], x["iface"]))
+            lines.append("Вход %s: туннель %s, SOCKS 127.0.0.1:%s" % (x["entry"], x["iface"], x["socks"]))
         lines += ["", "На выходе лежит /root/vpn-exit-setup.sh:",
                   "  bash /root/vpn-exit-setup.sh client ИМЯ   — AWG-клиент для телефона или ноутбука (конфиг + QR)",
                   "  bash /root/vpn-exit-setup.sh status       — что работает и на каких портах"]
@@ -1390,7 +2403,7 @@ class Provisioner:
 
 import os  # noqa: E402
 
-SPEED_URLS_DEFAULT = ("Москва · Яндекс | https://mirror.yandex.ru/ubuntu-releases/24.04/ubuntu-24.04.5-live-server-amd64.iso\n"
+SPEED_URLS_DEFAULT = ("Зеркало Yandex (RU) | https://mirror.yandex.ru/ubuntu-releases/24.04/ubuntu-24.04.5-live-server-amd64.iso\n"
                       "Германия · FAU | https://ftp.fau.de/ubuntu-releases/24.04/ubuntu-24.04.5-live-server-amd64.iso")
 
 

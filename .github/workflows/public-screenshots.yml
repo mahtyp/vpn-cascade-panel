@@ -1,0 +1,54 @@
+name: Capture public demo screenshots
+
+on:
+  push:
+    branches: [release/awg-sudoku-mihomo-20261119]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    if: "!contains(github.event.head_commit.message, '[screenshots]')"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Prepare isolated local testbed
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r requirements.txt playwright
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            .venv/bin/python -m playwright install --with-deps chromium
+          fi
+      - name: Capture five fake-server screenshots
+        run: |
+          set -euo pipefail
+          sudo bash dev/testbed.sh up
+          sudo chown -R "$(id -u):$(id -g)" dev/stand
+          bash dev/testbed.sh run 8790
+          .venv/bin/python dev/test_public_smoke.py
+          .venv/bin/python dev/capture_public_screenshots.py
+      - name: Commit only screenshot images to public release branch
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = "release/awg-sudoku-mihomo-20261119"
+          for name in overview servers sudoku schema analytics; do
+            test -s "docs/screenshots/$name.png"
+          done
+          git add -- docs/screenshots/overview.png docs/screenshots/servers.png docs/screenshots/sudoku.png docs/screenshots/schema.png docs/screenshots/analytics.png
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs: public testbed screenshots [screenshots]"
+          git push origin HEAD:refs/heads/release/awg-sudoku-mihomo-20261119
+      - name: Clean up fake servers
+        if: always()
+        run: |
+          bash dev/testbed.sh stop || true
+          sudo bash dev/testbed.sh down || true

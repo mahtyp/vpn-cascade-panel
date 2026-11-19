@@ -10,7 +10,8 @@ import sqlite3
 import struct
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-st = dict(sqlite3.connect("/etc/x-ui/x-ui.db").execute("select key, value from settings").fetchall())
+DB = "/etc/x-ui/x-ui.db"
+st = dict(sqlite3.connect(DB).execute("select key, value from settings").fetchall())
 PORT = int(st.get("webPort") or 2053)
 LISTEN = st.get("webListen") or "0.0.0.0"
 BASE = "/" + (st.get("webBasePath") or "/").strip("/") + "/"
@@ -85,7 +86,26 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         p = self.path.split("?")[0]
         n = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(n)
+        body = self.rfile.read(n)
+        if p.startswith(BASE + "panel/api/inbounds/"):         # API с токеном (как у 3X-UI): клиенты VLESS для «Связать по VLESS»
+            if self.headers.get("Authorization") != "Bearer stand-api-token":
+                return self.reply(401, json.dumps({"success": False, "msg": "unauthorized"}), "application/json")
+            rest = p[len(BASE + "panel/api/inbounds/"):]
+            db = sqlite3.connect(DB)
+            if rest == "addClient":
+                b = json.loads(body or b"{}")
+                sv = json.loads(db.execute("select settings from inbounds where id=?", (b["id"],)).fetchone()[0])
+                sv.setdefault("clients", []).extend(json.loads(b["settings"])["clients"])
+                db.execute("update inbounds set settings=? where id=?", (json.dumps(sv), b["id"]))
+            elif "/delClient/" in rest:
+                iid, cid = rest.split("/delClient/")
+                sv = json.loads(db.execute("select settings from inbounds where id=?", (int(iid),)).fetchone()[0])
+                sv["clients"] = [c for c in sv.get("clients") or [] if c.get("id") != cid]
+                db.execute("update inbounds set settings=? where id=?", (json.dumps(sv), int(iid)))
+            else:
+                return self.reply(404, "404 page not found", "text/plain")
+            db.commit()
+            return self.reply(200, json.dumps({"success": True, "msg": "ok"}), "application/json")
         if p == BASE + "login":
             return self.reply(200, json.dumps({"success": True}), "application/json",
                               [("Set-Cookie", "3x-ui=ok; Path=%s; HttpOnly; Secure; SameSite=Lax" % BASE)])

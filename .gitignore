@@ -15,8 +15,19 @@ addrcheck.json
 addrcheck.tmp
 dash.pid
 *.png
+!docs/screenshots/*.png
 govblock.json
 govblock.tmp
 govdrops.json
 govdrops.tmp
 tools/
+
+# Локальные секреты и ключи администратора
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.ssh/
+credentials.json

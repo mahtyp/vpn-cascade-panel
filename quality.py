@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 
+Q_URL_204 = "http://www.gstatic.com/generate_204"
 Q_URL_DOWN = "https://speed.cloudflare.com/__down?bytes=%d"
 Q_SPEED_CAP = 20          # один замер скорости — не дольше стольких секунд
 _Q_IDENT = [int.from_bytes(os.urandom(2), "big")]
@@ -87,7 +88,7 @@ def q_tcp(host, port, count=10, iface=None, pause=0.2):
 
 
 def q_ping_or_tcp(host, port, iface=None, count=20):
-    """Пинг; если сервер на пинг не отвечает совсем — 10 подключений к порту SSH."""
+    """Пинг; если сервер на пинг не отвечает совсем — серия подключений к порту (Sudoku или SSH)."""
     r = q_ping(host, count, iface)
     if r.get("error") or not r.get("got"):
         t = q_tcp(host, port, 10, iface)
@@ -254,13 +255,33 @@ def q_live(flt):
     return {"n": len(rtts), "retr": round(100 * retr / max(segs, 1), 1), "rtt": round(rtts[len(rtts) // 2])}
 
 
-def q_speed(iface, mb=2):
+def q_requests(socks, count=10):
+    """Короткие запросы через SOCKS Sudoku: сколько прошло и насколько ровно по времени."""
+    times, ok = [], 0
+    for _ in range(count):
+        rc, out = q_run(["curl", "-4", "-s", "-m", "6", "-o", "/dev/null", "-w", "%{http_code} %{time_total}",
+                         "--socks5-hostname", "127.0.0.1:%d" % int(socks), Q_URL_204], 9)
+        f = out.split()
+        if f and f[0] in ("200", "204"):
+            ok += 1
+            try:
+                times.append(float(f[1]) * 1000)
+            except (IndexError, ValueError):
+                pass
+    s = q_stats(times, count, "http")
+    fast = sorted(times)[len(times) // 4] if times else None            # «обычно» — по быстрой четверти: подвисаний там нет
+    slow = [t for t in times if t > max(1000, 3 * (fast or 0))]          # подвисания: дольше секунды и втрое дольше обычного
+    return {"n": count, "ok": ok, "ms": round(fast) if fast else None, "jit": s["jit"], "slow": len(slow),
+            "max": round(max(times)) if times else None}
+
+
+def q_speed(iface=None, socks=None, mb=2):
     """Скачать mb мегабайт через канал, не дольше Q_SPEED_CAP секунд. Не успело докачать, но шло — это скорость
     (partial); встало (меньше 2 КБ/с четыре секунды подряд) — сколько успело прийти."""
     want = int(mb) * 1000000
     a = ["curl", "-4", "-s", "-m", str(Q_SPEED_CAP), "--speed-limit", "2048", "--speed-time", "4", "-o", "/dev/null",
          "-w", "%{http_code} %{size_download} %{speed_download} %{time_total}"]
-    a += ["--interface", iface]
+    a += ["--interface", iface] if iface else ["--socks5-hostname", "127.0.0.1:%d" % int(socks)]
     rc, out = q_run(a + [Q_URL_DOWN % want], Q_SPEED_CAP + 8)
     f = out.split()
     try:
@@ -286,6 +307,23 @@ def q_conf(iface):
         return None, None
 
 
+def q_sudoku_port(socks):
+    """Порт Sudoku на выходе для данного SOCKS Mihomo — нужен, чтобы найти живые соединения в ss."""
+    try:
+        txt = open("/etc/mihomo/config.yaml").read()
+    except OSError:
+        return None
+    try:
+        import yaml
+        y = yaml.safe_load(txt) or {}
+        ln = next(l["name"] for l in y.get("listeners") or [] if int(l.get("port", 0)) == int(socks))
+        rule = next(str(r) for r in y.get("rules") or [] if str(r).replace(" ", "").startswith("IN-NAME,%s," % ln))
+        px = rule.split(",")[2].strip()
+        return int(next(p["port"] for p in y.get("proxies") or [] if p.get("name") == px))
+    except Exception:   # noqa: BLE001 — нет yaml или конфиг другого вида: без живых цифр Sudoku
+        return None
+
+
 def run_bg(r, th, name, fn, *a):
     """fn(*a) в отдельном потоке: результат (или ошибка) — в r[name], поток — в th (потом join)."""
     def w():
@@ -299,7 +337,7 @@ def run_bg(r, th, name, fn, *a):
 
 
 def entry_run(targets, tests, ch):
-    """На входе. targets: [{key, host, sshport, iface|None}] — по одному на выход."""
+    """На входе. targets: [{key, host, sshport, iface|None, socks|None}] — по одному на выход."""
     out = {}
 
     def one(t):
@@ -308,18 +346,24 @@ def entry_run(targets, tests, ch):
 
         def bg(name, fn, *a):
             run_bg(r, th, name, fn, *a)
+        sp = q_sudoku_port(t["socks"]) if t.get("socks") else None
         if tests.get("base"):
-            bg("raw", q_ping_or_tcp, t["host"], t["sshport"], None, 50)   # не отвечает на пинг — 10 подключений к SSH
+            # если выход не отвечает на пинг — подключаемся к порту Sudoku: SSH лучше не дёргать, fail2ban может обидеться
+            bg("raw", q_ping_or_tcp, t["host"], sp or t["sshport"], None, 50)
             if ch.get("awg") and t.get("iface"):
                 addr, peer = q_conf(t["iface"])
                 if peer:
                     bg("awg_ping", q_ping_or_tcp, peer, t["sshport"], t["iface"], 50)
                     bg("awg_live", q_live, "src %s" % addr)
+            if ch.get("sud") and t.get("socks"):
+                bg("sud_req", q_requests, t["socks"])
+                if sp:
+                    bg("sud_live", q_live, "dst %s:%d" % (t["host"], sp))
         if tests.get("trace"):
             bg("trace", q_trace, t["host"])
         for x in th:
             x.join()
-        r["has_awg"] = bool(t.get("iface"))
+        r["has_awg"], r["has_sud"] = bool(t.get("iface")), bool(t.get("socks"))
 
     th = [threading.Thread(target=one, args=(t,)) for t in targets]
     for x in th:
@@ -332,6 +376,8 @@ def entry_run(targets, tests, ch):
             r = out[t["key"]]
             if ch.get("awg") and t.get("iface"):
                 r["awg_speed"] = q_speed(iface=t["iface"], mb=mb)
+            if ch.get("sud") and t.get("socks"):
+                r["sud_speed"] = q_speed(socks=t["socks"], mb=mb)
     return out
 
 

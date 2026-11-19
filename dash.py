@@ -121,7 +121,7 @@ SETTINGS = [
     ("cert_days", 2, "int", 0, 90, "Пороги", "Предупредить о сертификате панели за, дн", ""),
     ("tg_dc", TG_DC_DEFAULT, "dclist", None, None, "Telegram", "Какие DC проверять с выходов",
      "По строке на DC: имя и IP через пробел. Проверяется подключение к порту 443."),
-    ("speed_urls", "Москва · Яндекс | https://mirror.yandex.ru/ubuntu-releases/24.04/ubuntu-24.04.5-live-server-amd64.iso\n"
+    ("speed_urls", "Россия · Яндекс | https://mirror.yandex.ru/ubuntu-releases/24.04/ubuntu-24.04.5-live-server-amd64.iso\n"
                    "Германия · FAU | https://ftp.fau.de/ubuntu-releases/24.04/ubuntu-24.04.5-live-server-amd64.iso",
      "urllist", None, None, "Замер скорости", "Откуда качать при замере нового сервера",
      "По строке: название | адрес большого файла (от 100 МБ). Каждый качается 15 секунд. Если файл пропал с зеркала — замените адрес."),
@@ -236,6 +236,9 @@ class Config:
         st = self.data.setdefault("settings", {})
         for k, v in DEFAULT_CFG["settings"].items():
             st.setdefault(k, v)
+        for sv in self.data.get("servers") or []:   # пометку связки теряло сохранение списка серверов — вернуть по подписи мастера
+            if sv.get("role") == "entry" and not sv.get("group") and sv.get("note") == "отдельная связка":
+                sv["group"] = sv["id"]
         self.mem_pw = {}        # если keyring недоступен — пароль живёт до перезапуска
 
     def save(self):
@@ -643,6 +646,7 @@ GROUPS = [
     (r"^xui\.template\.(burstObservatory|observatory)", "Проверка здоровья"),
     (r"^xui\.template", "Шаблон Xray"),
     (r"^xui\.settings", "Настройки панели"),
+    (r"^mihomo", "Mihomo"),
     (r"^awg", "AWG-туннели"),
 ]
 
@@ -679,7 +683,7 @@ def _brief(v):
 
 
 def normalize_cfg(c):
-    """Убрать из снимка то, что у каждого входа своё по задумке: имя входящего (vless / vless-2).
+    """Убрать из снимка то, что у каждого входа своё по задумке: имя входящего (пример обычного и резервного входящего).
     Входящие сравниваются по протоколу и порту, у клиентов — список входящих в том же виде."""
     c = json.loads(json.dumps(c))
     x = c.get("xui") or {}
@@ -698,7 +702,7 @@ def normalize_cfg(c):
 
 
 KIND = {"Клиенты": "Клиент", "Входящие": "Входящий", "Балансировщики": "Балансировщик", "Исходящие": "Исходящий",
-        "Маршрутизация": "Правило маршрутизации", "AWG-туннели": "Туннель"}
+        "Маршрутизация": "Правило маршрутизации", "AWG-туннели": "Туннель", "Mihomo": "Mihomo"}
 
 
 def describe(d):
@@ -719,7 +723,7 @@ def diff_configs(a, b):
 
     def add(path, va, vb):
         group = next((g for rx, g in GROUPS if re.match(rx, path)), "Прочее")
-        short = re.sub(r"^(xui\.(template\.)?|awg\.)", "", path)
+        short = re.sub(r"^(xui\.(template\.)?|mihomo\.|awg\.)", "", path)
         res.append({"group": group, "path": short, "a": va, "b": vb})
 
     def walk(x, y, path):
@@ -865,6 +869,7 @@ class Dash:
             self.gov_drops = {}  # sid -> {base, last, since}: счётчик nftables сбрасывается при перезагрузке — копим здесь
         self.xui_web = {}       # sid -> {port, path, https, domain, listen}: веб-панель 3X-UI (путь — только здесь, не на странице)
         self.geo = {}           # sid -> итог «как видят адрес» (ipcheck.summarize + at)
+        self.proto_tests = {}   # sid -> {"at", "tests": {тег исходящего: ok/ip/loc/ms/err}} — проверка путей по отдельности («Протоколы»)
         self.nb = {}            # sid -> итог «шумные соседи» (neighbors.summarize + at)
         self.dns = {}           # sid -> итог проверки DNS (dnscheck.summarize + at)
         try:
@@ -873,6 +878,7 @@ class Dash:
         except (OSError, ValueError):
             pass
         self.dpi = None         # «что режут на входах»: sites.Sites.dpi()
+        self.sw_latest = {}     # последние версии Sudoku/Mihomo на GitHub: {"sudoku": {tag, at, assets}, "_at", "_ok"}
         self.quality = None     # последняя проверка качества: {at, secs, tests, ch, routes, pc, ...}
         self.rsess = remote.Sessions()      # удалённый доступ: сессии и защита от подбора
         import sites
@@ -1084,14 +1090,30 @@ class Dash:
     def bypass_api(self, body):
         import sites
         a, code = body.get("action"), str(body.get("code") or "")
-        if not sites.CODE_RE.match(code):
-            return {"error": "код обхода?"}
         reg = self.sites.registry()
+        # Старые записи могли попасть в реестр с кодом вроде «dns usa»: их надо позволить удалить,
+        # но создавать и менять обходы по-прежнему можно только с безопасным кодом для тегов Xray.
+        if not sites.CODE_RE.match(code) and not (a == "remove" and code in reg):
+            return {"error": "код обхода?"}
         ents = [s for s in self.cfg.servers if s["role"] == "entry"]
         if "bypass" in self.running:
             return {"error": "уже идёт другое действие с обходами — дождитесь"}
         with self.busy("bypass"):
             if a == "recheck":
+                if code not in reg:
+                    return {"error": "нет такого обхода"}
+                try:
+                    check = self.sites.check_bypass(code, str(body.get("target") or ""))
+                except ValueError as e:
+                    return {"error": str(e)}
+                old = reg[code].get("check")
+                if old and old.get("kind") != "route" and not reg[code].get("need_check"):
+                    reg[code]["need_check"] = old
+                reg[code]["check"] = check
+                self.cfg.save()
+                self.note(check["status"], "Проверка обхода %s: %s" % (code, check["text"]))
+                return {"ok": True, "check": check}
+            if a == "need":
                 b = reg.get(code)
                 if not b:
                     return {"error": "нет такого обхода"}
@@ -1103,15 +1125,21 @@ class Dash:
                     cells = (self.dc.get(act) or {}).get("cells") or []
                     ok = any(c["name"] == "DC5" and c["ok"] for c in cells)
                 else:
-                    r = self.sites.check(b.get("service") or (b["match"].get("domain") or ["?"])[0].replace("domain:", ""))
+                    target = sites.recheck_target(b)
+                    if not target:
+                        return {"error": "для этого правила нет однозначной проверки необходимости"}
+                    try:
+                        r = self.sites.check(target)
+                    except ValueError as e:
+                        return {"error": str(e)}
                     rows = [x for x in r["rows"] if x["exit_id"] == act]
                     ok = any(all(c["st"] in ("ok", "slow") for c in x["cells"] if c["st"] != "none") for x in rows)
-                b["check"] = {"at": time.time(), "fine": ok,
-                              "text": ("через выход %s %s снова открывается — обход больше не нужен" if ok else
-                                       "через выход %s %s всё ещё не открывается — обход нужен") % (xn, b["title"])}
+                b["need_check"] = {"at": time.time(), "fine": ok,
+                                   "text": ("через выход %s %s снова открывается — обход больше не нужен" if ok else
+                                            "через выход %s %s всё ещё не открывается — обход нужен") % (xn, b["title"])}
                 self.cfg.save()
-                self.note("ok" if ok else "warn", "Перепроверка обхода %s: %s" % (code, b["check"]["text"]))
-                return {"ok": True, "check": b["check"]}
+                self.note("ok" if ok else "warn", "Проверка необходимости %s: %s" % (code, b["need_check"]["text"]))
+                return {"ok": True, "need_check": b["need_check"]}
             chain = [str(x) for x in body.get("chain") or [] if re.match(r"^[A-Za-z0-9_.-]{1,40}$", str(x))]
             if a == "create" and body.get("target") and not body.get("match"):   # новый обход вручную, без проверки
                 try:
@@ -1132,6 +1160,9 @@ class Dash:
                 on = self.sites.where().get(code, {}).get("on", {})
                 log = self.sites.apply(code, [e for e in ents if on.get(e["id"])] or ents, "set", b["match"], chain)
                 if all(x.get("ok") for x in log):
+                    old = b.get("check")
+                    if old and old.get("kind") != "route" and not b.get("need_check"):
+                        b["need_check"] = old
                     b["chain"] = chain
                     b["check"] = None
                     self.cfg.save()
@@ -1155,7 +1186,10 @@ class Dash:
                 log = self.sites.apply(code, [e for e in ents if not on.get(e["id"])], "create", b["match"], b["chain"])
             elif a == "remove":
                 on = self.sites.where().get(code, {}).get("on", {})
-                log = self.sites.apply(code, [e for e in ents if on.get(e["id"])] or ents, "remove")
+                targets = [e for e in ents if on.get(e["id"])]
+                # Если правило нигде не найдено, осталось убрать только запись панели:
+                # недоступность нынешних входов не должна оставлять в списке обход с удалённой цепочкой.
+                log = self.sites.apply(code, targets, "remove") if targets else []
                 if all(x.get("ok") for x in log):
                     reg.pop(code, None)
                     self.cfg.data.setdefault("bypass_gone", {})[code] = time.time()   # не подхватить снова по старым данным
@@ -1226,18 +1260,25 @@ class Dash:
     def awg_view(self):
         """probe MODE "awg" на всех серверах (параллельно): настройки туннелей без секретов + живое состояние;
         дальше — какой туннель входа к какому выходу и совпадают ли у концов параметры маскировки."""
+        return self._awg_build(self._probe_all("awg", 40))
+
+    def _probe_all(self, mode, timeout):
+        """probe в режиме mode на всех серверах с паролем, параллельно: {id: ответ | {"error": …}}."""
         servers = [s for s in self.cfg.servers if self.cfg.get_pw(s["id"])]
 
         def one(s):
             try:
-                rc, out, err = self.ssh.run(s, "python3 -", stdin='MODE = "awg"\n' + PROBE, timeout=40)
+                rc, out, err = self.ssh.run(s, "python3 -", stdin='MODE = "%s"\n' % mode + PROBE, timeout=timeout)
                 if rc != 0 or not out.strip():
                     raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
-                return s["id"], json.loads(out.strip().splitlines()[-1])["awg"]
+                return s["id"], json.loads(out.strip().splitlines()[-1])[mode]
             except Exception as e:  # noqa: BLE001
                 return s["id"], {"error": str(e)[:200]}
         with cf.ThreadPoolExecutor(max_workers=8) as ex:
-            got = dict(ex.map(one, servers))
+            return dict(ex.map(one, servers))
+
+    def _awg_build(self, got):
+        servers = [s for s in self.cfg.servers if self.cfg.get_pw(s["id"])]
         byhost = {}
         for s in servers:
             byhost.setdefault(s["host"], s)
@@ -1270,6 +1311,77 @@ class Dash:
                         if ip_of(pr["params"].get("AllowedIPs")) == ip_of(i["iface"].get("Address")):
                             pr["entry"] = {"id": x["id"], "name": x["name"], "iface": i["name"]}
         return {"at": now(), "servers": res}
+
+    def proto_view(self):
+        """Раздел «Протоколы»: probe MODE "proto" на всех серверах — пути каждого до других (протокол, место в цепочке,
+        для чего), что на нём стоит ещё, плюс прежний вид AmneziaWG. Только чтение, не хранится."""
+        import proto
+        got = self._probe_all("proto", 60)
+        res = self._awg_build({k: (v.get("awg") or {}) if not v.get("error") else v for k, v in got.items()})
+        res["proto"] = {}
+        for s in self.cfg.servers:
+            p = got.get(s["id"])
+            if not p or p.get("error"):
+                continue
+            with self.lock:
+                ch = list(self.channels.get(s["id"], []))
+            res["proto"][s["id"]] = {
+                "links": proto.links(s, p, ch, self.cfg.by_host), "inv": proto.inventory(p), "docker": p.get("docker") or [],
+                "rules": proto.rules(p) if s["role"] == "entry" else [], "main": p.get("main") or [],
+                "sudoku": p.get("sudoku"),
+                "mproxies": [dict(x, exit=(self.cfg.by_host(str(x.get("server") or "")) or {}).get("name", ""),
+                                  exit_id=(self.cfg.by_host(str(x.get("server") or "")) or {}).get("id"))
+                             for x in p.get("mproxies") or []],
+                "inbounds": [dict(i, label=proto.proto_label({"proto": i.get("proto"), "sec": i.get("sec"), "net": i.get("net")}))
+                             for i in p.get("inbounds") or []]}
+        res["tests"] = self.proto_tests
+        return res
+
+    def route_trace(self, sid, target):
+        """«Куда пойдёт»: какое правило 3X-UI на входе сработает для сайта/адреса (proto.ROUTE_PY). Только чтение, не хранится."""
+        import proto
+        srv = self.cfg.by_id(sid)
+        if not srv or srv["role"] != "entry":
+            return {"error": "выберите вход"}
+        t = str(target or "").strip()
+        try:
+            t = ".".join(x.encode("idna").decode() if any(ord(ch) > 127 for ch in x) else x for x in t.split("."))   # сайт.рф → xn--…
+        except UnicodeError:
+            return {"error": "непонятное имя сайта"}
+        if not re.match(r"^[A-Za-z0-9._:\[\]/-]{1,200}$", t):
+            return {"error": "впишите сайт (например youtube.com) или адрес (203.0.113.10)"}
+        try:
+            rc, out, err = self.ssh.run(srv, "python3 -", stdin="TARGET = %r\n" % t + proto.ROUTE_PY, timeout=90)
+            if rc != 0 or not out.strip():
+                raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
+            return json.loads(out.strip().splitlines()[-1])
+        except (CheckError, ValueError) as e:
+            return {"error": str(e)[:200]}
+
+    def proto_view_ids(self):
+        """Серверы, у которых есть 3X-UI с путями до других (входы): им есть что проверять."""
+        return [(s["id"], s["name"]) for s in self.cfg.servers if s["role"] == "entry" and self.cfg.get_pw(s["id"])]
+
+    def proto_test(self, sid):
+        """Проверка каждого пути сервера по отдельности (probe MODE "prototest": временный Xray, у каждого исходящего свой вход)."""
+        srv = self.cfg.by_id(sid)
+        if not srv:
+            return {"error": "нет такого сервера"}
+        with self.busy("proto:" + sid):
+            try:
+                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "prototest"\n' + PROBE, timeout=60)
+                if rc != 0 or not out.strip():
+                    raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
+                r = json.loads(out.strip().splitlines()[-1])["prototest"]
+            except (CheckError, ValueError, KeyError) as e:
+                r = {"error": str(e)[:200]}
+            for t in (r.get("tests") or {}).values():            # чей это адрес: наш сервер или посторонний
+                x = self.cfg.by_host(t.get("ip") or "")
+                if x:
+                    t["srv"] = x["name"]
+            r["at"] = now()
+            self.proto_tests[sid] = r
+            return r
 
     def check_fw(self, sid):
         """Фаервол, шаг 1: что слушает сервер и что останется открытым. Ничего не меняет."""
@@ -1812,7 +1924,7 @@ class Dash:
             # клиент → вход: с ПК подключается, и клиенты основного здесь есть (их подписки заработают)
             pc = self.pc_e2e.get(s["id"]) or {}
             miss = []
-            if mfp and s["id"] != main["id"] and s["id"] in self.client_fps:
+            if mfp and not s.get("group") and s["id"] != main["id"] and s["id"] in self.client_fps:
                 have = set(self.client_fps[s["id"]].values())
                 miss = sorted(n for n, f in mfp.items() if f not in have)
             if miss:
@@ -1850,6 +1962,7 @@ class Dash:
     def _build_channels(self, srv, data):
         e = data.get("entry") or {}
         awg = {a["iface"]: a for a in e.get("awg") or []}
+        socks = {s["port"]: s for s in ((e.get("mihomo") or {}).get("socks") or [])}
         chain = ((e.get("xui") or {}).get("chain")) or []
         chans, used = [], set()
 
@@ -1857,22 +1970,35 @@ class Dash:
             x = self.cfg.by_host(host)
             return (x["id"], x["name"], x.get("cc", "")) if x else (None, host or "?", "")
 
-        def add(ref, n, tag=None):
-            a = awg.get(ref)
-            if not a:
-                return
-            xid, xname, cc = exit_of(a["host"])
-            chans.append({"key": "awg:" + ref, "n": n, "kind": "AWG", "exit_id": xid, "exit": xname, "cc": cc, "tag": tag,
-                          "host": a["host"], "via": "%s, %s" % (ref, a.get("address", "")),
-                          "iface": ref, "handshake_age": a.get("handshake_age"), "up": a.get("up")})
-            used.add(ref)
+        def add(kind, ref, n, tag=None):
+            if kind == "AWG":
+                a = awg.get(ref)
+                if not a:
+                    return
+                xid, xname, cc = exit_of(a["host"])
+                chans.append({"key": "awg:" + ref, "n": n, "kind": "AWG", "exit_id": xid, "exit": xname, "cc": cc, "tag": tag,
+                              "host": a["host"], "via": "%s, %s" % (ref, a.get("address", "")),
+                              "iface": ref, "handshake_age": a.get("handshake_age"), "up": a.get("up")})
+            else:
+                s = socks.get(ref)
+                if not s:
+                    return
+                xid, xname, cc = exit_of(s["host"])
+                chans.append({"key": "socks:%s" % ref, "n": n, "kind": "Sudoku", "exit_id": xid, "exit": xname, "cc": cc, "tag": tag,
+                              "host": s["host"], "via": "SOCKS %s, %s" % (ref, s.get("proxy", "")), "port": ref})
+            used.add((kind, ref))
 
         for i, c in enumerate(chain, 1):
             if c["kind"] == "AWG":
-                add(c["iface"], i, c.get("tag"))
+                add("AWG", c["iface"], i, c.get("tag"))
+            elif c["kind"] == "Sudoku" and c.get("port"):
+                add("Sudoku", int(c["port"]), i, c.get("tag"))
         for a in awg:                      # туннели, которых нет в цепочке
-            if a not in used:
-                add(a, None)
+            if ("AWG", a) not in used:
+                add("AWG", a, None)
+        for p in socks:
+            if ("Sudoku", p) not in used:
+                add("Sudoku", p, None)
         with self.lock:
             self.channels[srv["id"]] = chans
 
@@ -1888,7 +2014,10 @@ class Dash:
             st = self.cfg.settings
             url = st.get("check_url") or "https://ifconfig.me"
             tmo = int(st.get("channel_timeout") or 15)
-            cmd = "curl -4 -s -m %d --interface %s -w '\\n%%{time_total}' '%s'" % (tmo, ch["iface"], url)
+            if ch["kind"] == "AWG":
+                cmd = "curl -4 -s -m %d --interface %s -w '\\n%%{time_total}' '%s'" % (tmo, ch["iface"], url)
+            else:
+                cmd = "curl -4 -s -m %d --socks5 127.0.0.1:%d -w '\\n%%{time_total}' '%s'" % (tmo, int(ch["port"]), url)
             res = {"at": now()}
             try:
                 rc, out, err = self.ssh.run(srv, cmd, timeout=30)
@@ -2197,11 +2326,12 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
     # --- сравнение входов
 
     def drift_main(self):
-        return next((s for s in self.cfg.servers if s["role"] == "entry"), None)
+        return next((s for s in self.cfg.servers if s["role"] == "entry" and not s.get("group")), None)
 
     def check_drift(self):
-        """Сверка резервов: основной вход (первый в списке) против каждого другого входа."""
-        entries = [s for s in self.cfg.servers if s["role"] == "entry"]
+        """Сверка резервов: основной вход (первый в списке) против каждого другого входа.
+        Входы отдельных связок («с нуля», group) — не резервы основного: их не сверяем."""
+        entries = [s for s in self.cfg.servers if s["role"] == "entry" and not s.get("group")]
         if len(entries) < 2:
             with self.lock:
                 self.drift = None
@@ -2272,7 +2402,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
     def backup_target(self):
         """Сервер для бэкапа: из настроек, а если не выбран — первый вход."""
         srv = self.cfg.by_id(self.cfg.settings.get("backup_server") or "")
-        return srv or next((s for s in self.cfg.servers if s["role"] == "entry"), None)
+        return srv or next((s for s in self.cfg.servers if s["role"] == "entry" and not s.get("group")), None)
 
     def do_backup(self, sid=None):
         srv = self.cfg.by_id(sid) if sid else self.backup_target()
@@ -2369,6 +2499,9 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                     self.check_all(with_dc=due_dc)
                 except Exception:
                     traceback.print_exc()
+            if now() - (self.sw_latest.get("_at") or 0) >= (12 * 3600 if self.sw_latest.get("_ok") else 1800):
+                self.sw_latest["_at"] = now()
+                self.pool.submit(self.fetch_sw_latest)
             if has_pw and now() - self.last_zap >= 300 and "zapmon" not in self.running:   # автовозврат zapret
                 self.last_zap = now()
 
@@ -2449,6 +2582,40 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
 
     # --- снимок для страницы
 
+    # --- версии Sudoku и Mihomo на GitHub (узнаёт этот компьютер: у серверов в России GitHub бывает медленным)
+
+    SW_REPOS = {"sudoku": "SUDOKU-ASCII/sudoku", "mihomo": "MetaCubeX/mihomo"}
+
+    def fetch_sw_latest(self):
+        import urllib.request
+        res, ok = {}, True
+        for name, repo in self.SW_REPOS.items():
+            try:
+                if os.environ.get("VPN_DASH_STAND") == "1":     # стенд: GitHub недоступен — «новые» версии заданы
+                    tag = {"sudoku": "v0.5.3.0", "mihomo": "v1.19.31"}[name]
+                    assets = ["%s-linux-amd64-compatible-%s.gz" % (name, tag), "%s-linux-amd64-%s.gz" % (name, tag)]
+                    r = {"tag_name": tag, "published_at": "2026-10-24T00:00:00Z", "assets": [
+                        {"name": a, "browser_download_url": "https://github.com/%s/releases/download/%s/%s" % (repo, tag, a)} for a in assets]}
+                else:
+                    rq = urllib.request.Request("https://api.github.com/repos/%s/releases/latest" % repo,
+                                                headers={"Accept": "application/vnd.github+json", "User-Agent": "vpn-dash"})
+                    with urllib.request.urlopen(rq, timeout=20) as f:
+                        r = json.loads(f.read().decode("utf-8"))
+                res[name] = {"tag": r.get("tag_name"), "date": (r.get("published_at") or "")[:10], "at": now(),
+                             "assets": {a["name"]: a["browser_download_url"] for a in r.get("assets") or []
+                                        if re.match(r"^[\w.-]+$", a.get("name") or "")}}
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                res[name] = dict(self.sw_latest.get(name) or {}, error=str(e)[:160])
+        with self.lock:
+            self.sw_latest.update(res)
+            self.sw_latest["_ok"] = ok
+
+    def sw_view(self):
+        """Для страницы: только тег, дата и ошибка, без ссылок на файлы."""
+        return {k: {"tag": v.get("tag"), "date": v.get("date"), "error": v.get("error")}
+                for k, v in self.sw_latest.items() if not k.startswith("_")}
+
     # --- качество каналов (только замеры, на серверах ничего не меняется)
 
     def quality_check(self, body):
@@ -2457,11 +2624,11 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
         tests = {k: bool((body.get("tests") or {}).get(k)) for k in ("base", "speed", "trace")}
         mb = (body.get("tests") or {}).get("mb")
         tests["mb"] = max(1, min(100, int(mb))) if isinstance(mb, (int, float)) and not isinstance(mb, bool) else 2
-        ch = {"awg": True}
+        ch = {k: bool((body.get("ch") or {}).get(k)) for k in ("awg", "sud")}
         routes = [r for r in body.get("routes") or [] if isinstance(r, list) and len(r) == 2]
         pcs = [str(x) for x in body.get("pc") or []]
-        if not any(tests[k] for k in ("base", "speed", "trace")) or not (routes or pcs and (tests["base"] or tests["trace"])):
-            raise ValueError("нечего проверять: выберите маршрут или вход и тест")
+        if not any(tests[k] for k in ("base", "speed", "trace")) or not (routes and any(ch.values()) or pcs and (tests["base"] or tests["trace"])):
+            raise ValueError("нечего проверять: выберите маршрут или вход, тест и канал")
         if "quality" in self.running:
             raise ValueError("проверка качества уже идёт")
         t0 = time.time()
@@ -2476,13 +2643,14 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
         def on_entry(eid):
             e = self.cfg.by_id(eid)
             chans = self.channels.get(eid) or []
-            if not chans:
+            if not chans and (ch["awg"] or ch["sud"]):
                 raise CheckError("каналы входа ещё не прочитаны — подождите, пока панель проверит вход на «Обзоре», и повторите")
             targets = []
             for x in by_entry[eid]:
                 awg = next((c for c in chans if c.get("exit_id") == x["id"] and c["kind"] == "AWG"), None)
+                sud = next((c for c in chans if c.get("exit_id") == x["id"] and c["kind"] == "Sudoku"), None)
                 targets.append({"key": "%s>%s" % (eid, x["id"]), "host": x["host"], "sshport": int(x.get("port") or 22),
-                                "iface": awg["iface"] if awg else None})
+                                "iface": awg["iface"] if awg else None, "socks": int(sud["port"]) if sud else None})
             if not self.cfg.get_pw(eid):
                 raise CheckError("не задан пароль")
             pre = "MODE = \"quality\"\nQ_TARGETS = %r\nQ_TESTS = %r\nQ_CH = %r\n" % (targets, tests, ch)
@@ -2547,7 +2715,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                 "platform": os.name, "port_now": PORT, "boot": BOOT_ID, "can_restart": bool(self.on_restart),
                 "version": self.version, "git": self.git,
                 "hist": self.hist.summary(), "drift": self.drift_view(), "fw": self.fw, "fwjob": self.fwjob, "gov": self.gov_view(), "govjob": self.govjob, "bypasses": self.sites.view(),
-                "quality": self.quality, "geo": self.geo, "nb": self.nb, "dns": self.dns, "dpi": self.dpi,
+                "quality": self.quality, "sw_latest": self.sw_view(), "geo": self.geo, "nb": self.nb, "dns": self.dns, "dpi": self.dpi,
                 "addrjobs": [{"id": j.id, "kind": j.kind, "sid": j.params.get("sid"), "status": j.status, "error": j.error,
                               "finished": j.finished}
                              for j in sorted(getattr(self, "prov", None).jobs.values() if getattr(self, "prov", None) else [],
@@ -3186,6 +3354,8 @@ class Handler(BaseHTTPRequestHandler):
                     "provider": str(s.get("provider") or "")[:60], "note": str(s.get("note") or "")[:40],
                     "cc": str(s.get("cc") or "")[:3].upper(),
                 })
+                if (olds.get(sid) or {}).get("group"):      # отдельная связка — страница эту пометку не присылает
+                    clean[-1]["group"] = olds[sid]["group"]
             gone = [i for i in olds if i not in seen]
             added = [s["id"] for s in clean if s["id"] not in olds]
             # адрес, порт, пользователь или роль поменялись — старое соединение и результаты больше не годятся
@@ -3305,6 +3475,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(409, {"error": str(e)})
         if p == "/api/awg":                     # AmneziaWG: все туннели наглядно (только чтение, секреты не уходят с серверов)
             return self._send(200, D.awg_view())
+        if p == "/api/proto":                   # «Протоколы»: чем серверы связаны и что на них стоит (только чтение)
+            return self._send(200, D.proto_view())
+        if p == "/api/proto-test":              # проверить каждый путь сервера по отдельности (ничего не меняет)
+            ids = [body.get("id")] if body.get("id") else [x for x, v in D.proto_view_ids()]
+            with cf.ThreadPoolExecutor(max_workers=6) as ex:
+                res = dict(zip(ids, ex.map(D.proto_test, ids)))
+            return self._send(200, {"tests": res})
         if p == "/api/dns":                     # DNS на сервере: кто отвечает, подменяют ли (только чтение)
             srv = D.cfg.by_id(body.get("id"))
             if not srv:
@@ -3321,6 +3498,61 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "job": D.prov.start_nb(srv)})
             except ValueError as e:
                 return self._send(409, {"error": str(e)})
+        if p == "/api/sw-update":               # Sudoku на выходе / Mihomo на входе — до последней версии с GitHub
+            srv = D.cfg.by_id(body.get("id"))
+            if not srv:
+                return self._send(404, {"error": "нет такого сервера"})
+            try:
+                jid = D.prov.start_sw_update(srv, str(body.get("what") or ""))
+            except ValueError as e:
+                return self._send(409, {"error": str(e)})
+            return self._send(200, {"ok": True, "job": jid})
+        if p == "/api/sudoku-direct":           # выход: Sudoku через sudoku-sing-box → обычный sudoku
+            srv = D.cfg.by_id(body.get("id"))
+            if not srv:
+                return self._send(404, {"error": "нет такого сервера"})
+            try:
+                jid = D.prov.start_sudoku_direct(srv)
+            except ValueError as e:
+                return self._send(409, {"error": str(e)})
+            return self._send(200, {"ok": True, "job": jid})
+        if p == "/api/link-plan":               # «Протоколы» → «Настройка»: что изменится, если связать (ничего не меняет)
+            return self._send(200, D.prov.link_plan(body.get("entry"), body.get("exit"), str(body.get("proto") or ""), str(body.get("pos") or "end"),
+                                                    str(body.get("port") or "") if str(body.get("port") or "").isdigit() else ""))
+        if p == "/api/link":                    # связать вход с выходом выбранным протоколом
+            try:
+                jid = D.prov.start_link(body.get("entry"), body.get("exit"), str(body.get("proto") or ""), str(body.get("pos") or "end"),
+                                        bool(body.get("cross_ok")), str(body.get("port") or ""))
+            except ValueError as e:
+                return self._send(409, {"error": str(e)})
+            return self._send(200, {"ok": True, "job": jid})
+        if p == "/api/route":                   # «Схема» → «Куда пойдёт»: какое правило сработает (только чтение)
+            return self._send(200, D.route_trace(body.get("id"), body.get("target")))
+        if p == "/api/reorder-plan":            # «Схема»: новый порядок цепочки входа (ничего не меняет)
+            return self._send(200, D.prov.reorder_plan(body.get("entry"), body.get("order") if isinstance(body.get("order"), list) else []))
+        if p == "/api/reorder":                 # поменять порядок основной цепочки входа
+            try:
+                jid = D.prov.start_reorder(body.get("entry"), body.get("order") if isinstance(body.get("order"), list) else [])
+            except ValueError as e:
+                return self._send(409, {"error": str(e)})
+            return self._send(200, {"ok": True, "job": jid})
+        if p == "/api/unlink-plan":             # «Настройка»: что будет, если отвязать (ничего не меняет)
+            return self._send(200, D.prov.unlink_plan(body.get("entry"), body.get("exit"), str(body.get("proto") or ""), str(body.get("tag") or "")))
+        if p == "/api/unlink":                  # отвязать выход от входа одним протоколом
+            try:
+                jid = D.prov.start_unlink(body.get("entry"), body.get("exit"), str(body.get("proto") or ""), str(body.get("tag") or ""))
+            except ValueError as e:
+                return self._send(409, {"error": str(e)})
+            return self._send(200, {"ok": True, "job": jid})
+        if p == "/api/sudoku-backup":           # выход связки: запасной канал Sudoku со входов связки
+            srv = D.cfg.by_id(body.get("id"))
+            if not srv:
+                return self._send(404, {"error": "нет такого сервера"})
+            try:
+                jid = D.prov.start_sudoku_backup(srv)
+            except ValueError as e:
+                return self._send(409, {"error": str(e)})
+            return self._send(200, {"ok": True, "job": jid})
         if p == "/api/migrate":                 # выход: Amnezia в Docker → AmneziaWG без Docker
             srv = D.cfg.by_id(body.get("id"))
             if not srv:
@@ -3398,7 +3630,7 @@ class Handler(BaseHTTPRequestHandler):
             params = body.get("params") or {}
             host = str(params.get("host") or "").strip()
             if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
-                return self._send(400, {"error": "IP нового сервера в виде 1.2.3.4"})
+                return self._send(400, {"error": "IP нового сервера в виде 203.0.113.10"})
             params["host"] = host
             if not body.get("password"):
                 return self._send(400, {"error": "нужен пароль root нового сервера"})

@@ -1,0 +1,88 @@
+name: Public candidate checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-validation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m compileall -q -f .
+      - name: Bash syntax
+        run: |
+          set -e
+          for f in dev/*.sh server-scripts/*.sh; do
+            bash -n "$f"
+          done
+      - name: Browser JavaScript syntax
+        run: python3 dev/check_js_syntax.py
+      - name: Public safety unit tests
+        run: python3 -m unittest discover -s dev -p 'test_public_safety.py'
+      - name: Public safety scan
+        run: python3 dev/public_safety.py
+
+
+  integration-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare isolated runner
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r requirements.txt playwright
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            .venv/bin/python -m playwright install --with-deps chromium
+          fi
+      - name: Clean first launch without personal configuration
+        run: python3 dev/test_public_fresh.py
+      - name: Five local fake servers and AWG/Sudoku API smoke test
+        run: |
+          set -euo pipefail
+          trap 'bash dev/testbed.sh stop || true; sudo bash dev/testbed.sh down || true' EXIT
+          sudo bash dev/testbed.sh up
+          sudo chown -R "$(id -u):$(id -g)" dev/stand
+          bash dev/testbed.sh run 8790
+          python3 dev/test_public_smoke.py
+          python3 dev/test_public_plans.py
+          python3 dev/test_public_browser.py
+          sudo python3 dev/test_public_reorder.py
+
+  windows-product-check:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies for Windows
+        run: python -m pip install -q -r requirements.txt
+      - name: Windows compile and clean first launch
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          python -m compileall -q -f .
+          python dev/test_public_fresh.py
+      - name: Check UTF-8 batch launcher and CRLF
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("start.bat")
+          $content = [Text.Encoding]::UTF8.GetString($bytes)
+          if (!$content.Contains("chcp 65001")) { throw "Missing UTF-8 console setting" }
+          if (!$content.Contains([Environment]::NewLine)) { throw "start.bat should have CRLF line endings" }
