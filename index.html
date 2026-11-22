@@ -953,7 +953,7 @@ function backupCard() {
     <div style="flex-grow:1"></div>
     <button class="btn" data-act="backup" data-id="${esc(bsrv)}" ${runB || !bsrv ? "disabled" : ""}>${spinIcon(runB)}${runB ? "Делаю бэкап…" : "Сделать бэкап"}</button></div>
     <div style="padding:12px 16px 16px;display:flex;flex-direction:column;gap:8px">
-    <span class="sm muted">Сервер: ${esc(name(bsrv))}, ${hrs > 0 ? "автоматически раз в " + hrs + " ч" : "автоматически — выключено"}, хранится ${esc(S.settings.backup_keep)} последних. <a href="#/settings">Изменить</a>.</span>
+    <span class="sm muted">Сервер: ${esc(name(bsrv))}, ${hrs > 0 ? "автоматически раз в " + hrs + " ч" : "автоматически — выключено"}, хранится ${esc(S.settings.backup_keep)} последних. <a href="#/settings/backup">Изменить</a>.</span>
     ${last.at && !last.ok ? `<span class="sm" style="color:var(--bad)">Последняя попытка ${esc(ago(last.at))} не удалась: ${esc(last.error)}</span>` : ""}`;
   if (!files.length) h += `<span class="dim sm" style="padding:8px 0">Архивов пока нет.</span>`;
   for (const f of files.slice(0, bkAll ? files.length : 2)) h += `<div class="list-row"><span class="mono sm" style="flex-grow:1;word-break:break-all">${esc(f.name)}</span><span class="sm muted">${esc(fmtDate(f.mtime))}</span><span class="mono sm" style="width:64px;text-align:right">${fmtMB(f.size)}</span></div>`;
@@ -1120,7 +1120,8 @@ function renderSettings() {
     <div class="msg" id="abuse-msg" style="padding:0"></div></div></section>`;
   if (st.port !== S.port_now) h += `<div class="banner">Панель сейчас работает на порту ${S.port_now}, в настройках — ${esc(st.port)}. Чтобы перейти: меню значка в трее → «Выход», потом start.bat.</div>`;
   for (const g of groups) {
-    h += `<section class="card"><div class="head"><h3>${esc(g.name)}</h3></div><div class="form setform${g.name === "Проверки" ? " setform-aligned" : ""}">`;
+    const anchor = g.items.some((f) => f.key === "backup_server") ? ' id="backup-settings" tabindex="-1"' : "";
+    h += `<section class="card"><div class="head"><h3${anchor}>${esc(g.name)}</h3></div><div class="form setform${g.name === "Проверки" ? " setform-aligned" : ""}">`;
     for (const f of g.items) {
       const v = st[f.key] ?? f.default, id = "set-" + f.key, hint = `<span class="sm dim">${f.help ? esc(f.help) + " " : ""}Стандартно: ${esc(fmtD(f))}.</span>`;
       if (f.type === "bool") {
@@ -1143,6 +1144,14 @@ function renderSettings() {
   $("#main").innerHTML = h;
   setDirty = false;
   remoteLoad();
+}
+
+function scrollSettings() {
+  const heading = location.hash === "#/settings/backup" ? $("#backup-settings") : null;
+  if (heading) {
+    heading.focus({ preventScroll: true });
+    heading.scrollIntoView({ block: "start", behavior: "instant" });
+  } else window.scrollTo({ top: 0, left: 0, behavior: "instant" });
 }
 
 // ------------------------------------------------------------------ удалённый доступ (настройка)
@@ -4358,12 +4367,14 @@ async function load() {
     if (bootSeen && S.boot !== bootSeen && !srvDirty && !setDirty) { location.reload(); return; }   // панель перезапустилась (обновление)
     bootSeen = S.boot;
     const p = location.hash.startsWith("#/servers") ? "servers" : location.hash.startsWith("#/settings") ? "settings" : location.hash.startsWith("#/new") ? "new" : location.hash.startsWith("#/sites") ? "sites" : location.hash.startsWith("#/fw") ? "fw" : location.hash.startsWith("#/quality") ? "quality" : location.hash.startsWith("#/addr") ? "addr" : location.hash.startsWith("#/awg") ? "awg" : location.hash.startsWith("#/zapret") ? "zapret" : location.hash.startsWith("#/ai") ? "ai" : "overview";
-    if (p !== page) window.scrollTo({ top: 0, left: 0, behavior: "instant" });   // ссылки на карточки задают позицию при отрисовке
+    const entering = p !== page;
+    if (entering && p !== "settings") window.scrollTo({ top: 0, left: 0, behavior: "instant" });   // ссылки на карточки задают позицию при отрисовке
     if (p !== page || (p === "servers" && !$("#srvlist"))) { page = p; if (p === "servers") { render(); renderServers(); } if (p === "settings") { render(); renderSettings(); } if (p === "new") { render(); await wzEnter(); } if (p === "sites") { render(); renderSites(); } if (p === "fw") { render(); renderFw(); } if (p === "quality") { render(); renderQuality(); } if (p === "addr") { render(); renderAddr(); } if (p === "awg") { render(); awgEnter(); } if (p === "zapret") { render(); renderZapret(); } if (p === "ai") { render(); renderAi(); } }
     else if (p === "sites") { if (!BYP_EDIT && !NEWB) renderBypasses(); renderDpi(); }   // пока правите цепочку — обходы не перерисовывать
     else if (p === "fw") renderFw();
     else if (p === "addr") renderAddr();
     else if (p === "ai") renderAi();
+    if (entering && p === "settings") scrollSettings();
     page = p;
     render();
   } catch (e) {
@@ -4371,10 +4382,11 @@ async function load() {
   }
   schedule(S && (S.running.length || (S.addrjobs || []).some((j) => j.status === "run") || (S.ai && S.ai.run)) ? 1500 : 6000);
 }
-window.addEventListener("hashchange", () => {
+window.addEventListener("hashchange", (event) => {
+  if (page === "settings" && location.hash.startsWith("#/settings")) { scrollSettings(); return; }
   const dirtyHere = (srvDirty && page === "servers" && !location.hash.startsWith("#/servers")) || (setDirty && page === "settings" && !location.hash.startsWith("#/settings"));
   if (dirtyHere) {
-    if (!confirm("Изменения не сохранены. Уйти без сохранения?")) { history.replaceState(null, "", "#/" + page); return; }
+    if (!confirm("Изменения не сохранены. Уйти без сохранения?")) { history.replaceState(null, "", new URL(event.oldURL).hash || "#/"); return; }
     srvDirty = setDirty = false;
   }
   if (!location.hash.startsWith("#/servers")) editId = editFrom = "";
