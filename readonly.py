@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 
 import paramiko
+from ssh_output import read_output
 
 USER = "vpn-ro"
 KR_KEY = "_ro_key"
@@ -176,10 +177,11 @@ class ROPool:
         for attempt in (1, 2):
             try:
                 c = self._client(srv)
-                si, so, se = c.exec_command(line, timeout=timeout)
-                out = so.read().decode("utf-8", "replace")
-                err = se.read().decode("utf-8", "replace")
-                rc = so.channel.recv_exit_status()
+                with c.get_transport().open_session(timeout=timeout) as channel:
+                    channel.settimeout(timeout)
+                    channel.exec_command(line)
+                    channel.shutdown_write()
+                    rc, out, err = read_output(channel, timeout)
                 if rc != 0 and not out.strip() and "sudo" in err:
                     raise self.CheckError("sudo на сервере не пустил vpn-ro к проверкам — переставьте доступ «только чтение»")
                 return (out + (("\n" + err) if err.strip() and rc else "")).strip()

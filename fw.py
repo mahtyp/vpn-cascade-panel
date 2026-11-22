@@ -174,8 +174,15 @@ def active():
 
 
 if P["do"] == "confirm":
+    # Таймер мог успеть выключить ufw во время долгой внешней проверки.
+    # Не подтверждать успех, если правил уже нет.
+    if not active():
+        cancel_undo()
+        done(False, "ufw уже выключен — подтверждать нечего", active=False)
     cancel_undo()
-    done(True, "фаервол оставлен включённым", active=active())
+    still_on = active()
+    done(still_on, "фаервол оставлен включённым" if still_on else
+         "ufw выключился во время подтверждения", active=still_on)
 if P["do"] == "disable":
     cancel_undo()
     rc, out = sh("ufw --force disable")

@@ -121,7 +121,7 @@ def nft_update(v4, v6, keep):
 
 
 # ------------------------------------------------------------------ на сервере (python3 -)
-# P = {"do": "apply", "nft": текст, "meta": {...}, "undo_s": 300} | {"do": "confirm"} | {"do": "undo"} | {"do": "off"} | {"do": "who", "ports": [...]}
+# P = {"do": "apply", "nft": текст, "meta": {...}, "undo_s": 300} | {"do": "confirm", "meta": {...}} | {"do": "undo"} | {"do": "off"} | {"do": "who", "ports": [...]}
 # apply: ставит nftables (только пакет, его службу не включает), прежнее состояние — в .prev, «ремень» его вернёт.
 
 GOV_PY = r'''
@@ -175,14 +175,36 @@ if P["do"] == "who":                 # кто сейчас подключён к
                 peers.add(rp[0].strip("[]").replace("::ffff:", ""))
     done(True, "", me=me[0] if me else "", peers=sorted(peers))
 if P["do"] == "confirm":
+    def matches_apply():
+        try:
+            with open(META) as f:
+                return json.load(f) == P["meta"]
+        except (OSError, ValueError):
+            return False
+
+    def unconfirmed(msg):
+        done(False, msg, undo_pending=os.path.isfile(UNDO_SH))
+
+    if not matches_apply():
+        unconfirmed("применение списка не подтверждено")
+    rc, out = sh("systemctl daemon-reload && systemctl enable vpn-dash-govblock", 30)
+    if rc != 0:
+        unconfirmed("не удалось настроить запуск защиты после перезагрузки (%s)"
+                    % (out.strip()[-300:] or "код %d" % rc))
+    rc, out = sh("systemctl is-enabled vpn-dash-govblock", 15)
+    if rc != 0 or out.strip() != "enabled":
+        unconfirmed("запуск защиты после перезагрузки не подтверждён")
+    if sh("nft list chain inet %s input" % TABLE, 15)[0] != 0:
+        unconfirmed("рабочая цепочка nftables не найдена")
+    if not matches_apply():
+        unconfirmed("применение списка не подтверждено")
     cancel_undo()
     for f in (PREV, PREVM):
         try:
             os.remove(f)
         except OSError:
             pass
-    sh("systemctl daemon-reload; systemctl enable vpn-dash-govblock >/dev/null 2>&1")
-    done(True, "оставлено включённым, и после перезагрузки тоже", on=on())
+    done(True, "оставлено включённым, и после перезагрузки тоже", on=True, boot=True)
 if P["do"] == "undo":                # вернуть прежнее сейчас, не дожидаясь «ремня»
     if not os.path.exists(UNDO_SH):
         done(False, "возвращать нечего", on=on())

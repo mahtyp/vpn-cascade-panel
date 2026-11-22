@@ -88,6 +88,13 @@ add_awg() {
 
 # ---------------------------------------------------------------- 2. Sudoku / Mihomo
 
+sudoku_exit_ip() {
+  local site=https://api.ipify.org
+  # При разрешении имени через SOCKS ifconfig.me может вернуть IPv6 для выхода с двумя стеками.
+  [[ "$IP" == *:* ]] && site=https://ifconfig.me
+  curl -4 -fsS -m 12 --noproxy '' --socks5-hostname "127.0.0.1:$SOCKS_PORT" "$site"
+}
+
 add_sudoku() {
   say "2. Sudoku: прокси в Mihomo"
   [ -f "$MIHOMO_CONF" ] || die "нет $MIHOMO_CONF — на этом сервере не настроен Mihomo"
@@ -199,19 +206,45 @@ PY
   SOCKS_PORT=$(sed -n 's/^PORT=//p' "$T/out")
   local state; state=$(sed -n 's/^STATE=//p' "$T/out")
 
+  local backup="" changed=0 via="" verified=0 attempt
   if [ "$state" = "уже был" ] && cmp -s "$MIHOMO_CONF" "$T/config.new"; then
     ok "прокси EU-Sudoku-$NAME уже есть, SOCKS $SOCKS_PORT"
   else
     "$MIHOMO_BIN" -t -d "$(dirname "$MIHOMO_CONF")" -f "$T/config.new" >"$T/test" 2>&1 \
       || { cat "$T/test" >&2; die "Mihomo не принял новый конфиг — ничего не меняю"; }
-    cp "$MIHOMO_CONF" "$MIHOMO_CONF.bak-$(date +%F_%H%M%S)"
+    backup="$MIHOMO_CONF.bak-$(date +%F_%H%M%S)-$$"
+    cp -p "$MIHOMO_CONF" "$backup"
     install -m 600 "$T/config.new" "$MIHOMO_CONF"
-    systemctl restart mihomo
-    sleep 3
-    ok "прокси EU-Sudoku-$NAME $state, SOCKS 127.0.0.1:$SOCKS_PORT (старый конфиг: $MIHOMO_CONF.bak-*)"
+    changed=1
+    if ! systemctl restart mihomo || ! systemctl is-active --quiet mihomo; then
+      warn "Mihomo не запустился с новым конфигом — возвращаю предыдущий"
+      install -m 600 "$backup" "$MIHOMO_CONF"
+      if systemctl restart mihomo && systemctl is-active --quiet mihomo; then
+        die "новый конфиг Mihomo не запустился; прежний восстановлен"
+      fi
+      die "Mihomo не поднялся даже после возврата прежнего конфига — проверьте журнал службы"
+    fi
   fi
-  local via; via=$(curl -s -m 15 --socks5 "127.0.0.1:$SOCKS_PORT" https://ifconfig.me || true)
-  if [ "$via" = "$IP" ]; then ok "SOCKS $SOCKS_PORT → $via"; else warn "SOCKS $SOCKS_PORT → ${via:-нет ответа} (ожидался $IP)"; fi
+  # Проверка должна проходить именно через SOCKS нового выхода, а не через DNS входа.
+  # После перезапуска даём Mihomo и Sudoku три короткие попытки.
+  for attempt in 1 2 3; do
+    if via=$(sudoku_exit_ip 2>/dev/null) && [ "$via" = "$IP" ]; then verified=1; break; fi
+    [ "$attempt" = 3 ] || sleep 2
+  done
+  if [ "$verified" = 1 ]; then
+    [ "$changed" = 0 ] || ok "прокси EU-Sudoku-$NAME $state, SOCKS 127.0.0.1:$SOCKS_PORT (копия: $backup)"
+    ok "SOCKS $SOCKS_PORT → $via"
+    return 0
+  fi
+  if [ "$changed" = 1 ]; then
+    warn "новый SOCKS не подтвердил выход $IP (${via:-нет ответа}) — возвращаю конфиг Mihomo"
+    install -m 600 "$backup" "$MIHOMO_CONF"
+    if systemctl restart mihomo && systemctl is-active --quiet mihomo; then
+      die "новый канал Sudoku не работает; прежний конфиг Mihomo восстановлен"
+    fi
+    die "новый канал Sudoku не работает; прежний конфиг восстановлен, но Mihomo не поднялся"
+  fi
+  die "имеющийся SOCKS $SOCKS_PORT не подтвердил выход $IP (${via:-нет ответа}); конфиг не менял"
 }
 
 # ---------------------------------------------------------------- замена: что осталось от старого выхода
@@ -661,7 +694,7 @@ add_exit_main() {
     if [ "$v" = "$IP" ]; then ok "$IFACE → $v"; else warn "$IFACE → ${v:-нет ответа} (ожидался $IP)"; fi
   fi
   if [ -n "${SOCKS_PORT:-}" ]; then
-    v=$(curl -s -m 15 --socks5 "127.0.0.1:$SOCKS_PORT" https://ifconfig.me || true)
+    v=$(sudoku_exit_ip || true)
     if [ "$v" = "$IP" ]; then ok "SOCKS $SOCKS_PORT → $v"; else warn "SOCKS $SOCKS_PORT → ${v:-нет ответа} (ожидался $IP)"; fi
   fi
   if [ "${SUDOKU_ONLY:-0}${AWG_ONLY:-0}${VLESS_ONLY:-0}" != 000 ] && [ "$XUI_ALREADY" != 1 ]; then

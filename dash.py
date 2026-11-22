@@ -14,10 +14,12 @@ import base64
 import concurrent.futures as cf
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
 import secrets
+import shlex
 import socket
 import sqlite3
 import ssl
@@ -27,11 +29,13 @@ import threading
 import time
 import traceback
 import webbrowser
+from contextlib import ExitStack, closing, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 import remote
+from ssh_output import read_output
 
 try:
     import paramiko
@@ -98,6 +102,8 @@ TOKEN = secrets.token_urlsafe(18)   # новый при каждом запус�
 BOOT_ID = secrets.token_hex(4)      # по нему открытая страница замечает перезапуск панели и обновляется
 
 TG_DC_DEFAULT = "DC1 149.154.175.53\nDC2 149.154.167.51\nDC3 149.154.175.100\nDC4 149.154.167.91\nDC5 91.108.56.130"
+CHECK_URL = "https://ifconfig.me"
+CHECK_URL_IPV4 = "https://api.ipify.org"
 # Все настройки панели: (ключ, по умолчанию, тип, мин, макс, группа, подпись, пояснение).
 # Страница «Настройки» строится из этого списка; значения хранятся в servers.json → settings.
 SETTINGS = [
@@ -105,8 +111,8 @@ SETTINGS = [
     ("dc_minutes", 30, "int", 5, 240, "Проверки", "Проверять Telegram DC каждые, мин", ""),
     ("slow_s", 2.0, "float", 0.3, 30, "Проверки", "Канал медленный (жёлтый), если ответ дольше, с", ""),
     ("channel_timeout", 15, "int", 3, 60, "Проверки", "Ждать ответа через канал, с", "Не дождались — канал красный."),
-    ("check_url", "https://ifconfig.me", "url", None, None, "Проверки", "Адрес для проверки канала",
-     "Должен отвечать голым IP-адресом. Другие варианты: https://api.ipify.org, https://icanhazip.com"),
+    ("check_url", CHECK_URL, "url", None, None, "Проверки", "Адрес для проверки канала",
+     "Должен отвечать голым IP-адресом. Если ifconfig.me не подтвердил ожидаемый IPv4, панель может перепроверить через api.ipify.org."),
     ("hs_stale_min", 5, "int", 1, 120, "Проверки", "Рукопожатие AWG считать старым после, мин", ""),
     ("pc_e2e", True, "bool", None, None, "Проверки", "Проверять входы и с этого компьютера",
      "При полной проверке панель запускает у себя клиент Xray (скачивается с GitHub XTLS при первой проверке) и открывает страницу "
@@ -214,6 +220,10 @@ DEFAULT_CFG = {
 
 class CheckError(Exception):
     pass
+
+
+class SSHOutcomeUnknown(CheckError):
+    """Запрос на выполнение мог дойти до сервера, но итог неизвестен."""
 
 
 def now():
@@ -360,29 +370,33 @@ class SSHPool:
                 self.drop(entry["id"])
                 raise CheckError("через вход %s: %s" % (entry["name"], e or type(e).__name__))
             path = {"via": entry["name"], "via_id": entry["id"], "how": how, "addr": "%s:%d" % (host, port)}
-        c = paramiko.SSHClient()
-        KNOWN_HOSTS.touch(exist_ok=True)
-        c.load_host_keys(str(KNOWN_HOSTS))
-        c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        pre = "через вход %s: " % path["via"] if via else ""
-        try:
-            c.connect(srv["host"], port=int(srv.get("port") or 22), username=srv.get("user") or "root",
-                      password=pw, timeout=10, banner_timeout=15, auth_timeout=15,
-                      look_for_keys=False, allow_agent=False, sock=sock)
-        except paramiko.AuthenticationException:
-            raise CheckError("неверный пароль")
-        except paramiko.BadHostKeyException:
-            raise CheckError("ключ сервера изменился (переустановка или подмена?) — удалите его строку из known_hosts")
-        except (socket.timeout, TimeoutError):
-            raise CheckError(pre + "SSH не отвечает (таймаут)")
-        except (paramiko.SSHException, OSError) as e:
-            if "No existing session" in str(e) or "No authentication methods" in str(e):
-                raise CheckError(pre + "сервер оборвал вход до проверки пароля — скорее всего вход %s по паролю на нём выключен "
-                                 "(только по ключу) или его режет защита от перебора. Нужно разрешить: PermitRootLogin yes и "
-                                 "PasswordAuthentication yes в настройках SSH сервера" % (srv.get("user") or "root"))
-            raise CheckError(pre + "SSH: %s" % e)
-        c.save_host_keys(str(KNOWN_HOSTS))
-        return c, path
+        with ExitStack() as resources:
+            if sock is not None:
+                resources.callback(sock.close)
+            c = resources.enter_context(closing(paramiko.SSHClient()))
+            KNOWN_HOSTS.touch(exist_ok=True)
+            c.load_host_keys(str(KNOWN_HOSTS))
+            c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            pre = "через вход %s: " % path["via"] if via else ""
+            try:
+                c.connect(srv["host"], port=int(srv.get("port") or 22), username=srv.get("user") or "root",
+                          password=pw, timeout=10, banner_timeout=15, auth_timeout=15,
+                          look_for_keys=False, allow_agent=False, sock=sock)
+            except paramiko.AuthenticationException:
+                raise CheckError("неверный пароль")
+            except paramiko.BadHostKeyException:
+                raise CheckError("ключ сервера изменился (переустановка или подмена?) — удалите его строку из known_hosts")
+            except (socket.timeout, TimeoutError):
+                raise CheckError(pre + "SSH не отвечает (таймаут)")
+            except (paramiko.SSHException, OSError) as e:
+                if "No existing session" in str(e) or "No authentication methods" in str(e):
+                    raise CheckError(pre + "сервер оборвал вход до проверки пароля — скорее всего вход %s по паролю на нём выключен "
+                                     "(только по ключу) или его режет защита от перебора. Нужно разрешить: PermitRootLogin yes и "
+                                     "PasswordAuthentication yes в настройках SSH сервера" % (srv.get("user") or "root"))
+                raise CheckError(pre + "SSH: %s" % e)
+            c.save_host_keys(str(KNOWN_HOSTS))
+            resources.pop_all()  # клиент забирает соединение и туннель
+            return c, path
 
     # Туннели AWG на входах — с Table = off: маршрутов в них нет, Xray и проверки выбирают туннель сами
     # (sockopt interface, ping -I). Поэтому sshd входа (direct-tcpip) до адреса выхода в туннеле не дойдёт —
@@ -430,31 +444,33 @@ while True:
         import base64
         code = "IFACE = %r\nHOST = %r\nPORT = %d\n" % (iface, host, port) + self.RELAY_PY
         ch = tr.open_session(timeout=10)
-        ch.exec_command("python3 -u -c 'import base64; exec(base64.b64decode(\"%s\"))'" % base64.b64encode(code.encode()).decode())
-        ch.settimeout(15)
-        got = b""
-        try:
-            while len(got) < 3:
-                part = ch.recv(3 - len(got))
-                if not part:
-                    break
-                got += part
-        except socket.timeout:
-            pass
-        if got != b"OK\n":
-            err = b""
+        with ExitStack() as resources:
+            resources.callback(ch.close)
+            ch.exec_command("python3 -u -c 'import base64; exec(base64.b64decode(\"%s\"))'" % base64.b64encode(code.encode()).decode())
+            ch.settimeout(15)
+            got = b""
             try:
-                while ch.recv_stderr_ready() or not ch.exit_status_ready():
-                    part = ch.recv_stderr(4096)
+                while len(got) < 3:
+                    part = ch.recv(3 - len(got))
                     if not part:
                         break
-                    err += part
+                    got += part
             except socket.timeout:
                 pass
-            ch.close()
-            raise CheckError("вход %s: %s" % (entry["name"], err.decode("utf-8", "replace").strip() or "по туннелю %s не подключиться (таймаут)" % iface))
-        ch.settimeout(None)
-        return ch
+            if got != b"OK\n":
+                err = b""
+                try:
+                    while ch.recv_stderr_ready() or not ch.exit_status_ready():
+                        part = ch.recv_stderr(4096)
+                        if not part:
+                            break
+                        err += part
+                except socket.timeout:
+                    pass
+                raise CheckError("вход %s: %s" % (entry["name"], err.decode("utf-8", "replace").strip() or "по туннелю %s не подключиться (таймаут)" % iface))
+            ch.settimeout(None)
+            resources.pop_all()
+            return ch
 
     def tunnel(self, srv, host, port):
         """Сокет, соединённый через SSH с host:port на самом сервере (как ssh -L). Нужен, чтобы открыть 3X-UI,
@@ -472,7 +488,10 @@ while True:
                 self.drop(srv["id"])
                 if attempt == 2:
                     raise CheckError("SSH: %s" % (e or type(e).__name__))
-        a, b = socket.socketpair()
+        with ExitStack() as failed:
+            failed.callback(ch.close)
+            a, b = socket.socketpair()
+            failed.pop_all()
         left = [2]
         lk = threading.Lock()
 
@@ -487,6 +506,11 @@ while True:
                 except Exception:
                     pass
 
+        def abort():
+            with suppress(OSError):
+                a.shutdown(socket.SHUT_RDWR)
+            ch.close()
+
         def to_server():
             try:
                 while True:
@@ -496,7 +520,7 @@ while True:
                     ch.sendall(d)
                 ch.shutdown_write()
             except Exception:
-                pass
+                abort()
             finally:
                 finish()
 
@@ -508,7 +532,7 @@ while True:
                         break
                     a.sendall(d)
             except Exception:
-                pass
+                abort()
             finally:
                 try:
                     a.shutdown(socket.SHUT_WR)
@@ -520,39 +544,43 @@ while True:
         threading.Thread(target=to_us, daemon=True).start()
         return b
 
-    def run(self, srv, cmd, stdin=None, timeout=60):
+    def run(self, srv, cmd, stdin=None, timeout=60, *, retry=False):
+        """Повтор после возможной отправки команды разрешён только по явному запросу."""
         with self._sem(srv["id"]):
             for attempt in (1, 2, 3):
-                c = None
+                transport = channel = None
+                dispatched = False
                 try:
-                    c = self.client(srv)
-                    si, so, se = c.exec_command(cmd, timeout=timeout)
+                    transport = self.client(srv).get_transport()
+                    if transport is None:
+                        raise paramiko.SSHException("соединение закрыто")
+                    channel = transport.open_session(timeout=timeout)
+                    channel.settimeout(timeout)
+                    dispatched = True  # ошибка при ожидании ACK ещё не означает, что команда не запустилась
+                    channel.exec_command(cmd)
                     if stdin is not None:
-                        si.write(stdin)
-                        si.channel.shutdown_write()
-                    out = so.read().decode("utf-8", "replace")
-                    err = se.read().decode("utf-8", "replace")
-                    rc = so.channel.recv_exit_status()
-                    if rc == -1 and not out and attempt < 3:    # канал закрылся без кода — соединение оборвалось, ещё раз
-                        continue
-                    return rc, out, err
-                except CheckError:
-                    raise
-                except (paramiko.ChannelException, paramiko.SSHException) as e:
-                    if not isinstance(e, paramiko.ChannelException) and "open channel" not in str(e).lower() \
-                            or not (c and c.get_transport() and c.get_transport().is_active()):
-                        self.drop(srv["id"])
+                        channel.makefile_stdin("wb").write(stdin)
+                        channel.shutdown_write()
+                    return read_output(channel, timeout)
+                except (paramiko.SSHException, OSError, EOFError) as e:
+                    active = transport is not None and transport.is_active()
+                    if dispatched and not retry:
+                        if not active:
+                            self.drop(srv["id"])
+                        raise SSHOutcomeUnknown("SSH: результат команды неизвестен. Она могла выполниться на сервере.") from e
+                    if not dispatched and active and (isinstance(e, paramiko.ChannelException) or "open channel" in str(e).lower()):
+                        # MaxSessions: команда ещё не отправлялась, дождёмся свободного канала.
                         if attempt == 3:
-                            raise CheckError("SSH: %s" % (e or type(e).__name__))
+                            raise CheckError("SSH: сервер не открыл ещё один канал (%s)" % e) from e
+                        time.sleep(1.5)
                         continue
-                    # сервер не дал ещё одну сессию (MaxSessions) — соединение живо, не рвём: подождать и ещё раз
-                    if attempt == 3:
-                        raise CheckError("SSH: сервер не открыл ещё один канал (%s)" % e)
-                    time.sleep(1.5)
-                except (OSError, EOFError) as e:
                     self.drop(srv["id"])
                     if attempt == 3:
-                        raise CheckError("SSH: %s" % (e or type(e).__name__))
+                        raise CheckError("SSH: %s" % (str(e) or type(e).__name__)) from e
+                finally:
+                    if channel is not None:
+                        with suppress(paramiko.SSHException, OSError, EOFError):
+                            channel.close()
 
 
 # ------------------------------------------------------------------ история
@@ -563,22 +591,26 @@ class History:
     def __init__(self, days=lambda: 30):
         self.days = days
         self.lock = threading.Lock()
+        self.summary_lock = threading.Lock()
         self.db = sqlite3.connect(str(HIST_FILE), check_same_thread=False)
         self.db.execute("pragma journal_mode=wal")
         self.db.execute("create table if not exists samples(ts real, kind text, key text, status text, ms real)")
         self.db.execute("create index if not exists samples_k on samples(kind, key, ts)")
+        self.db.execute("create index if not exists samples_ts on samples(ts)")
         self.db.commit()
         self.last_prune = 0
         self.cache = (0, None)
 
     def add(self, kind, key, status, ms=None):
         with self.lock:
-            self.db.execute("insert into samples values(?,?,?,?,?)", (now(), kind, key, status, ms))
-            self.db.commit()
-            if now() - self.last_prune > 3600:
-                self.last_prune = now()
-                self.db.execute("delete from samples where ts < ?", (now() - self.days() * 86400,))
-                self.db.commit()
+            ts = now()
+            prune = ts - self.last_prune > 3600
+            with self.db:
+                self.db.execute("insert into samples values(?,?,?,?,?)", (ts, kind, key, status, ms))
+                if prune:
+                    self.db.execute("delete from samples where ts < ?", (ts - self.days() * 86400,))
+            if prune:
+                self.last_prune = ts
 
     def series(self, kind, key, hours):
         with self.lock:
@@ -588,6 +620,10 @@ class History:
 
     def summary(self):
         """Для обзора: по каждому каналу и DC — доступность за 24 ч и 48 точек для мини-графика."""
+        with self.summary_lock:
+            return self._summary()
+
+    def _summary(self):
         if now() - self.cache[0] < 20:
             return self.cache[1]
         since = now() - 86400
@@ -1268,7 +1304,7 @@ class Dash:
 
         def one(s):
             try:
-                rc, out, err = self.ssh.run(s, "python3 -", stdin='MODE = "%s"\n' % mode + PROBE, timeout=timeout)
+                rc, out, err = self.ssh.run(s, "python3 -", stdin='MODE = "%s"\n' % mode + PROBE, timeout=timeout, retry=True)
                 if rc != 0 or not out.strip():
                     raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
                 return s["id"], json.loads(out.strip().splitlines()[-1])[mode]
@@ -1351,7 +1387,7 @@ class Dash:
         if not re.match(r"^[A-Za-z0-9._:\[\]/-]{1,200}$", t):
             return {"error": "впишите сайт (например youtube.com) или адрес (203.0.113.10)"}
         try:
-            rc, out, err = self.ssh.run(srv, "python3 -", stdin="TARGET = %r\n" % t + proto.ROUTE_PY, timeout=90)
+            rc, out, err = self.ssh.run(srv, "python3 -", stdin="TARGET = %r\n" % t + proto.ROUTE_PY, timeout=90, retry=True)
             if rc != 0 or not out.strip():
                 raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
             return json.loads(out.strip().splitlines()[-1])
@@ -1369,7 +1405,7 @@ class Dash:
             return {"error": "нет такого сервера"}
         with self.busy("proto:" + sid):
             try:
-                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "prototest"\n' + PROBE, timeout=60)
+                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "prototest"\n' + PROBE, timeout=60, retry=True)
                 if rc != 0 or not out.strip():
                     raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
                 r = json.loads(out.strip().splitlines()[-1])["prototest"]
@@ -1391,7 +1427,7 @@ class Dash:
             return
         with self.busy("fw:" + sid):
             try:
-                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "fw"\n' + PROBE, timeout=70)
+                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "fw"\n' + PROBE, timeout=70, retry=True)
                 if rc != 0 or not out.strip():
                     raise CheckError("проверочный скрипт: %s" % (err.strip().splitlines() or ["код %s" % rc])[-1][:200])
                 r = {"at": now(), "ok": True, "plan": fw.plan(srv, json.loads(out)["fw"])}
@@ -1417,13 +1453,13 @@ class Dash:
             for c in self.channels.get(e["id"], []):
                 if e["id"] == sid or c.get("exit_id") == sid:
                     out.append((e["id"], c["key"]))
-        return out
+        return list(dict.fromkeys(out))
 
     def _fw_probe(self, srv, chans):
         """Сейчас: SSH заново, каналы, порты входа с этого компьютера. → (ssh_ok, {канал: ok}, {порт: ok})"""
         self.ssh.drop(srv["id"])
         try:
-            rc, _, _ = self.ssh.run(srv, "true", timeout=20)
+            rc, _, _ = self.ssh.run(srv, "true", timeout=20, retry=True)
             ssh_ok = rc == 0
         except CheckError:
             ssh_ok = False
@@ -1477,7 +1513,7 @@ class Dash:
                 step("info", "включаю ufw (если нужно — ставлю); «ремень»: сам выключится через 5 минут")
                 res = self._fw_run(srv, {"do": "enable", "cmds": cmds, "undo_s": 300}, timeout=700)
             except CheckError as e:
-                return finish(False, "не дошло до сервера: %s — если ufw успел включиться, он выключится сам через 5 минут" % e)
+                return finish(False, "включение ufw не подтверждено (%s). Если таймер отката запустился, ufw выключится сам" % e)
             if not res.get("ok"):
                 return finish(False, res.get("msg") or "не вышло")
             job["undo_at"] = now() + 300
@@ -1504,10 +1540,12 @@ class Dash:
                 except CheckError:
                     return finish(False, "до сервера не достучаться — ufw выключится сам через 5 минут")
             try:
-                self._fw_run(srv, {"do": "confirm"})
+                confirmed = self._fw_run(srv, {"do": "confirm"})
             except CheckError as e:
-                return finish(False, "не смог подтвердить (%s) — ufw выключится сам через 5 минут" % e)
+                return finish(False, "не удалось получить итог подтверждения ufw (%s)" % e)
             job["undo_at"] = None
+            if not confirmed.get("ok") or confirmed.get("active") is not True:
+                return finish(False, "ufw не остался включён после проверки — проверьте состояние фаервола")
             ok_ch = sum(1 for v in ch1.values() if v)
             finish(True, "включён: SSH работает, каналов в порядке %d из %d%s. «Ремень» снят — ufw остаётся включённым "
                          "насовсем, и после перезагрузки тоже" % (ok_ch, len(ch1), ", порты входа открываются" if ports1 else ""))
@@ -1595,7 +1633,8 @@ class Dash:
 
     def _gov_run(self, srv, P, timeout=120):
         import govblock
-        rc, out, err = self.ssh.run(srv, "python3 -", stdin="P = %s\n" % json.dumps(P) + govblock.GOV_PY, timeout=timeout)
+        rc, out, err = self.ssh.run(srv, "python3 -", stdin="P = %s\n" % json.dumps(P) + govblock.GOV_PY, timeout=timeout,
+                                    retry=P["do"] == "who")
         lines = out.strip().splitlines()
         if not lines:
             raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:300])
@@ -1660,7 +1699,7 @@ class Dash:
                                           "upd": govblock.nft_update(g["v4"], g["v6"], keep), "meta": meta,
                                           "undo_s": 300}, timeout=600)
             except CheckError as e:
-                return finish(False, "не дошло до сервера: %s — если успело включиться, через 5 минут вернётся само" % e)
+                return finish(False, "применение списка не подтверждено (%s). Если таймер отката запустился, он вернёт прежнее состояние" % e)
             if not res.get("ok"):
                 return finish(False, res.get("msg") or "не вышло")
             job["undo_at"] = now() + 300
@@ -1679,9 +1718,16 @@ class Dash:
                 except CheckError:
                     return finish(False, "до сервера не достучаться — через 5 минут вернётся само")
             try:
-                self._gov_run(srv, {"do": "confirm"})
+                confirmed = self._gov_run(srv, {"do": "confirm", "meta": meta})
             except CheckError as e:
-                return finish(False, "не смог подтвердить (%s) — через 5 минут вернётся как было" % e)
+                return finish(False, "сервер не подтвердил итог (%s). Состояние защиты неизвестно" % e)
+            if not confirmed.get("ok") or confirmed.get("on") is not True or confirmed.get("boot") is not True:
+                text = confirmed.get("msg") or "сервер не подтвердил рабочую цепочку и запуск после перезагрузки"
+                if confirmed.get("undo_pending") is True:
+                    text += ". Таймер отката остаётся включённым"
+                elif confirmed.get("undo_pending") is False:
+                    job["undo_at"] = None
+                return finish(False, text)
             job["undo_at"] = None
             self.check_server(sid)
             return finish(True, ("список обновлён (от %s)" if auto else "включено: список от %s, всё работает как раньше")
@@ -1789,15 +1835,19 @@ class Dash:
         except OSError:
             pass
 
-    def busy(self, key):
+    def busy(self, key, *, exclusive=False):
         class _B:
             def __enter__(s):
                 with self.lock:
-                    self.running.add(key)
+                    s.acquired = not exclusive or key not in self.running
+                    if s.acquired:
+                        self.running.add(key)
+                    return s.acquired
 
             def __exit__(s, *a):
-                with self.lock:
-                    self.running.discard(key)
+                if s.acquired:
+                    with self.lock:
+                        self.running.discard(key)
         return _B()
 
     # --- состояние сервера
@@ -1806,19 +1856,20 @@ class Dash:
         srv = self.cfg.by_id(sid)
         if not srv:
             return
-        if "srv:" + sid in self.running:      # уже проверяется — дождёмся этой проверки
-            for _ in range(600):
-                time.sleep(0.2)
-                if "srv:" + sid not in self.running:
-                    return
-            return
-        with self.busy("srv:" + sid):
+        key = "srv:" + sid
+        with self.busy(key, exclusive=True) as acquired:
+            if not acquired:        # уже проверяется — дождёмся этой проверки
+                for _ in range(600):
+                    if key not in self.running:
+                        break
+                    time.sleep(0.2)
+                return
             try:
                 # число обновлений считается тяжело — раз в 6 часов (или сразу после установки), в остальное время
                 # показываем прошлое
                 pc = self.pkg_count.get(sid) or {}
                 want = now() - pc.get("at", 0) > 6 * 3600
-                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "status"\nPKG_COUNT = %s\n' % want + PROBE, timeout=90)
+                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "status"\nPKG_COUNT = %s\n' % want + PROBE, timeout=90, retry=True)
                 if rc != 0 or not out.strip():
                     raise CheckError("проверочный скрипт: %s" % (
                         "не уложился в 80 с — сервер перегружен?" if rc == 3 else (err.strip().splitlines() or ["код %s" % rc])[-1][:200]))
@@ -2012,24 +2063,57 @@ class Dash:
         rk = "%s:%s" % (sid, key)
         with self.busy("ch:" + rk):
             st = self.cfg.settings
-            url = st.get("check_url") or "https://ifconfig.me"
+            url = st.get("check_url") or CHECK_URL
             tmo = int(st.get("channel_timeout") or 15)
-            if ch["kind"] == "AWG":
-                cmd = "curl -4 -s -m %d --interface %s -w '\\n%%{time_total}' '%s'" % (tmo, ch["iface"], url)
-            else:
-                cmd = "curl -4 -s -m %d --socks5 127.0.0.1:%d -w '\\n%%{time_total}' '%s'" % (tmo, int(ch["port"]), url)
-            res = {"at": now()}
+            expected = ch.get("host")
             try:
-                rc, out, err = self.ssh.run(srv, cmd, timeout=30)
-                lines = out.strip().splitlines()
-                ip = lines[0].strip() if len(lines) >= 2 else ""
-                secs = float(lines[-1]) if lines and re.match(r"^[\d.]+$", lines[-1].strip()) else None
-                if rc != 0 or not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
-                    res.update(status="bad", error="нет ответа через канал" + (" (curl %d)" % rc if rc else ""))
-                elif ch.get("host") and ip != ch["host"]:
-                    res.update(status="bad", ip=ip, ms=secs, error="вышел не через тот сервер: %s" % ip)
-                else:
-                    res.update(status="warn" if secs and secs >= float(st.get("slow_s") or 2) else "ok", ip=ip, ms=secs)
+                expected_ip = ipaddress.ip_address(expected)
+            except ValueError:
+                expected_ip = None
+            urls = [url]
+            if url.rstrip("/") == CHECK_URL and isinstance(expected_ip, ipaddress.IPv4Address):
+                urls.append(CHECK_URL_IPV4)
+            if ch["kind"] == "AWG":
+                route = "--interface " + shlex.quote(ch["iface"])
+            else:
+                route = "--noproxy '' --socks5-hostname 127.0.0.1:%d" % int(ch["port"])
+            res = {"at": now()}
+            deadline = time.monotonic() + tmo
+            errors = []
+            try:
+                for i, endpoint in enumerate(urls):
+                    # Первому запросу даём весь лимит. Резервный использует остаток.
+                    limit = tmo if i == 0 else int(deadline - time.monotonic())
+                    if limit < 1:
+                        break
+                    cmd = "curl -4 -s -m %d %s -w '\\n%%{http_code} %%{time_total}' %s" % (limit, route, shlex.quote(endpoint))
+                    rc, out, _ = self.ssh.run(srv, cmd, timeout=max(30, limit + 15), retry=True)
+                    body, _, footer = out.rstrip().rpartition("\n")
+                    meta = re.fullmatch(r"([0-9]{3}) ([0-9]+(?:\.[0-9]+)?)", footer)
+                    code, secs = (int(meta[1]), float(meta[2])) if meta else (0, None)
+                    try:
+                        ip = ipaddress.ip_address(body.strip())
+                    except ValueError:
+                        ip = None
+                    host = urlparse(endpoint).hostname or "контрольный сайт"
+                    if rc:
+                        errors.append("%s — нет ответа (curl %d)" % (host, rc))
+                        if rc == 45 or (rc == 7 and ch["kind"] != "AWG"):
+                            break
+                    elif not 200 <= code < 300:
+                        errors.append("%s — %s" % (host, "HTTP %d" % code if code else "нет HTTP-ответа"))
+                    elif ip is None:
+                        errors.append("%s — ответ без IP-адреса" % host)
+                    elif expected_ip and ip.version != expected_ip.version:
+                        errors.append("%s — вернул IPv%d, ожидался IPv%d" % (host, ip.version, expected_ip.version))
+                    else:
+                        if expected and (ip != expected_ip if expected_ip else str(ip) != expected):
+                            res.update(status="bad", ip=str(ip), ms=secs, error="вышел не через тот сервер: %s" % ip)
+                        else:
+                            res.update(status="warn" if secs and secs >= float(st.get("slow_s") or 2) else "ok", ip=str(ip), ms=secs)
+                        break
+                if "status" not in res:
+                    res.update(status="bad", error=". ".join(errors))
                 self.hist.add("ch", rk, res["status"], res.get("ms"))
             except CheckError as e:
                 res.update(status="bad", error=str(e))
@@ -2046,7 +2130,8 @@ class Dash:
                     self.note("bad", "%s: %s" % (name, res.get("error")))
 
     def check_entry_channels(self, sid):
-        futs = [self.leaf.submit(self.check_channel, sid, c["key"]) for c in self.channels.get(sid, [])]
+        keys = dict.fromkeys(c["key"] for c in self.channels.get(sid, []))
+        futs = [self.leaf.submit(self.check_channel, sid, key) for key in keys]
         cf.wait(futs)
 
     # --- раздел «Zapret»
@@ -2144,7 +2229,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                 tun = None
         if not tun:                       # вход ещё не проверялся — спросим у него самого
             try:
-                rc, out, _ = self.ssh.run(entry, "python3 -", stdin="HOST = %r\n" % srv["host"] + self.TUN_PY, timeout=20)
+                rc, out, _ = self.ssh.run(entry, "python3 -", stdin="HOST = %r\n" % srv["host"] + self.TUN_PY, timeout=20, retry=True)
                 tun = json.loads(out) if out.strip() else None
             except (CheckError, ValueError):
                 tun = None
@@ -2161,7 +2246,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
         with self.busy("dc:" + sid):
             try:
                 dcs = parse_dc(self.cfg.settings.get("tg_dc")) or parse_dc(TG_DC_DEFAULT)
-                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "dc"\nTG_DC_OVERRIDE = %r\n' % dcs + PROBE, timeout=40)
+                rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "dc"\nTG_DC_OVERRIDE = %r\n' % dcs + PROBE, timeout=40, retry=True)
                 cells = json.loads(out)["dc"]
                 r = {"at": now(), "cells": cells}
                 for c in cells:
@@ -2182,21 +2267,26 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
     # --- доступность входов с этого компьютера
 
     def reach_targets(self):
-        out = []
+        out = {}
         for s in self.cfg.servers:
             if s["role"] != "entry":
                 continue
             x = ((self.status.get(s["id"], {}).get("data") or {}).get("entry") or {}).get("xui") or {}
             for ib in x.get("inbounds", []):
-                if ib.get("enable"):
-                    out.append((s, ib["port"], "VLESS, %s" % (ib.get("remark") or ib["port"])))
+                if ib.get("enable") and ib.get("tcp", True):
+                    out.setdefault((s["id"], ib["port"]), (
+                        s, ib["port"], "%s, %s" % (ib.get("protocol", "vless").upper(), ib.get("remark") or ib["port"])))
             if x.get("sub"):
-                out.append((s, x["sub"]["port"], "подписка"))
-            out.append((s, int(s.get("port") or 22), "SSH"))
-        return out
+                port = x["sub"]["port"]
+                out[s["id"], port] = (s, port, "подписка")
+            port = int(s.get("port") or 22)
+            out[s["id"], port] = (s, port, "SSH")
+        return list(out.values())
 
     def check_reach(self):
-        with self.busy("reach"):
+        with self.busy("reach", exclusive=True) as acquired:
+            if not acquired:
+                return
             def one(t):
                 s, port, label = t
                 k = "%s:%s" % (s["id"], port)
@@ -2214,41 +2304,59 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
                     self.note("bad", "%s: порт %s (%s) не открывается с этого компьютера" % (s["name"], port, label))
                 if prev is False and r["ok"]:
                     self.note("ok", "%s: порт %s (%s) снова открывается" % (s["name"], port, label))
-            list(self.leaf.map(one, self.reach_targets()))
+            targets = self.reach_targets()
+            list(self.leaf.map(one, targets))
+            current = {"%s:%s" % (s["id"], port) for s, port, _ in targets}
+            with self.lock:
+                for key in self.reach.keys() - current:
+                    del self.reach[key]
 
     def check_pc_e2e(self):
         """Проверка входов с этого компьютера: клиент Xray у себя → вход → цепочка → страница Cloudflare."""
         import pce2e
-        with self.busy("pce2e"):
+        with self.busy("pce2e", exclusive=True) as acquired:
+            if not acquired:
+                return
             stand = os.environ.get("VPN_DASH_STAND") == "1"
             ents = [s for s in self.cfg.servers if s["role"] == "entry" and (stand or s["id"] in self.e2e_params)]
-            bins = {}
+            bins, bins_lock = {}, threading.Lock()
+
+            def executable(ver):
+                with bins_lock:
+                    pending = bins.get(ver)
+                    if pending is None:
+                        pending = bins[ver] = cf.Future()
+                        loader = True
+                    else:
+                        loader = False
+                if loader:
+                    try:
+                        pending.set_result(pce2e.ensure_xray(ver, str(APP)))
+                    except Exception as e:
+                        pending.set_exception(e)
+                return pending.result()
 
             def one(s):
                 sid = s["id"]
                 if stand:      # стенд: Reality настоящий не поднять — готовый ответ
                     f = "/etc/testbed-pc-e2e-bad.json" if os.path.exists("/etc/testbed-pc-e2e-bad.json") else "/etc/testbed-pc-e2e.json"
                     try:
-                        r = json.load(open(f, encoding="utf-8"))
+                        with open(f, encoding="utf-8") as stand_result:
+                            r = json.load(stand_result)
                     except (OSError, ValueError):
                         return
                 else:
                     v = self.e2e_params[sid]
                     ver = v.get("ver") or "26.10.31"
                     try:
-                        if ver not in bins:
-                            bins[ver] = pce2e.ensure_xray(ver, str(APP))
+                        binary = executable(ver)
                     except Exception as e:
-                        bins[ver] = None
                         r = {"ok": False, "skip": True, "err": "не удалось взять Xray %s с GitHub для проверки: %s" % (ver, str(e)[:120])}
                     else:
-                        if bins[ver] is None:
-                            r = {"ok": False, "skip": True, "err": "Xray %s для проверки не скачался (см. соседний вход)" % ver}
-                        else:
-                            try:
-                                r = pce2e.run(bins[ver], v, v["address"], timeout=int(self.cfg.settings.get("channel_timeout") or 15))
-                            except Exception as e:
-                                r = {"ok": False, "skip": True, "err": "проверка с ПК сломалась: %s: %s" % (type(e).__name__, str(e)[:120])}
+                        try:
+                            r = pce2e.run(binary, v, v["address"], timeout=int(self.cfg.settings.get("channel_timeout") or 15))
+                        except Exception as e:
+                            r = {"ok": False, "skip": True, "err": "проверка с ПК сломалась: %s: %s" % (type(e).__name__, str(e)[:120])}
                 prev = self.pc_e2e.get(sid) or {}
                 if not r.get("skip"):
                     r["fails"] = 0 if r.get("ok") else prev.get("fails", 0) + 1
@@ -2272,7 +2380,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
         srv = self.cfg.by_id(sid)
         if not srv:
             return {"error": "нет такого сервера"}
-        rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "diag"\n' + PROBE, timeout=200)
+        rc, out, err = self.ssh.run(srv, "python3 -", stdin='MODE = "diag"\n' + PROBE, timeout=200, retry=True)
         try:
             secs = json.loads(out.strip().splitlines()[-1])["sections"]
         except Exception:
@@ -2339,7 +2447,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
         with self.busy("drift"):
             def snap(s):
                 try:
-                    rc, out, err = self.ssh.run(s, "python3 -", stdin='MODE = "config"\n' + PROBE, timeout=60)
+                    rc, out, err = self.ssh.run(s, "python3 -", stdin='MODE = "config"\n' + PROBE, timeout=60, retry=True)
                     if rc != 0 or not out.strip():
                         raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
                     return normalize_cfg(json.loads(out)["config"]), None
@@ -2462,11 +2570,18 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
 
     # --- всё сразу
 
-    def check_all(self, with_dc=False):
-        if "all" in self.running:              # полная проверка уже идёт
-            return
-        with self.busy("all"):
+    def _dc_jobs(self):
+        return [self.leaf.submit(self.check_dc, s["id"]) for s in self.cfg.servers if s["role"] == "exit"]
+
+    def check_all(self, with_dc=False, *, automatic=False):
+        with self.busy("all", exclusive=True) as acquired:
+            if not acquired:
+                return
             t0 = now()
+            if automatic:
+                self.last_auto = t0
+                if with_dc:
+                    self.last_dc = t0
             ids = [s["id"] for s in self.cfg.servers]
             cf.wait([self.leaf.submit(self.check_server, i) for i in ids])
             entries = [s["id"] for s in self.cfg.servers if s["role"] == "entry" and self.status.get(s["id"], {}).get("ok")]
@@ -2475,7 +2590,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             if self.cfg.settings.get("pc_e2e", True):
                 jobs.append(self.pool.submit(self.check_pc_e2e))
             if with_dc:
-                jobs += [self.leaf.submit(self.check_dc, s["id"]) for s in self.cfg.servers if s["role"] == "exit"]
+                jobs += self._dc_jobs()
             cf.wait(jobs)
             res = [self.results.get("%s:%s" % (e, c["key"]), {}) for e in entries for c in self.channels.get(e, [])]
             okc = sum(1 for r in res if r.get("status") == "ok")
@@ -2491,12 +2606,15 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             has_pw = any(self.cfg.get_pw(s["id"]) for s in self.cfg.servers)
             due = now() - self.last_auto >= max(1, int(st.get("auto_minutes") or 5)) * 60
             due_dc = now() - self.last_dc >= max(5, int(st.get("dc_minutes") or 30)) * 60
-            if (due or due_dc) and "all" not in self.running and has_pw:
-                self.last_auto = now()
-                if due_dc:
-                    self.last_dc = now()
+            if has_pw and (due or due_dc):
                 try:
-                    self.check_all(with_dc=due_dc)
+                    if due:
+                        self.check_all(with_dc=due_dc, automatic=True)
+                    else:
+                        with self.busy("all", exclusive=True) as acquired:
+                            if acquired:
+                                self.last_dc = now()
+                                cf.wait(self._dc_jobs())
                 except Exception:
                     traceback.print_exc()
             if now() - (self.sw_latest.get("_at") or 0) >= (12 * 3600 if self.sw_latest.get("_ok") else 1800):
@@ -2654,7 +2772,7 @@ for f in sorted(glob.glob("/etc/amnezia/amneziawg/wg*.conf")):
             if not self.cfg.get_pw(eid):
                 raise CheckError("не задан пароль")
             pre = "MODE = \"quality\"\nQ_TARGETS = %r\nQ_TESTS = %r\nQ_CH = %r\n" % (targets, tests, ch)
-            rc, out, err = self.ssh.run(e, "python3 -", stdin=pre + QUALITY_SRC + "\n" + PROBE, timeout=305)
+            rc, out, err = self.ssh.run(e, "python3 -", stdin=pre + QUALITY_SRC + "\n" + PROBE, timeout=305, retry=True)
             if rc != 0 or not out.strip():
                 raise CheckError("не уложилась в 290 с" if rc == 3 else (err.strip().splitlines() or ["код %s" % rc])[-1][:200])
             return json.loads(out)["quality"]
@@ -2899,9 +3017,10 @@ def answers():                      # по новому пути отвечае�
     ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
     try:
         op = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
-        op.open("%s://%s:%d%s" % ("https" if https else "http", host, port, path), timeout=5)
-        return True
+        with op.open("%s://%s:%d%s" % ("https" if https else "http", host, port, path), timeout=5):
+            return True
     except urllib.error.HTTPError as e:
+        e.close()
         return e.code < 404
     except Exception:
         return False
@@ -3085,81 +3204,78 @@ class Handler(BaseHTTPRequestHandler):
         lines += ["Connection: Upgrade", "Upgrade: websocket"] if ws else ["Connection: close"]
         if body or self.command in ("POST", "PUT", "PATCH"):
             lines.append("Content-Length: %d" % len(body))
-        try:
-            up = D.ssh.tunnel(srv, dest, w["port"])
-            if w["https"]:                      # внутри SSH до самого сервера — сертификат проверять не нужно
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                up = ctx.wrap_socket(up, server_hostname=w["domain"] or None)
-            up.settimeout(None if ws else 120)
-            up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace") + body)
-            f = up.makefile("rb")
-            status = f.readline(65537)
-            if not status.startswith(b"HTTP/"):
-                raise OSError("3X-UI не ответила" + (" — может, у неё не https?" if w["https"] else " — может, она на https?"))
-            hdrs = []
-            while True:
-                ln = f.readline(65537)
-                if ln in (b"\r\n", b"\n", b""):
-                    break
-                hdrs.append(ln.decode("latin-1").rstrip("\r\n"))
-        except (CheckError, OSError, ssl.SSLError) as e:
-            return self._xui_page(502, "Не удалось открыть 3X-UI на «%s»: %s" % (esc_html(srv["name"]), esc_html(str(e))))
-        code = int((status.split() + [b"0", b"0"])[1] or 0)
-        own = re.compile(r"^https?://(127\.0\.0\.1|localhost|%s%s)(:\d+)?" % (
-            re.escape(srv["host"]), "|" + re.escape(w["domain"]) if w["domain"] else ""), re.I)
-        out = [status.decode("latin-1").rstrip("\r\n")]
-        for h in hdrs:
-            k, _, v = h.partition(":")
-            kl, v = k.strip().lower(), v.strip()
-            if kl in ("keep-alive", "strict-transport-security") or (kl == "connection" and code != 101):
-                continue
-            if kl == "location":
-                v = own.sub("", v) or "/"
-            elif kl == "set-cookie":
-                v = re.sub(r";\s*domain=[^;]*", "", v, flags=re.I)
-                if not self.remote:             # страница у нас на http://127.0.0.1
-                    v = re.sub(r";\s*secure(?=\s*(;|$))", "", v, flags=re.I)
-            out.append("%s: %s" % (k.strip(), v))
-        if js and code == 200 and not any(h.lower().startswith("content-encoding:") for h in hdrs):
-            return self._xui_js(f, up, out, hdrs, real)
-        if code != 101:
-            out.append("Connection: close")
-        self.close_connection = True
-        try:
-            self.wfile.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1", "replace"))
-            if code == 101 and ws:
-                def to_server():
-                    try:
-                        while True:
-                            d = self.rfile.read1(65536)
-                            if not d:
-                                break
-                            up.sendall(d)
-                    except Exception:
-                        pass
-                    finally:
+        with ExitStack() as resources:
+            try:
+                up = resources.enter_context(closing(D.ssh.tunnel(srv, dest, w["port"])))
+                if w["https"]:                      # внутри SSH до самого сервера — сертификат проверять не нужно
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    up = resources.enter_context(closing(ctx.wrap_socket(up, server_hostname=w["domain"] or None)))
+                up.settimeout(None if ws else 120)
+                up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace") + body)
+                f = resources.enter_context(up.makefile("rb"))
+                status = f.readline(65537)
+                if not status.startswith(b"HTTP/"):
+                    raise OSError("3X-UI не ответила" + (" — может, у неё не https?" if w["https"] else " — может, она на https?"))
+                code = int(status.split()[1])
+                hdrs = []
+                while True:
+                    ln = f.readline(65537)
+                    if ln in (b"\r\n", b"\n", b""):
+                        break
+                    hdrs.append(ln.decode("latin-1").rstrip("\r\n"))
+            except (CheckError, OSError, ValueError, IndexError) as e:
+                return self._xui_page(502, "Не удалось открыть 3X-UI на «%s»: %s" % (esc_html(srv["name"]), esc_html(str(e))))
+            own = re.compile(r"^https?://(127\.0\.0\.1|localhost|%s%s)(:\d+)?" % (
+                re.escape(srv["host"]), "|" + re.escape(w["domain"]) if w["domain"] else ""), re.I)
+            out = [status.decode("latin-1").rstrip("\r\n")]
+            for h in hdrs:
+                k, _, v = h.partition(":")
+                kl, v = k.strip().lower(), v.strip()
+                if kl in ("keep-alive", "strict-transport-security") or (kl == "connection" and code != 101):
+                    continue
+                if kl == "location":
+                    v = own.sub("", v) or "/"
+                elif kl == "set-cookie":
+                    v = re.sub(r";\s*domain=[^;]*", "", v, flags=re.I)
+                    if not self.remote:             # страница у нас на http://127.0.0.1
+                        v = re.sub(r";\s*secure(?=\s*(;|$))", "", v, flags=re.I)
+                out.append("%s: %s" % (k.strip(), v))
+            if js and code == 200 and not any(h.lower().startswith("content-encoding:") for h in hdrs):
+                return self._xui_js(f, out, hdrs, real)
+            if code != 101:
+                out.append("Connection: close")
+            self.close_connection = True
+            try:
+                self.wfile.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1", "replace"))
+                if code == 101 and ws:
+                    def to_server():
                         try:
-                            up.close()
+                            while True:
+                                d = self.rfile.read1(65536)
+                                if not d:
+                                    break
+                                up.sendall(d)
                         except Exception:
                             pass
-                threading.Thread(target=to_server, daemon=True).start()
-            while True:
-                d = f.read1(65536)
-                if not d:
-                    break
-                self.wfile.write(d)
-        except (OSError, ssl.SSLError):
-            pass
-        finally:
-            for x in (f, up):
-                try:
-                    x.close()
-                except Exception:
-                    pass
+                        finally:
+                            with suppress(OSError):
+                                up.shutdown(socket.SHUT_RDWR)
+                    threading.Thread(target=to_server, daemon=True).start()
+                while True:
+                    d = f.read1(65536)
+                    if not d:
+                        break
+                    self.wfile.write(d)
+            except (OSError, ssl.SSLError):
+                pass
+            finally:
+                if code == 101 and ws:
+                    with suppress(OSError):
+                        self.connection.shutdown(socket.SHUT_RD)
 
-    def _xui_js(self, f, up, out, hdrs, real):
+    def _xui_js(self, f, out, hdrs, real):
         """Скрипт 3X-UI: адрес в ссылках VLESS панель берёт из адреса страницы (window.location.hostname) — у нас это
         127.0.0.1 или адрес Tailscale. Подменяем на настоящий адрес сервера."""
         self.close_connection = True
@@ -3183,12 +3299,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1", "replace") + b)
         except (OSError, ssl.SSLError, ValueError):
             pass
-        finally:
-            for x in (f, up):
-                try:
-                    x.close()
-                except Exception:
-                    pass
 
     def _xui_other(self):                       # HEAD/PUT/DELETE/PATCH — только для 3X-UI
         if not self._host_ok():
@@ -3330,7 +3440,7 @@ class Handler(BaseHTTPRequestHandler):
             if not pw:
                 return self._send(200, {"ok": True, "where": where})
             try:
-                rc, out, err = D.ssh.run(srv, "hostname", timeout=20)
+                rc, out, err = D.ssh.run(srv, "hostname", timeout=20, retry=True)
                 D.pool.submit(D.check_server, sid)
                 return self._send(200, {"ok": True, "where": where, "hostname": out.strip()})
             except CheckError as e:
@@ -3399,7 +3509,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "нет такого сервера"})
             try:
                 rc, out, err = D.ssh.run(srv, "python3 -", stdin='MODE = "pkgs"\nREFRESH = %s\n' % bool(body.get("refresh")) + PROBE,
-                                         timeout=300)
+                                         timeout=300, retry=not body.get("refresh"))
                 if rc != 0 or not out.strip():
                     raise CheckError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
                 info = json.loads(out)["pkgs"]
@@ -3804,7 +3914,8 @@ def main():
     D = Dash()
     import provision
     D.prov = provision.Provisioner(D, APP, Path(os.environ.get("VPN_DASH_SCRIPTS") or APP / "server-scripts"),
-                                   {"CheckError": CheckError, "PROBE": PROBE, "parse_dc": parse_dc, "TG_DC_DEFAULT": TG_DC_DEFAULT, "BACKUP_DIR": BACKUP_DIR})
+                                   {"CheckError": CheckError, "SSHOutcomeUnknown": SSHOutcomeUnknown, "PROBE": PROBE,
+                                    "parse_dc": parse_dc, "TG_DC_DEFAULT": TG_DC_DEFAULT, "BACKUP_DIR": BACKUP_DIR})
     threading.Thread(target=D.auto_loop, daemon=True).start()
     D.remote_apply()
     if tray_mode:

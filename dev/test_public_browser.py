@@ -38,6 +38,17 @@ def main():
         expect(page.locator("html")).to_have_attribute("data-theme", "light")
         print("PASS: настройки и переключение темы")
 
+        page.evaluate("document.fonts.ready")
+        positions = page.locator("#set-auto_minutes, #set-dc_minutes, #set-slow_s, #set-channel_timeout").evaluate_all(
+            "inputs => inputs.map(input => input.getBoundingClientRect().top)")
+        assert len(positions) == 4 and max(positions) == min(positions), positions
+        page.evaluate("window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' })")
+        assert page.evaluate("window.scrollY") > 300
+        page.locator('a[data-page="servers"]').click()
+        expect(page.locator("#main h1")).to_have_text("Серверы и пароли")
+        assert page.evaluate("window.scrollY") == 0
+        print("PASS: поля проверок выровнены, новый раздел открывается сверху")
+
         go(page, "awg", "Протоколы")
         sudoku = page.locator('[data-act="proto-tab"][data-tab="sudoku"]')
         expect(sudoku).to_be_visible(timeout=90000)

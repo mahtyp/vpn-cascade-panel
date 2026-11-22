@@ -168,6 +168,12 @@ if "generate_204" in args and "--socks5" in args:   # короткие запр�
     if random.random() < q.get("sud_slow", 0):   # подвисание
         time.sleep(1.5); sys.stdout.write("204 1.%03d" % random.randint(300, 900)); sys.exit(0)
     time.sleep(0.15); sys.stdout.write("204 0.%03d" % (140 + random.randint(0, 40))); sys.exit(0)
+if r"\n%{http_code} %{time_total}" in sys.argv and ("--interface" in args or "--socks5" in args):
+    if not ip:
+        sys.exit(7)
+    time.sleep(0.2)
+    sys.stdout.write("%s\n200 0.%d" % (ip, 25 + len(ip) % 20))
+    sys.exit(0)
 if "http_code" in args:   # проверка сайта: ответы задаёт /etc/testbed-sites.json {"IP выхода": {"часть имени": код}}
     import json
     url = sys.argv[-1]
@@ -248,6 +254,13 @@ U=/etc/testbed-units   # sudoku / sudoku-sing-box: «unit=active|inactive|none»
 st() { sed -n "s/^$1=//p" "$U" 2>/dev/null | tail -n1; }
 put() { grep -v "^$1=" "$U" 2>/dev/null > "$U.t"; echo "$1=$2" >> "$U.t"; mv "$U.t" "$U"; }
 u2=${2%.service}; [ "$2" = --quiet ] || [ "$2" = --now ] && u2=${3%.service}
+if [ "$u2" = vpn-dash-govblock ]; then
+  case "$1" in
+    enable) [ -f "/etc/systemd/system/$u2.service" ] || exit 1; put "$u2" enabled; exit 0 ;;
+    disable) put "$u2" disabled; exit 0 ;;
+    is-enabled) [ "$(st "$u2")" = enabled ] && { echo enabled; exit 0; }; echo disabled; exit 1 ;;
+  esac
+fi
 if [ "$u2" = zapret2 ]; then   # zapret2 на стенде: только состояние, сеть не трогаем; отказ — /etc/testbed-zapret-bad
   s=$(st zapret2)
   case "$1" in

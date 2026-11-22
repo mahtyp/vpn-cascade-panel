@@ -251,6 +251,8 @@ input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-
 .wz-dc span{font-family:inherit;font-size:13px;font-weight:400;color:var(--muted)}
 @keyframes wzspin{to{transform:rotate(360deg)}}.wz-spin{animation:wzspin 1s linear infinite}
 .setform{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.setform label{gap:8px}.setform .wide{grid-column:1/-1}.setform textarea{width:100%;resize:vertical}
+.setform-aligned>label{grid-row:span 3}
+.setform-aligned>label:not(.chk){display:grid;grid-template-rows:auto auto 1fr;grid-template-rows:subgrid}
 .setform label.chk{justify-content:flex-start}.setform input[type=checkbox]{width:18px;height:18px;min-height:0;accent-color:var(--accent)}
 .savebar{position:sticky;bottom:0;z-index:5;display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 16px;border:1px solid var(--warn);border-radius:0;background:var(--surface);box-shadow:0 -8px 24px rgba(0,0,0,.6)}
 #srv-msg{padding:0}
@@ -1118,7 +1120,7 @@ function renderSettings() {
     <div class="msg" id="abuse-msg" style="padding:0"></div></div></section>`;
   if (st.port !== S.port_now) h += `<div class="banner">Панель сейчас работает на порту ${S.port_now}, в настройках — ${esc(st.port)}. Чтобы перейти: меню значка в трее → «Выход», потом start.bat.</div>`;
   for (const g of groups) {
-    h += `<section class="card"><div class="head"><h3>${esc(g.name)}</h3></div><div class="form setform">`;
+    h += `<section class="card"><div class="head"><h3>${esc(g.name)}</h3></div><div class="form setform${g.name === "Проверки" ? " setform-aligned" : ""}">`;
     for (const f of g.items) {
       const v = st[f.key] ?? f.default, id = "set-" + f.key, hint = `<span class="sm dim">${f.help ? esc(f.help) + " " : ""}Стандартно: ${esc(fmtD(f))}.</span>`;
       if (f.type === "bool") {
@@ -4356,6 +4358,7 @@ async function load() {
     if (bootSeen && S.boot !== bootSeen && !srvDirty && !setDirty) { location.reload(); return; }   // панель перезапустилась (обновление)
     bootSeen = S.boot;
     const p = location.hash.startsWith("#/servers") ? "servers" : location.hash.startsWith("#/settings") ? "settings" : location.hash.startsWith("#/new") ? "new" : location.hash.startsWith("#/sites") ? "sites" : location.hash.startsWith("#/fw") ? "fw" : location.hash.startsWith("#/quality") ? "quality" : location.hash.startsWith("#/addr") ? "addr" : location.hash.startsWith("#/awg") ? "awg" : location.hash.startsWith("#/zapret") ? "zapret" : location.hash.startsWith("#/ai") ? "ai" : "overview";
+    if (p !== page) window.scrollTo({ top: 0, left: 0, behavior: "instant" });   // ссылки на карточки задают позицию при отрисовке
     if (p !== page || (p === "servers" && !$("#srvlist"))) { page = p; if (p === "servers") { render(); renderServers(); } if (p === "settings") { render(); renderSettings(); } if (p === "new") { render(); await wzEnter(); } if (p === "sites") { render(); renderSites(); } if (p === "fw") { render(); renderFw(); } if (p === "quality") { render(); renderQuality(); } if (p === "addr") { render(); renderAddr(); } if (p === "awg") { render(); awgEnter(); } if (p === "zapret") { render(); renderZapret(); } if (p === "ai") { render(); renderAi(); } }
     else if (p === "sites") { if (!BYP_EDIT && !NEWB) renderBypasses(); renderDpi(); }   // пока правите цепочку — обходы не перерисовывать
     else if (p === "fw") renderFw();

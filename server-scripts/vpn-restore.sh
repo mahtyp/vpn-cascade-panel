@@ -380,7 +380,7 @@ stage_mihomo() {
   sleep 2
   local p
   for p in $(mihomo_ports); do
-    ok "SOCKS $p → $(curl -s -m 15 --socks5 "127.0.0.1:$p" https://ifconfig.me || echo 'нет ответа')"
+    ok "SOCKS $p → $(curl -s -m 15 --noproxy '' --socks5-hostname "127.0.0.1:$p" https://ifconfig.me || echo 'нет ответа')"
   done
 }
 

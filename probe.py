@@ -371,6 +371,22 @@ def mihomo():
 
 # ------------------------------------------------------------------ 3X-UI на входе
 
+def inbound_tcp(protocol, stream, settings):
+    if protocol in ("wireguard", "hysteria", "hysteria2"):
+        return False
+    try:
+        network = (json.loads(stream or "{}") or {}).get("network")
+        if network in ("kcp", "mkcp", "quic", "udp", "hysteria", "hysteria2"):
+            return False
+        if protocol in ("dokodemo-door", "tunnel", "shadowsocks"):
+            networks = (json.loads(settings or "{}") or {}).get("network")
+            if isinstance(networks, str) and networks.strip() == "udp":
+                return False
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return True
+
+
 def xui():
     db_path = "/etc/x-ui/x-ui.db"
     if not os.path.exists(db_path):
@@ -383,8 +399,10 @@ def xui():
     try:
         db = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
         st = dict(db.execute("select key, value from settings").fetchall())
-        for port, remark, enable in db.execute("select port, remark, enable from inbounds"):
-            out["inbounds"].append({"port": port, "remark": remark, "enable": bool(enable)})
+        for port, remark, enable, protocol, stream, settings in db.execute(
+                "select port, remark, enable, protocol, stream_settings, settings from inbounds"):
+            out["inbounds"].append({"port": port, "remark": remark, "enable": bool(enable),
+                                    "protocol": protocol or "?", "tcp": inbound_tcp(protocol, stream, settings)})
         fps = {}            # клиенты входов VLESS: имя → отпечаток UUID (для «клиенты те же, что на основном»)
         for (sv,) in db.execute("select settings from inbounds where enable=1 and protocol='vless'"):
             try:

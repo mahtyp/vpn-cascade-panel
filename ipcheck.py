@@ -77,12 +77,16 @@ try:
         else:
             rq = urllib.request.Request("https://geoip.maxmind.com/geoip/v2.1/city/me",
                                         headers={"Referer": "https://www.maxmind.com", "User-Agent": "Mozilla/5.0"})
-            m = json.loads(urllib.request.urlopen(rq, timeout=10).read().decode("utf-8"))
+            with urllib.request.urlopen(rq, timeout=10) as response:
+                m = json.load(response)
             tr = m.get("traits") or {}
             out["mm"] = {"registered": (m.get("registered_country") or {}).get("iso_code"),
                          "country": (m.get("country") or {}).get("iso_code"),
                          "asn": tr.get("autonomous_system_number"), "org": tr.get("autonomous_system_organization"),
                          "ip": tr.get("ip_address")}
+    except urllib.error.HTTPError as e:
+        e.close()
+        out["mm"] = {"error": str(e)[:120]}
     except Exception as e:
         out["mm"] = {"error": str(e)[:120]}
     # репутация адреса: Scamalytics (оценка мошенничества) и StopForumSpam; AbuseIPDB — с ПК по ключу (abuse_api)
@@ -102,6 +106,7 @@ try:
                 with urllib.request.urlopen(rq, timeout=15) as f:
                     return f.status, f.read(600000).decode("utf-8", "replace")
             except urllib.error.HTTPError as e:
+                e.close()
                 return e.code, ""
             except Exception as e:
                 return 0, str(e)[:100]
@@ -140,7 +145,8 @@ try:
                     return f.status, f.read(300000).decode("utf-8", "replace")
             except urllib.error.HTTPError as e:
                 try:
-                    return e.code, e.read(300000).decode("utf-8", "replace")
+                    with e:
+                        return e.code, e.read(300000).decode("utf-8", "replace")
                 except Exception:
                     return e.code, ""
             except Exception as e:
@@ -405,6 +411,7 @@ def abuse_api(ip, key, fake=""):
             with urllib.request.urlopen(rq, timeout=15) as f:
                 a["code"], j = f.status, json.loads(f.read(200000).decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
+        e.close()
         return {"code": e.code}
     except Exception:  # noqa: BLE001
         return {"code": 0}

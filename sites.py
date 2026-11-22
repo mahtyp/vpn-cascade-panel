@@ -163,7 +163,7 @@ class Sites:
     # ------------------------------------------------------------ проверка
     def _probe(self, srv, urls, channels, diag=False, timeout=90):
         pre = "MODE = \"site\"\nURLS = %r\nCHANNELS = %r\nDIAG = %r\n" % (urls, channels, diag)
-        rc, out, err = self.d.ssh.run(srv, "python3 -", stdin=pre + self.PROBE, timeout=timeout)
+        rc, out, err = self.d.ssh.run(srv, "python3 -", stdin=pre + self.PROBE, timeout=timeout, retry=True)
         if rc != 0 or not out.strip():
             raise RuntimeError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
         return json.loads(out)["site"]
@@ -427,7 +427,7 @@ class Sites:
         def on_entry(e):
             pre = "MODE = \"dpi\"\nSITES = %r\n" % sites
             try:
-                rc, out, err = self.d.ssh.run(e, "python3 -", stdin=pre + self.PROBE, timeout=190)
+                rc, out, err = self.d.ssh.run(e, "python3 -", stdin=pre + self.PROBE, timeout=190, retry=True)
                 if rc != 0 or not out.strip():
                     raise RuntimeError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
                 return {"id": e["id"], "name": e["name"], "res": json.loads(out)["dpi"]}

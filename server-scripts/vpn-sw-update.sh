@@ -23,19 +23,72 @@ die() { echo "  ✗ $*" >&2; exit 1; }
 listening() { ss -Htln "sport = :$1" 2>/dev/null | grep -q .; }
 wait_port() { for _ in $(seq 1 "${2:-15}"); do listening "$1" && return 0; sleep 1; done; return 1; }
 ver_set() {
-  local tmp; tmp=$(mktemp)
-  [ -f "$VERS" ] && grep -v "^$1=" "$VERS" > "$tmp" || true
-  echo "$1=$2" >> "$tmp"; mv "$tmp" "$VERS"; chmod 600 "$VERS"
+  local tmp; tmp=$(mktemp "$VERS.XXXXXX") || return 1
+  if { [ ! -f "$VERS" ] || awk -v key="$1" 'index($0, key "=") != 1' "$VERS"; } > "$tmp" \
+      && printf '%s=%s\n' "$1" "$2" >> "$tmp" && mv -f "$tmp" "$VERS"; then return 0; fi
+  rm -f "$tmp"
+  return 1
+}
+restore_sudoku() {
+  cp -p "$BK/sudoku.bin" "$SUDOKU" || return 1
+  if [ -f "$BK/sudoku.versions" ]; then
+    cp -p "$BK/sudoku.versions" "$VERS" || return 1
+  elif [ -f "$BK/sudoku.no-versions" ]; then
+    rm -f "$VERS" || return 1
+  else
+    local old; old=$(cat "$BK/sudoku.ver" 2>/dev/null)
+    if [ -n "$old" ]; then ver_set SUDOKU_VERSION "$old" || return 1; fi
+  fi
+  systemctl restart sudoku
 }
 fetch() {   # <url> <файл>
   case "$1" in https://github.com/*/releases/download/*) ;; *) die "ссылка не на релиз GitHub: $1" ;; esac
   curl -fsSL --connect-timeout 15 --max-time 300 "$1" -o "$2" || die "не скачалось: $1"
 }
 mihomo_ports() {   # порты, которые слушает mihomo сейчас (SOCKS-входы для Sudoku)
-  ss -Htlnp 2>/dev/null | awk '/"mihomo"/ {n=split($4,a,":"); print a[n]}' | sort -un | tr '\n' ' '
+  local comm=${1##*/}
+  ss -Htlnp 2>/dev/null | awk -v comm="${comm:0:15}" 'index($0, "(\"" comm "\",") {n=split($4,a,":"); print a[n]}' | sort -un
+}
+expected_mihomo_ports() {
+  python3 - "$MDIR/config.yaml" <<'PY'
+import pathlib, re, sys
+
+text = pathlib.Path(sys.argv[1]).read_text()
+keys = ("port", "socks-port", "mixed-port", "redir-port", "tproxy-port")
+try:
+    import yaml
+except ImportError:
+    # На новом входе без PyYAML панель создаёт именно пустой список.
+    listeners = re.search(r"(?m)^listeners:[ \t]*(.*)", text)
+    if not listeners or listeners[1].split("#", 1)[0].strip() != "[]":
+        sys.exit("для чтения непустого списка listeners нужен PyYAML")
+    values = [p for k, p in re.findall(r"(?m)^([\w-]+):[ \t]*(\d+)[ \t]*(?:#.*)?$", text) if k in keys]
+else:
+    y = yaml.safe_load(text) or {}
+    values = [y.get(key) for key in keys]
+    values.extend(l.get("port") for l in y.get("listeners") or []
+                  if l.get("network") != "udp" and l.get("type") not in ("tuic", "hysteria", "hysteria2"))
+print(*sorted({int(p) for p in values if p and 1 <= int(p) <= 65535}))
+PY
+}
+wait_mihomo_ports() {
+  local actual p missing
+  for _ in $(seq 1 15); do
+    if actual=$(mihomo_ports "$2"); then
+      actual=$(echo "$actual" | tr '\n' ' ')
+      missing=""
+      for p in $1; do
+        case " $actual " in *" $p "*) ;; *) missing="$missing $p" ;; esac
+      done
+      [ -n "$missing" ] || return 0
+    fi
+    sleep 1
+  done
+  say "Mihomo не подтвердил слушающие порты"
+  return 1
 }
 
-mkdir -p "$BK" && chmod 700 "$BK"
+mkdir -p "$BK" && chmod 700 "$BK" || die "не удалось создать папку с копиями"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 case "${1:-}" in
@@ -54,34 +107,38 @@ sudoku)
   OUT=$("$NB" -c "$SCONF" -test 2>&1) || { echo "$OUT" | tail -5; die "sudoku $TAG не принимает конфиг — ничего не менял"; }
   ok "конфиг подходит"
   say "Замена и перезапуск"
-  cp -p "$SUDOKU" "$BK/sudoku.bin"; echo "${OLD:-}" > "$BK/sudoku.ver"
-  cp "$NB" "$SUDOKU.new" && chmod 755 "$SUDOKU.new" && mv -f "$SUDOKU.new" "$SUDOKU"
-  ver_set SUDOKU_VERSION "$TAG"
-  systemctl restart sudoku
-  if wait_port "$P" 15 && systemctl is-active --quiet sudoku; then
+  cp -p "$SUDOKU" "$BK/sudoku.bin" && rm -f "$BK/sudoku.versions" "$BK/sudoku.no-versions" || die "не удалось сохранить прежний Sudoku"
+  if [ -f "$VERS" ]; then
+    cp -p "$VERS" "$BK/sudoku.versions" || die "не удалось сохранить versions.env"
+  else
+    touch "$BK/sudoku.no-versions" || die "не удалось записать отсутствие versions.env"
+  fi
+  if cp "$NB" "$SUDOKU.new" && chmod 755 "$SUDOKU.new" && mv -f "$SUDOKU.new" "$SUDOKU" \
+      && ver_set SUDOKU_VERSION "$TAG" && systemctl restart sudoku && wait_port "$P" 15 && systemctl is-active --quiet sudoku; then
     ok "sudoku $TAG работает, TCP $P"
   else
     journalctl -u sudoku -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
-    cp -p "$BK/sudoku.bin" "$SUDOKU"; [ -n "$OLD" ] && ver_set SUDOKU_VERSION "$OLD"
-    systemctl restart sudoku
-    die "sudoku $TAG не поднялся — вернул ${OLD:-старую версию}"
+    if restore_sudoku && wait_port "$P" 15 && systemctl is-active --quiet sudoku; then
+      die "sudoku $TAG не поднялся — вернул ${OLD:-старую версию}"
+    fi
+    die "sudoku $TAG не поднялся, возврат прежней версии не подтверждён"
   fi
   ;;
 sudoku-rollback)
   say "Sudoku: возврат старой версии"
   [ -f "$BK/sudoku.bin" ] || die "нет копии старого sudoku"
-  cp -p "$BK/sudoku.bin" "$SUDOKU"
-  OLD=$(cat "$BK/sudoku.ver" 2>/dev/null); [ -n "$OLD" ] && ver_set SUDOKU_VERSION "$OLD"
-  systemctl restart sudoku
-  P=$(python3 -c "import json; print(json.load(open('$SCONF'))['local_port'])" 2>/dev/null)
-  wait_port "$P" 15 && ok "вернул ${OLD:-старую версию}, TCP $P" || die "старый sudoku не слушает TCP $P — проверьте вручную"
+  P=$(python3 -c "import json; print(json.load(open('$SCONF'))['local_port'])" 2>/dev/null) || die "нет local_port в $SCONF"
+  restore_sudoku && wait_port "$P" 15 && systemctl is-active --quiet sudoku \
+    && ok "вернул старую версию, TCP $P" || die "возврат прежней версии Sudoku не подтверждён"
   ;;
 mihomo)
   URL=${2:?ссылка}; BIN=${3:-/usr/local/bin/mihomo}
   say "Mihomo: проверка"
   systemctl is-active --quiet mihomo || die "служба mihomo не работает — обновлять нечего"
   [ -x "$BIN" ] || die "нет $BIN"
-  PORTS=$(mihomo_ports)
+  PORTS=$(mihomo_ports "$BIN") || die "не удалось прочитать слушающие порты Mihomo"
+  EXPECTED=$(expected_mihomo_ports) || die "не удалось прочитать порты из конфига Mihomo"
+  PORTS=$(printf '%s\n%s\n' "$PORTS" "$EXPECTED" | tr ' ' '\n' | awk 'NF' | sort -un | paste -sd' ' -)
   ok "сейчас $("$BIN" -v 2>/dev/null | head -n1 | cut -c1-60); слушает: ${PORTS:-ничего}"
   say "Mihomo: скачать и проверить конфиг"
   fetch "$URL" "$TMP/m.gz"
@@ -92,24 +149,24 @@ mihomo)
   OUT=$("$TMP/mihomo" -d "$MDIR" -t 2>&1) || { echo "$OUT" | tail -5; die "новый mihomo не принимает конфиг — ничего не менял"; }
   ok "$(echo "$NV" | cut -c1-60), конфиг подходит"
   say "Замена и перезапуск (каналы Sudoku с этого входа моргнут на пару секунд)"
-  cp -p "$BIN" "$BK/mihomo.bin"
-  cp "$TMP/mihomo" "$BIN.new" && chmod 755 "$BIN.new" && mv -f "$BIN.new" "$BIN"
-  systemctl restart mihomo
-  okp=1
-  for p in $PORTS; do wait_port "$p" 15 || { okp=0; echo "  порт $p не поднялся"; }; done
-  if [ "$okp" = 1 ] && systemctl is-active --quiet mihomo; then
+  cp -p "$BIN" "$BK/mihomo.bin" || die "не удалось сохранить прежний Mihomo"
+  if cp "$TMP/mihomo" "$BIN.new" && chmod 755 "$BIN.new" && mv -f "$BIN.new" "$BIN" \
+      && systemctl restart mihomo && wait_mihomo_ports "$PORTS" "$BIN" && systemctl is-active --quiet mihomo; then
     ok "mihomo работает, слушает: ${PORTS:-—}"
   else
     journalctl -u mihomo -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
-    cp -p "$BK/mihomo.bin" "$BIN"; systemctl restart mihomo
-    die "новый mihomo не поднялся — вернул старый"
+    if cp -p "$BK/mihomo.bin" "$BIN" && systemctl restart mihomo && systemctl is-active --quiet mihomo; then
+      die "новый mihomo не поднялся — вернул старый"
+    fi
+    die "новый Mihomo не поднялся, возврат прежней версии не подтверждён"
   fi
   ;;
 mihomo-rollback)
   BIN=${2:-/usr/local/bin/mihomo}
   say "Mihomo: возврат старой версии"
   [ -f "$BK/mihomo.bin" ] || die "нет копии старого mihomo"
-  cp -p "$BK/mihomo.bin" "$BIN"; systemctl restart mihomo; sleep 2
+  cp -p "$BK/mihomo.bin" "$BIN" && systemctl restart mihomo || die "не удалось вернуть прежний Mihomo"
+  sleep 2
   systemctl is-active --quiet mihomo && ok "вернул $("$BIN" -v 2>/dev/null | head -n1 | cut -c1-60)" || die "mihomo не запустился — проверьте вручную"
   ;;
 *)

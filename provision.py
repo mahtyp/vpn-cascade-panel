@@ -192,7 +192,7 @@ class Provisioner:
             job.end("pkg", "ok", "поставлено")
         job.begin("geo")
         fake = "/etc/testbed-ipregion.json" if STAND else ""
-        rc, out, err = self.sh(srv, "python3 -", stdin=ipcheck.runner(fake), timeout=300)
+        rc, out, err = self.sh(srv, "python3 -", stdin=ipcheck.runner(fake), timeout=300, retry=True)
         try:
             raw = ipcheck.parse(out)
         except ValueError:
@@ -275,7 +275,7 @@ class Provisioner:
             raise Stop("сервера больше нет в панели")
         job.plan([("dns", "DNS: Cloudflare, Google, Quad9, AdGuard, Яндекс — UDP, DoH, DoT; подмена ответов", srv["name"])])
         job.begin("dns")
-        rc, out, err = self.sh(srv, "python3 -", stdin=dnscheck.runner(srv["host"], "/etc/testbed-dns.json" if STAND else ""), timeout=90)
+        rc, out, err = self.sh(srv, "python3 -", stdin=dnscheck.runner(srv["host"], "/etc/testbed-dns.json" if STAND else ""), timeout=90, retry=True)
         try:
             raw = dnscheck.parse(out)
         except ValueError:
@@ -378,7 +378,7 @@ class Provisioner:
         job.begin("mask")
         reality = []
         try:
-            rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.reality_script(), timeout=90)
+            rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.reality_script(), timeout=90, retry=True)
             reality = (neighbors.parse(out) or {}).get("reality") or []
             for r in reality:      # как имя видят публичные DNS (DoH Яндекса/Google/Cloudflare с этого ПК) — сервер спрашивает DNS хостера
                 if r.get("sni") and not STAND:
@@ -403,7 +403,7 @@ class Provisioner:
         cands = neighbors.fit_candidates(raw)
         if cands:       # Xray ходит к сайту маскировки с сервера — подсказываем только то, что открывается оттуда
             try:
-                rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.fit_script(cands), timeout=90)
+                rc, out, err = self.sh(srv, "python3 -", stdin=neighbors.fit_script(cands), timeout=90, retry=True)
                 bad = neighbors.apply_server_fit(raw, (neighbors.parse(out) or {}).get("fit") or {})
                 job.log("сайты для маскировки проверены с сервера: подходят %d из %d%s" % (
                     len(cands) - len(bad), len(cands), ("; не открылись оттуда: " + ", ".join(bad)) if bad else ""))
@@ -453,13 +453,14 @@ class Provisioner:
         if x.get("mode") != "docker":
             raise Stop("на %s AmneziaWG и так без Docker — переводить нечего" % srv["name"])
         container = x.get("container") or "amnezia-awg2"
-        entries, tag = [], ""
+        entries, expected, tag = [], {}, ""
         for e in cfg.servers:
             if e["role"] != "entry":
                 continue
             chans = [c for c in self.d.channels.get(e["id"], []) if c.get("exit_id") == srv["id"] and c.get("kind") == "AWG"]
             if chans:
                 entries.append(e)
+                expected[e["id"]] = {c["key"] for c in chans}
                 tag = tag or (chans[0].get("tag") or "")[4:]
         if not TAG_RE.match(tag):
             tag = latin(srv["name"]) or "Exit"
@@ -468,8 +469,9 @@ class Provisioner:
                 raise Stop("нет пароля от %s" % e["name"])
         steps = [("setup", "AmneziaWG без Docker на выходе — сборка модуля ядра 5–10 мин", srv["name"])]
         steps += [("link-" + e["id"], "Туннель переводится на новый AmneziaWG (Sudoku и 3X-UI не меняются)", e["name"]) for e in entries]
-        steps += [("docker", "Остановить и удалить контейнер Amnezia (%s)" % container, srv["name"]),
-                  ("panel", "Проверка выхода и каналов", "панель")]
+        steps += [("verify", "Проверка туннелей через новый порт", "панель"),
+                  ("docker", "Остановить и удалить контейнер Amnezia (%s)" % container, srv["name"]),
+                  ("panel", "Итоговая проверка туннелей", "панель")]
         job.plan(steps)
 
         job.begin("setup")
@@ -478,10 +480,10 @@ class Provisioner:
         if rc != 0:
             raise Stop("AmneziaWG на выходе не встал (код %d) — журнал выше. Входы не трогал, контейнер работает как раньше." % rc)
         rc, out, _ = self.sh(srv, "awg show awg0 listen-port; ufw status 2>/dev/null | head -n1; "
-                                  "ip -o route show default 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n1")
+                                  "ip -o route show default 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n1", retry=True)
         lines = out.split("\n") + ["", ""]
         port, ufw, wan = lines[0].strip(), lines[1].strip(), lines[2].strip() or "eth0"
-        if not port.isdigit():
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
             raise Stop("awg0 на выходе не отвечает — журнал выше. Входы не трогал.")
         job.result["awg_port"] = port
         if "Status: active" in ufw:       # фаервол включали панелью: новый порт и пересылку через awg0 — разрешить
@@ -514,31 +516,64 @@ class Provisioner:
                 except Stop:
                     job.log("не удалось удалить временный пароль на %s: удалите %s/pw вручную" % (e["name"], REMOTE))
 
+        job.begin("verify")
+        endpoint = "%s:%s" % (srv["host"], port)
+        failed = self._check_migrated_channels(job, entries, expected, endpoint) if entries else []
+        if failed:
+            detail = "не подтверждены туннели на входах %s" % ", ".join(failed)
+            job.end("verify", "error", detail)
+            job.skip("docker", "контейнер сохранён до проверки туннелей")
+            job.skip("panel", "перевод не подтверждён")
+            self.d.note("bad", "%s. %s" % (srv["name"], detail))
+            raise Stop("Перевод не подтверждён на входах %s. Настройки туннелей уже изменены, старый контейнер сохранён."
+                       % ", ".join(failed))
+        job.end("verify")
+
         job.begin("docker")
         rc, out, _ = self.sh(srv, "docker rm -f %s 2>&1 && echo REMOVED" % shlex.quote(container), timeout=120)
-        if "REMOVED" not in out:
+        removed = rc == 0 and "REMOVED" in out
+        if removed:
+            job.end("docker", note="удалён")
+        else:
             job.log(out.strip()[-300:])
             job.end("docker", "warn", "не удалось удалить — входы уже на новом AmneziaWG, контейнер можно убрать позже")
-        else:
-            job.end("docker", note="удалён")
 
         job.begin("panel")
-        self.d.check_server(srv["id"])
+        failed = self._check_migrated_channels(job, entries, expected, endpoint, with_dc=True)
+        if failed:
+            detail = "не подтверждены туннели на входах %s" % ", ".join(failed)
+            job.end("panel", "error", detail)
+            self.d.note("bad", "%s. %s" % (srv["name"], detail))
+            raise Stop("После шага с Docker %s. %s." % (detail, "Контейнер уже удалён" if removed else "Удаление контейнера не подтверждено"))
+        job.end("panel")
+        self.d.note("ok", "%s: AmneziaWG переведён с Docker на модуль ядра (UDP %s), входы: %s" % (
+            srv["name"], port, ", ".join(done) or "—"))
+
+    def _check_migrated_channels(self, job, entries, expected, endpoint, with_dc=False):
+        changed_at = time.time()
         for _ in range(120):
             if "all" not in self.d.running:
                 break
             time.sleep(1)
-        self.d.check_all(True)
-        post = []
+        self.d.check_all(with_dc)
+        post, failed = [], []
         for e in entries:
-            res = [self.d.results.get("%s:%s" % (e["id"], c["key"]), {}) for c in self.d.channels.get(e["id"], []) if c.get("exit_id") == srv["id"]]
-            okn = sum(1 for r in res if r.get("status") in ("ok", "warn"))
-            post.append({"entry": e["name"], "ok": okn, "n": len(res)})
-            job.log("%s: каналы до %s — в норме %d из %d" % (e["name"], srv["name"], okn, len(res)))
+            eid = e["id"]
+            snapshot = self.d.status.get(eid) or {}
+            confirmed = set()
+            if snapshot.get("ok") and snapshot.get("at", 0) >= changed_at:
+                awg = (snapshot.get("data", {}).get("entry") or {}).get("awg") or []
+                ifaces = {a["iface"] for a in awg if a.get("endpoint") == endpoint}
+                confirmed = {c["key"] for c in self.d.channels.get(eid, [])
+                             if c["key"] in expected[eid] and c.get("iface") in ifaces
+                             and self._fresh_channel_status(eid, c["key"], changed_at) in ("ok", "warn")}
+            okn, count = len(confirmed), len(expected[eid])
+            if okn != count:
+                failed.append(e["name"])
+            post.append({"entry": e["name"], "ok": okn, "n": count})
+            job.log("%s: через %s подтверждено туннелей %d из %d" % (e["name"], endpoint, okn, count))
         job.result["post"] = post
-        self.d.note("ok", "%s: AmneziaWG переведён с Docker на модуль ядра (UDP %s), входы: %s" % (
-            srv["name"], port, ", ".join(done) or "—"))
-        job.end("panel", "ok" if all(x["ok"] == x["n"] for x in post) else "warn")
+        return failed
 
     def start_sudoku_backup(self, srv):
         """Запасной канал Sudoku к выходу связки, где есть только свой путь (например, VLESS из подписки 3X-UI).
@@ -583,7 +618,7 @@ class Provisioner:
         rc = self.detached(job, srv, "sudoku-setup", "ONLY_SUDOKU=1 bash /root/vpn-exit-setup.sh\n", timeout=1800)
         if rc != 0:
             raise Stop("Sudoku на выходе не встал (код %d) — журнал выше. Входы не трогал." % rc)
-        rc, out, _ = self.sh(srv, "jq -r .local_port /etc/sudoku/config.json 2>/dev/null")
+        rc, out, _ = self.sh(srv, "jq -r .local_port /etc/sudoku/config.json 2>/dev/null", retry=True)
         port = out.strip()
         if not port.isdigit():
             raise Stop("у Sudoku на выходе не нашёлся порт — журнал выше. Входы не трогал.")
@@ -615,6 +650,7 @@ class Provisioner:
                     job.log("не удалось удалить временный пароль на %s: удалите %s/pw вручную" % (e["name"], REMOTE))
 
         job.begin("panel")
+        changed_at = time.time()
         for e in entries:
             self.d.check_server(e["id"])
         self.d.check_server(srv["id"])
@@ -623,23 +659,36 @@ class Provisioner:
                 break
             time.sleep(1)
         self.d.check_all(True)
-        broke = [(e, c) for e, c in was
-                 if (self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
+        broke = [(e, c) for e, c in was if self._fresh_channel_status(e["id"], c["key"], changed_at) not in ("ok", "warn")]
         for e, c in broke:
             job.log("%s → %s %s: работал до, а сейчас нет" % (e["name"], c.get("kind") or "канал", c.get("exit") or ""))
-        new_ok = []
+        missing = []
         for e in entries:
+            ready = False
             for c in self.d.channels.get(e["id"], []):
-                if c.get("exit_id") == srv["id"] and c.get("kind") == "Sudoku":
-                    st = (self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}).get("status")
-                    job.log("%s → Sudoku %s: %s" % (e["name"], srv["name"], {"ok": "работает", "warn": "работает, медленно"}.get(st, "не работает")))
-                    if st in ("ok", "warn"):
-                        new_ok.append(e["name"])
-        self.d.note("ok" if new_ok and not broke else "warn", "%s: добавлен запасной канал Sudoku (TCP %s), входы: %s" % (
+                if c.get("exit_id") == srv["id"] and c.get("tag") == "Sudoku-" + tag and c.get("n"):
+                    st = self._fresh_channel_status(e["id"], c["key"], changed_at)
+                    job.log("%s → Sudoku %s: %s" % (e["name"], srv["name"], {"ok": "работает", "warn": "работает, медленно"}.get(st, "нет успешной проверки")))
+                    ready = ready or st in ("ok", "warn")
+            if not ready:
+                missing.append(e["name"])
+        problems = []
+        if missing:
+            problems.append("запасной канал не подтверждён на входах %s" % ", ".join(missing))
+        if broke:
+            problems.append("перестали работать прежние каналы (%d)" % len(broke))
+        if problems:
+            detail = ". ".join(problems)
+            job.end("panel", "error", detail)
+            self.d.note("bad", "%s. %s" % (srv["name"], detail))
+            raise Stop("Проверка Sudoku не прошла. %s. Настройки уже применены." % detail)
+        self.d.note("ok", "%s: добавлен запасной канал Sudoku (TCP %s), входы: %s" % (
             srv["name"], port, ", ".join(done) or "—"))
-        job.end("panel", "ok" if len(new_ok) == len(entries) and not broke else "warn",
-                "запасной канал работает" if len(new_ok) == len(entries) and not broke else
-                ("перестали работать: %d — журнал выше" % len(broke)) if broke else "новый канал не ответил — журнал выше")
+        job.end("panel", note="запасной канал работает на всех входах")
+
+    def _fresh_channel_status(self, sid, key, since):
+        result = self.d.results.get("%s:%s" % (sid, key)) or {}
+        return result.get("status") if result.get("at", 0) >= since else None
 
     # ------------------------------------------------------------------ «Протоколы» → «Настройка»: связать два сервера
     LINK_PROTO = {"awg": "AmneziaWG", "sudoku": "Sudoku", "vless": "VLESS"}
@@ -783,7 +832,7 @@ class Provisioner:
 
         job.begin("setup")
         if proto == "awg":
-            rc, out, _ = self.sh(x, "(awg show awg0 listen-port 2>/dev/null || docker ps --format '{{.Names}}' 2>/dev/null | grep -i amnezia-awg) | head -1")
+            rc, out, _ = self.sh(x, "(awg show awg0 listen-port 2>/dev/null || docker ps --format '{{.Names}}' 2>/dev/null | grep -i amnezia-awg) | head -1", retry=True)
             if out.strip():
                 job.log("AmneziaWG на выходе уже есть — ставить не нужно")
                 job.end("setup", note="уже стоит")
@@ -793,7 +842,7 @@ class Provisioner:
                 if rc != 0:
                     raise Stop("AmneziaWG на выходе не встал (код %d) — журнал выше. Вход не трогал." % rc)
                 rc, out, _ = self.sh(x, "awg show awg0 listen-port; ufw status 2>/dev/null | head -n1; "
-                                        "ip -o route show default | awk '{for(i=1;i<NF;i++) if($i==\"dev\"){print $(i+1); exit}}'")
+                                        "ip -o route show default | awk '{for(i=1;i<NF;i++) if($i==\"dev\"){print $(i+1); exit}}'", retry=True)
                 lines = (out.splitlines() + ["", "", ""])[:3]
                 port, ufw, wan = lines[0].strip(), lines[1].strip(), lines[2].strip() or "eth0"
                 if not port.isdigit():
@@ -807,7 +856,7 @@ class Provisioner:
             rc = self.detached(job, x, "link-setup", "ONLY_SUDOKU=1 bash /root/vpn-exit-setup.sh\n", timeout=1800)
             if rc != 0:
                 raise Stop("Sudoku на выходе не встал (код %d) — журнал выше. Вход не трогал." % rc)
-            rc, out, _ = self.sh(x, "jq -r .local_port /etc/sudoku/config.json 2>/dev/null")
+            rc, out, _ = self.sh(x, "jq -r .local_port /etc/sudoku/config.json 2>/dev/null", retry=True)
             if not out.strip().isdigit():
                 raise Stop("у Sudoku на выходе не нашёлся порт — журнал выше. Вход не трогал.")
             job.end("setup", note="TCP %s" % out.strip())
@@ -847,10 +896,7 @@ class Provisioner:
                 st = (self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}).get("status")
                 job.log("%s → %s %s: %s%s" % (e["name"], kind, x["name"], {"ok": "работает", "warn": "работает, медленно"}.get(st, "не работает"),
                                               ", место в цепочке %s" % c["n"] if c.get("n") else ""))
-        good = st in ("ok", "warn") and not broke
-        self.d.note("ok" if good else "warn", "Связаны %s → %s по %s (%s)" % (e["name"], x["name"], pn, "работает" if good else "нужна проверка"))
-        job.end("panel", "ok" if good else "warn", "новый путь работает" if good else
-                ("перестали работать: %d — журнал выше" % len(broke)) if broke else "новый путь не ответил — журнал выше")
+        self._finish_link(job, e, x, pn, st in ("ok", "warn"), broke)
 
     # клиент VLESS для входа во входящем VLESS Reality сервера-цели — через API 3X-UI (как vpn-entry-new.sh), без перезапуска x-ui.
     # find — какие входящие подходят (без секретов); add — завести (или взять уже заведённого) клиента и вывести параметры
@@ -885,8 +931,10 @@ def api(st, path, body):
                                  headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
     op = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
     try:
-        r = json.loads(op.open(req, timeout=30).read())
+        with op.open(req, timeout=30) as response:
+            r = json.load(response)
     except urllib.error.HTTPError as e:
+        e.close()
         sys.exit("API 3X-UI ответил %s — %s" % (e.code, "токен не подошёл" if e.code in (401, 403) else "такого запроса эта версия 3X-UI не знает" if e.code == 404 else "ошибка"))
     except (OSError, ValueError) as e:
         sys.exit("API 3X-UI не ответил: %s" % e)
@@ -943,14 +991,14 @@ print(json.dumps({"port": r["port"], "remark": r["remark"], "reused": reused, "u
     def _vless_look(self, e, x, name):
         """Для плана VLESS: какие входящие есть на цели и нет ли уже VLESS-ИМЯ на входе. → (входящие, ошибка)"""
         try:
-            rc, out, err = self.sh(x, "python3 - find %s" % shlex.quote(self._vless_email(e)), stdin=self.VLESS_CLIENT_PY, timeout=40)
+            rc, out, err = self.sh(x, "python3 - find %s" % shlex.quote(self._vless_email(e)), stdin=self.VLESS_CLIENT_PY, timeout=40, retry=True)
             if rc != 0:
                 return None, "«%s»: %s" % (x["name"], (err.strip().splitlines() or ["код %s" % rc])[-1][:200])
             vin = json.loads(out.strip().splitlines()[-1])["inbounds"]
             rc, out, _ = self.sh(e, "python3 -c %s" % shlex.quote(
                 "import json,sqlite3;t=json.loads(sqlite3.connect('file:/etc/x-ui/x-ui.db?mode=ro',uri=True).execute("
                 "\"select value from settings where key='xrayTemplateConfig'\").fetchone()[0]);"
-                "print(int(any(o.get('tag')=='VLESS-%s' for o in t.get('outbounds') or [])))" % name), timeout=40)
+                "print(int(any(o.get('tag')=='VLESS-%s' for o in t.get('outbounds') or [])))" % name), timeout=40, retry=True)
         except (Stop, ValueError, KeyError, IndexError) as ex:
             return None, "не прочитал: %s" % ex
         if out.strip() == "1":
@@ -1012,10 +1060,23 @@ print(json.dumps({"port": r["port"], "remark": r["remark"], "reused": reused, "u
         t = ((self.d.proto_test(e["id"]) or {}).get("tests") or {}).get(tag) or {}
         job.log("%s → %s по VLESS: %s" % (e["name"], x["name"], "работает, сайт видит %s" % (t.get("srv") or t.get("ip") or "?") if t.get("ok") else
                                              "не ответил%s" % (": " + t["err"] if t.get("err") else "")))
-        good = bool(t.get("ok")) and not broke
-        self.d.note("ok" if good else "warn", "Связаны %s → %s по VLESS (%s)" % (e["name"], x["name"], "работает" if good else "нужна проверка"))
-        job.end("panel", "ok" if good else "warn", "новый путь работает" if good else
-                ("перестали работать: %d — журнал выше" % len(broke)) if broke else "новый путь не ответил — журнал выше")
+        self._finish_link(job, e, x, "VLESS", bool(t.get("ok")), broke)
+
+    def _finish_link(self, job, entry, exit_, proto, new_ok, broke):
+        route = "%s → %s по %s" % (entry["name"], exit_["name"], proto)
+        if new_ok and not broke:
+            self.d.note("ok", "Связаны %s (работает)" % route)
+            job.end("panel", note="новый путь работает")
+            return
+        problems = []
+        if not new_ok:
+            problems.append("новый путь не прошёл проверку")
+        if broke:
+            problems.append("перестали работать прежние каналы (%d)" % len(broke))
+        detail = ", ".join(problems)
+        job.end("panel", "error", detail)
+        self.d.note("bad", "%s. Проверка связи не прошла (%s)" % (route, detail))
+        raise Stop("Проверка связи не прошла (%s). Настройки связи уже применены." % detail)
 
     # ------------------------------------------------------------------ «Настройка»: отвязать
     PEER_RM_PY = r"""
@@ -1174,11 +1235,8 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
                 break
             time.sleep(1)
         self.d.check_all(True)
-        broke = [(s, c) for s, c in was if (self.d.results.get("%s:%s" % (s["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
-        for s, c in broke:
-            job.log("%s → %s %s: работал до, а сейчас нет" % (s["name"], c.get("kind") or "канал", c.get("exit") or ""))
-        self.d.note("ok" if not broke else "warn", "Отвязано: %s → %s по %s" % (e["name"], x["name"], pn))
-        job.end("panel", "ok" if not broke else "warn", "остальные каналы работают" if not broke else "перестали работать: %d — журнал выше" % len(broke))
+        self._finish_retained_channels(job, was, "Отвязано: %s → %s по %s" % (e["name"], x["name"], pn),
+                                       "остальные каналы работают", "Путь уже удалён со входа")
 
     def reorder_plan(self, eid, order):
         """Новый порядок основной цепочки входа. Ничего не меняет; окончательно «можно ли» скажет скрипт (CHECK=1)."""
@@ -1253,11 +1311,21 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
                 break
             time.sleep(1)
         self.d.check_all(True)
+        self._finish_retained_channels(job, was, "Новый порядок цепочки: %s" % e["name"],
+                                       "каналы работают", "Новый порядок цепочки уже применён")
+
+    def _finish_retained_channels(self, job, was, event, success, applied):
         broke = [(s, c) for s, c in was if (self.d.results.get("%s:%s" % (s["id"], c["key"])) or {}).get("status") not in ("ok", "warn")]
+        if not broke:
+            self.d.note("ok", event)
+            job.end("panel", note=success)
+            return
         for s, c in broke:
             job.log("%s → %s %s: работал до, а сейчас нет" % (s["name"], c.get("kind") or "канал", c.get("exit") or ""))
-        self.d.note("ok" if not broke else "warn", "Новый порядок цепочки: %s" % e["name"])
-        job.end("panel", "ok" if not broke else "warn", "каналы работают" if not broke else "перестали работать: %d — журнал выше" % len(broke))
+        detail = "перестали работать прежние каналы (%d)" % len(broke)
+        job.end("panel", "error", detail)
+        self.d.note("bad", "%s. Проверка каналов не прошла (%s)" % (event, detail))
+        raise Stop("%s. Проверка каналов не прошла (%s)." % (applied, detail))
 
     def _unlink_plan_vless(self, e, x, tag):
         errors, warns, steps = [], [], []
@@ -1313,7 +1381,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         for line in (out + err).strip().splitlines():
             job.log(line)
         if rc != 0:
-            raise Stop("переключение не прошло — sudoku-sing-box работает как раньше (журнал выше)")
+            raise Stop("переключение Sudoku не прошло (результат и состояние службы в журнале выше)")
         job.end("switch")
 
         job.begin("check")
@@ -1335,16 +1403,19 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
                 job.log(line)
             for e, c in chans:
                 self.d.check_channel(e["id"], c["key"])
-            raise Stop("через обычный sudoku не заработал канал с %s — вернул sudoku-sing-box%s" % (
-                ", ".join(bad), "" if rc == 0 else " (но возврат сообщил об ошибке — журнал выше)"))
+            raise Stop("через обычный sudoku не заработал канал с %s. %s" % (
+                ", ".join(bad), "Вернул sudoku-sing-box" if rc == 0 else "Возврат sudoku-sing-box не подтверждён"))
         job.end("check", note="%d из %d" % (len(chans), len(chans)) if chans else "нет входов с этим каналом")
 
         job.begin("finish")
-        rc, out, err = self.sh(srv, "bash %s finish 2>&1; rm -f %s" % (script, script), timeout=120)
+        rc, out, err = self.sh(srv, "bash %s finish 2>&1 && rm -f %s" % (script, script), timeout=120)
         for line in (out + err).strip().splitlines():
             job.log(line)
         job.end("finish", "ok" if rc == 0 else "warn")
-        self.d.note("ok", "%s: Sudoku теперь обычный, без sudoku-sing-box (каналы со входов в норме)" % srv["name"])
+        if rc == 0:
+            self.d.note("ok", "%s: Sudoku теперь обычный, без sudoku-sing-box (каналы со входов в норме)" % srv["name"])
+        else:
+            self.d.note("warn", "%s: обычный Sudoku работает, автозапуск не подтверждён" % srv["name"])
         self.d.check_server(srv["id"])
 
     def start_sw_update(self, srv, what):
@@ -1411,7 +1482,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         for line in (out + err).strip().splitlines():
             job.log(line)
         if rc != 0:
-            raise Stop("обновление не прошло — работает прежняя версия (журнал выше)")
+            raise Stop("обновление не прошло (состояние службы и результат возможного отката в журнале выше)")
         job.end("update", note=tag)
 
         job.begin("check")
@@ -1432,7 +1503,8 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
                 job.log(line)
             for e, c in was:
                 self.d.check_channel(e["id"], c["key"])
-            raise Stop("после обновления не заработало: %s — вернул прежнюю версию" % ", ".join(bad))
+            raise Stop("после обновления не заработало: %s. %s" % (
+                ", ".join(bad), "Вернул прежнюю версию" if rc == 0 else "Возврат прежней версии не подтверждён"))
         job.end("check", note="%d из %d" % (len(was), len(was)) if was else "нечего проверять")
         self.sh(srv, "rm -f /root/vpn-sw-update.sh", timeout=30)
         self.d.note("ok", "%s: %s обновлён до %s, каналы в норме" % (srv["name"], "Sudoku" if what == "sudoku" else "Mihomo", tag))
@@ -1608,18 +1680,22 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         return {"id": "_new_" + job.id, "name": p.get("name") or "новый", "host": p["host"],
                 "port": int(p.get("port") or 22), "user": p.get("user") or "root", "_pw": password}
 
-    def sh(self, srv, cmd, timeout=120, stdin=None):
+    def sh(self, srv, cmd, timeout=120, stdin=None, *, retry=False):
         try:
-            return self.d.ssh.run(srv, cmd, stdin=stdin, timeout=timeout)
+            return self.d.ssh.run(srv, cmd, stdin=stdin, timeout=timeout, retry=retry)
         except self.h["CheckError"] as e:
-            raise Stop("%s: %s" % (srv.get("name") or srv["host"], e))
+            raise Stop("%s: %s" % (srv.get("name") or srv["host"], e)) from e
 
     def working_now(self, job, chans):
         """Проверить каналы [(вход, канал)] сейчас и вернуть те, что работают; про остальные — строка в журнал."""
-        was = []
+        was, seen = [], set()
         for e, c in chans:
+            key = (e["id"], c["key"])
+            if key in seen:
+                continue
+            seen.add(key)
             self.d.check_channel(e["id"], c["key"])
-            r = self.d.results.get("%s:%s" % (e["id"], c["key"])) or {}
+            r = self.d.results.get("%s:%s" % key) or {}
             if r.get("status") in ("ok", "warn"):
                 was.append((e, c))
             else:
@@ -1657,15 +1733,22 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
                                     "if [ -n \"$p\" ] && [ ! -f %s/%s.rc ] && kill -0 $p 2>/dev/null; then echo RUNNING; "
                                     "else rm -f %s/%s.rc %s/%s.log %s/%s.pid; echo NEW; fi"
                                % (d, d, d, key, d, key, d, key, d, key, d, key))
+        start_unknown = False
         if "RUNNING" in out0:
             job.log("этот шаг уже идёт на сервере (запущен раньше) — подключаюсь к его журналу")
         else:
             self.put(srv, script.encode("utf-8"), "%s/%s.sh" % (d, key))
             # запуск — строго один раз: под нагрузкой сервер может не ответить вовремя, и повтор команды
             # не должен стартовать вторую копию (проверка по pid-файлу на самом сервере)
-            self.sh(srv, "cd /root; p=$(cat %s/%s.pid 2>/dev/null); if [ -n \"$p\" ] && kill -0 $p 2>/dev/null; then exit 0; fi; "
-                         "nohup setsid bash -c 'echo $$ > %s/%s.pid; bash %s/%s.sh > %s/%s.log 2>&1; echo $? > %s/%s.rc' "
-                         ">/dev/null 2>&1 < /dev/null &" % (d, key, d, key, d, key, d, key, d, key), timeout=300)
+            try:
+                self.sh(srv, "cd /root; p=$(cat %s/%s.pid 2>/dev/null); if [ -n \"$p\" ] && kill -0 $p 2>/dev/null; then exit 0; fi; "
+                             "nohup setsid bash -c 'echo $$ > %s/%s.pid; bash %s/%s.sh > %s/%s.log 2>&1; echo $? > %s/%s.rc' "
+                             ">/dev/null 2>&1 < /dev/null &" % (d, key, d, key, d, key, d, key, d, key), timeout=300)
+            except Stop as e:
+                if not isinstance(e.__cause__, self.h["SSHOutcomeUnknown"]):
+                    raise
+                start_unknown = True
+                job.log("Потерян ответ на запуск шага. Проверяю его журнал и код завершения на сервере.")
         off, t0, buf = 0, time.time(), ""
         lost, dead = None, 0          # с какого момента нет связи; сколько раз подряд процесс шага не найден
         dec = codecs.getincrementaldecoder("utf-8")("replace")   # русские буквы не рвутся между кусками
@@ -1676,7 +1759,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
                                           "[ $((s - x)) -gt 262144 ] && s=$((x + 262144)); echo $s; "
                                           "tail -c +$((x + 1)) $f 2>/dev/null | head -c $((s - x)) | base64 -w0; echo; "
                                           "echo \"$(cat %s/%s.rc 2>/dev/null)\"; kill -0 $(cat %s/%s.pid 2>/dev/null) 2>/dev/null && echo alive"
-                                     % (d, key, off, d, key, d, key), timeout=60)
+                                     % (d, key, off, d, key, d, key), timeout=60, retry=True)
                 if lost:
                     job.log("…связь с сервером снова есть (не было %d с)" % (time.time() - lost))
                 lost = None
@@ -1710,6 +1793,8 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
             if dead >= 3 and not chunk:      # процесса нет и кода завершения нет — сервер перезагрузился или процесс убит
                 if buf:
                     job.log(buf)
+                if start_unknown:
+                    raise Stop("Шаг «%s» мог запуститься на сервере. Запуск и итог не подтверждены." % key)
                 raise Stop("шаг «%s» оборвался на сервере (перезагрузка? нехватка памяти?) — журнал выше. "
                            "Можно нажать «Повторить установку»." % key)
             if time.time() - t0 > timeout:
@@ -1722,7 +1807,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         t0 = time.time()
         while time.time() - t0 < limit:
             try:
-                rc, out, _ = self.d.ssh.run(srv, "cat /proc/uptime", timeout=15)
+                rc, out, _ = self.d.ssh.run(srv, "cat /proc/uptime", timeout=15, retry=True)
                 if rc == 0:
                     job.log("сервер снова на связи через %d с, аптайм %s с" % (time.time() - t0 + 20, out.split()[0]))
                     return
@@ -1732,7 +1817,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         raise Stop("сервер не вернулся после перезагрузки за %d мин" % (limit // 60))
 
     def probe(self, srv, mode, extra="", timeout=120):
-        rc, out, err = self.sh(srv, "python3 -", stdin='MODE = "%s"\n%s\n' % (mode, extra) + self.h["PROBE"], timeout=timeout)
+        rc, out, err = self.sh(srv, "python3 -", stdin='MODE = "%s"\n%s\n' % (mode, extra) + self.h["PROBE"], timeout=timeout, retry=True)
         if rc != 0 or not out.strip():
             raise Stop("%s: проверка не выполнилась (%s)" % (srv.get("name") or srv["host"], (err.strip().splitlines() or ["код %s" % rc])[-1][:200]))
         return json.loads(out)
@@ -1768,12 +1853,12 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         if p.get("reboot") or p.get("only_reboot"):
             job.begin("reboot")
             if not STAND:     # ядро, под которое не собран модуль AmneziaWG, — не перезагружаем в него
-                _, bad, _ = self.sh(srv, AWG_KERNEL_LIST + "awg_bad_kernels")
+                _, bad, _ = self.sh(srv, AWG_KERNEL_LIST + "awg_bad_kernels", retry=True)
                 if bad.split():
                     raise Stop("Не перезагружаю: сервер загрузится в ядро %s, а модуля AmneziaWG под него нет — туннели не "
                                "поднимутся. Поставьте обновления ещё раз (панель уберёт это ядро) или пришлите «диагностику»"
                                % ", ".join(bad.split()))
-            rc, out, _ = self.sh(srv, "test -f /var/run/reboot-required && echo yes || echo no")
+            rc, out, _ = self.sh(srv, "test -f /var/run/reboot-required && echo yes || echo no", retry=True)
             if out.strip() != "yes" and not p.get("only_reboot"):
                 job.skip("reboot", "не требуется")
             elif STAND:
@@ -1809,7 +1894,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         self._reach(job, p)
         job.end("reach")
         job.begin("ssh")
-        rc, out, _ = self.sh(srv, "id -u; hostname", timeout=30)
+        rc, out, _ = self.sh(srv, "id -u; hostname", timeout=30, retry=True)
         lines = out.split()
         if not lines or lines[0] != "0":
             raise Stop("нужен пользователь root (сейчас: uid %s)" % (lines[0] if lines else "?"))
@@ -1859,7 +1944,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
 
         def one(x):
             try:
-                rc, out, _ = self.d.ssh.run(x, cmd, timeout=25)
+                rc, out, _ = self.d.ssh.run(x, cmd, timeout=25, retry=True)
                 tcp = re.search(r"TCP_(\d+)", out)
                 return x, "PING_OK" in out, int(tcp.group(1)) if tcp else None
             except Exception:  # noqa: BLE001
@@ -2025,7 +2110,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
         rc = self.detached(job, srv, "setup", "%s bash /root/vpn-exit-setup.sh\n" % " ".join(env), timeout=3600)
         if rc != 0:
             raise Stop("установка выхода не прошла (код %d) — журнал выше. Повторный запуск пропустит уже сделанное." % rc)
-        rc, out, _ = self.sh(srv, "awg show awg0 listen-port; awg show awg0 public-key; jq -r .local_port /etc/sudoku/config.json 2>/dev/null")
+        rc, out, _ = self.sh(srv, "awg show awg0 listen-port; awg show awg0 public-key; jq -r .local_port /etc/sudoku/config.json 2>/dev/null", retry=True)
         vals = (out.split() + ["", "", ""])[:3]
         job.result.update({"awg_port": vals[0], "awg_pub": vals[1], "sudoku_port": vals[2]})
         job.end("setup")
@@ -2053,7 +2138,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
                 rc, out, _ = self.sh(e, "grep -l 'Endpoint *= *%s:' /etc/amnezia/amneziawg/wg*.conf 2>/dev/null | head -n1 | xargs -r basename | sed 's/.conf$//'; "
                                         "python3 -c \"import yaml;c=yaml.safe_load(open('/etc/mihomo/config.yaml'));"
                                         "print(next((l['port'] for l in c.get('listeners') or [] if l.get('name')=='socks-%s'),''))\""
-                                     % (re.escape(p["host"]), tag.lower()))
+                                     % (re.escape(p["host"]), tag.lower()), retry=True)
                 iface, sport = (out.split() + ["?", "?"])[:2]
                 linked.append({"entry": e["name"], "iface": iface, "socks": sport})
                 job.end(key, note="%s, SOCKS %s" % (iface, sport))
@@ -2120,7 +2205,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
     def _prepare(self, job, srv, comps):
         """Общее начало установки: вход по SSH, обновление с перезагрузкой, оптимизация."""
         job.begin("ssh")
-        rc, out, _ = self.sh(srv, "id -u; . /etc/os-release; echo $PRETTY_NAME", timeout=30)
+        rc, out, _ = self.sh(srv, "id -u; . /etc/os-release; echo $PRETTY_NAME", timeout=30, retry=True)
         if not out.startswith("0"):
             raise Stop("нужен пользователь root")
         job.log("вход выполнен, %s" % out.split("\n", 1)[-1].strip())
@@ -2130,7 +2215,7 @@ print("RM-OK клиент убран из awg0 (копия: %s)" % bak)
             rc = self.detached(job, srv, "upd", UPDATE_SH, timeout=2400)
             if rc != 0:
                 raise Stop("обновление системы не прошло (код %d) — журнал выше" % rc)
-            rc, out, _ = self.sh(srv, "test -f /var/run/reboot-required && echo yes || echo no")
+            rc, out, _ = self.sh(srv, "test -f /var/run/reboot-required && echo yes || echo no", retry=True)
             if out.strip() == "yes":
                 job.log("нужна перезагрузка — перезагружаю")
                 try:

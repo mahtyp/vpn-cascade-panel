@@ -249,7 +249,7 @@ class Zapret:
         dom = clean_hosts(domain)
         if len(dom) != 1:
             raise ValueError("для подсказки — один адрес, например youtube.com")
-        rc, out, err = self.d.ssh.run(e, "python3 -", stdin="DOMAIN = %r\n" % dom[0] + GEOSITE_PY, timeout=90)
+        rc, out, err = self.d.ssh.run(e, "python3 -", stdin="DOMAIN = %r\n" % dom[0] + GEOSITE_PY, timeout=90, retry=True)
         try:
             r = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
@@ -281,7 +281,7 @@ class Zapret:
             self.stopped.add((tid, eid))
         kill = ("p=$(cat %s.pid 2>/dev/null); if [ -n \"$p\" ] && kill -0 $p 2>/dev/null; then kill -TERM -- -$p 2>/dev/null || kill -TERM $p; "
                 "for i in $(seq 1 25); do pgrep -f '[b]lockcheck2.sh' >/dev/null || break; sleep 1; done; fi; " % self.LOG) if stop else ""
-        rc, out, err = self.d.ssh.run(e, kill + "tail -c 4000000 %s.log 2>/dev/null" % self.LOG, timeout=90)
+        rc, out, err = self.d.ssh.run(e, kill + "tail -c 4000000 %s.log 2>/dev/null" % self.LOG, timeout=90, retry=not stop)
         res = parse_blockcheck(out)
         if res is None:
             return None
@@ -322,7 +322,7 @@ class Zapret:
     def probe_hosts(self, eid, hosts):
         e = self.d.cfg.by_id(eid)
         sites_ = [[h, "/"] for h in hosts]
-        rc, out, err = self.d.ssh.run(e, "python3 -", stdin="MODE = \"dpi\"\nSITES = %r\n" % sites_ + self.PROBE, timeout=190)
+        rc, out, err = self.d.ssh.run(e, "python3 -", stdin="MODE = \"dpi\"\nSITES = %r\n" % sites_ + self.PROBE, timeout=190, retry=True)
         if rc != 0 or not out.strip():
             raise RuntimeError((err.strip().splitlines() or ["код %s" % rc])[-1][:200])
         return json.loads(out)["dpi"]

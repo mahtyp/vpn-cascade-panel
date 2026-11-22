@@ -29,9 +29,11 @@ port() { python3 -c "import json; print(json.load(open('$CONF'))['local_port'])"
 listening() { ss -Htln "sport = :$1" 2>/dev/null | grep -q .; }
 wait_port() { for _ in $(seq 1 "${2:-15}"); do listening "$1" && return 0; sleep 1; done; return 1; }
 ver_set() {   # как ver_set установщика: KEY=value, остальное в файле сохраняется
-  local tmp; tmp=$(mktemp)
-  [ -f "$VERS" ] && grep -v "^$1=" "$VERS" > "$tmp" || true
-  echo "$1=$2" >> "$tmp"; mv "$tmp" "$VERS"; chmod 600 "$VERS"
+  local tmp; tmp=$(mktemp "$VERS.XXXXXX") || return 1
+  if { [ ! -f "$VERS" ] || awk -v key="$1" 'index($0, key "=") != 1' "$VERS"; } > "$tmp" \
+      && printf '%s=%s\n' "$1" "$2" >> "$tmp" && mv -f "$tmp" "$VERS"; then return 0; fi
+  rm -f "$tmp"
+  return 1
 }
 latest_tag() {
   local t
@@ -64,13 +66,15 @@ EOF
 back_to_singbox() {
   systemctl stop sudoku >/dev/null 2>&1 || true
   systemctl disable sudoku >/dev/null 2>&1 || true
-  [ -f "$BK/sudoku.bin" ] && cp -p "$BK/sudoku.bin" "$BIN"
-  # юнита sudoku и versions.env до переключения не было — убрать, иначе панель решит, что «Sudoku не работает»
-  [ -f "$BK/no-unit" ] && rm -f "$UNIT"
-  [ -f "$BK/no-versions" ] && rm -f "$VERS"
-  [ -f "$BK/sudoku-sing-box.service" ] && [ ! -f "$SB_UNIT" ] && cp "$BK/sudoku-sing-box.service" "$SB_UNIT"
-  systemctl daemon-reload
-  systemctl enable sudoku-sing-box >/dev/null 2>&1 || true
+  if [ -f "$BK/sudoku.bin" ]; then cp -p "$BK/sudoku.bin" "$BIN" || return 1; fi
+  if [ -f "$BK/no-bin" ]; then rm -f "$BIN" || return 1; fi
+  if [ -f "$BK/sudoku.service" ]; then cp -p "$BK/sudoku.service" "$UNIT" || return 1
+  elif [ -f "$BK/no-unit" ]; then rm -f "$UNIT" || return 1; fi
+  if [ -f "$BK/versions.env" ]; then cp -p "$BK/versions.env" "$VERS" || return 1
+  elif [ -f "$BK/no-versions" ]; then rm -f "$VERS" || return 1; fi
+  if [ ! -f "$SB_UNIT" ]; then cp -p "$BK/sudoku-sing-box.service" "$SB_UNIT" || return 1; fi
+  systemctl daemon-reload || return 1
+  systemctl enable sudoku-sing-box >/dev/null 2>&1 || return 1
   systemctl start sudoku-sing-box
 }
 
@@ -85,12 +89,17 @@ switch)
   case "$(uname -m)" in x86_64|amd64) A=amd64 ;; aarch64|arm64) A=arm64 ;; *) die "архитектура $(uname -m) не поддерживается" ;; esac
 
   say "Копии"
-  mkdir -p "$BK" && chmod 700 "$BK"
-  [ -f "$BK/sudoku-sing-box.service" ] || cp "$SB_UNIT" "$BK/sudoku-sing-box.service" 2>/dev/null || true
-  [ -f "$BIN" ] && cp -p "$BIN" "$BK/sudoku.bin"
-  rm -f "$BK/no-unit" "$BK/no-versions"
-  [ -f "$UNIT" ] || touch "$BK/no-unit"
-  [ -f "$VERS" ] || touch "$BK/no-versions"
+  mkdir -p "$BK" && chmod 700 "$BK" || die "не удалось создать папку с копиями"
+  if [ -f "$SB_UNIT" ]; then
+    cp -p "$SB_UNIT" "$BK/sudoku-sing-box.service" || die "не удалось сохранить юнит sudoku-sing-box"
+  fi
+  rm -f "$BK/no-unit" "$BK/no-versions" "$BK/no-bin" "$BK/sudoku.service" "$BK/versions.env" "$BK/sudoku.bin" || die "не удалось подготовить копии"
+  if [ -f "$BIN" ]; then cp -p "$BIN" "$BK/sudoku.bin" || die "не удалось сохранить sudoku"
+  else touch "$BK/no-bin" || die "не удалось записать отсутствие sudoku"; fi
+  if [ -f "$UNIT" ]; then cp -p "$UNIT" "$BK/sudoku.service" || die "не удалось сохранить юнит"
+  else touch "$BK/no-unit" || die "не удалось записать отсутствие юнита"; fi
+  if [ -f "$VERS" ]; then cp -p "$VERS" "$BK/versions.env" || die "не удалось сохранить versions.env"
+  else touch "$BK/no-versions" || die "не удалось записать отсутствие versions.env"; fi
   cp -p "$CONF" "$BK/config.json"
   [ -d /etc/sing-box ] && cp -rp /etc/sing-box "$BK/" 2>/dev/null
   ok "$BK"
@@ -107,35 +116,33 @@ switch)
   ok "sudoku $T, конфиг проверен"
 
   say "Переключение"
-  cp "$NB" "$BIN.new" && chmod 755 "$BIN.new" && mv -f "$BIN.new" "$BIN"
-  ver_set SUDOKU_VERSION "$T"
-  unit_text > "$UNIT"
-  systemctl daemon-reload
-  systemctl stop sudoku-sing-box
-  for _ in 1 2 3 4 5; do listening "$P" || break; sleep 1; done
-  systemctl start sudoku
-  if wait_port "$P" 15 && systemctl is-active --quiet sudoku; then
+  if cp "$NB" "$BIN.new" && chmod 755 "$BIN.new" && mv -f "$BIN.new" "$BIN" \
+      && ver_set SUDOKU_VERSION "$T" && unit_text > "$UNIT" \
+      && systemctl daemon-reload && systemctl stop sudoku-sing-box \
+      && { for _ in 1 2 3 4 5; do listening "$P" || break; sleep 1; done; } \
+      && systemctl start sudoku && wait_port "$P" 15 && systemctl is-active --quiet sudoku; then
     ok "sudoku слушает TCP $P, sudoku-sing-box остановлен"
   else
     journalctl -u sudoku -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
-    back_to_singbox
-    wait_port "$P" 15 && die "sudoku не поднялся — вернул sudoku-sing-box, всё как было" \
-                      || die "sudoku не поднялся, и sudoku-sing-box после возврата не слушает порт — проверьте вручную"
+    if back_to_singbox && wait_port "$P" 15 && systemctl is-active --quiet sudoku-sing-box; then
+      die "sudoku не поднялся — вернул sudoku-sing-box"
+    fi
+    die "sudoku не поднялся, возврат sudoku-sing-box не подтверждён"
   fi
   ;;
 rollback)
   say "Возврат к sudoku-sing-box"
-  back_to_singbox
-  P=$(port)
-  wait_port "$P" 15 && ok "sudoku-sing-box снова слушает TCP $P" || die "sudoku-sing-box не слушает TCP $P — проверьте вручную"
+  P=$(port); [ -n "$P" ] || die "в $CONF нет local_port"
+  back_to_singbox && wait_port "$P" 15 && systemctl is-active --quiet sudoku-sing-box \
+    && ok "sudoku-sing-box снова слушает TCP $P" || die "возврат sudoku-sing-box не подтверждён"
   ;;
 finish)
   say "Автозапуск"
-  systemctl enable sudoku >/dev/null 2>&1 && ok "sudoku включён в автозапуск"
-  systemctl disable sudoku-sing-box >/dev/null 2>&1 || true
+  systemctl enable sudoku >/dev/null 2>&1 || die "не удалось включить sudoku в автозапуск"
+  ok "sudoku включён в автозапуск"
+  systemctl disable sudoku-sing-box >/dev/null 2>&1 || die "не удалось убрать sudoku-sing-box из автозапуска"
   # без юнита sing-box установщик (sudoku-dash, --upgrade) тоже считает режим прямым; копия юнита — в $BK
-  [ -f "$SB_UNIT" ] && rm -f "$SB_UNIT"
-  systemctl daemon-reload
+  rm -f "$SB_UNIT" && systemctl daemon-reload || die "не удалось обновить юниты Sudoku"
   ok "sudoku-sing-box убран из автозапуска (программа и /etc/sing-box остались, копия юнита — $BK)"
   ;;
 *)

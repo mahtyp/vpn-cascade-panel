@@ -27,18 +27,26 @@ def ensure_xray(ver, home):
     if os.path.exists(path):
         return path
     a = asset()
-    get = lambda u, t: urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "vpn-dash"}), timeout=t).read()
+    def get(u, t):
+        req = urllib.request.Request(u, headers={"User-Agent": "vpn-dash"})
+        try:
+            with urllib.request.urlopen(req, timeout=t) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            e.close()
+            raise
     z = get(REL % (ver, a), 180)
     dg = get(REL % (ver, a + ".dgst"), 30).decode("utf-8", "replace")
     want = next((l.split("=", 1)[1].strip().lower() for l in dg.splitlines() if l.startswith("SHA2-256=")), "")
     if not want or hashlib.sha256(z).hexdigest() != want:
         raise RuntimeError("Xray %s с GitHub не прошёл проверку суммы" % ver)
     os.makedirs(d, exist_ok=True)
-    tmp = path + ".part"
-    with zipfile.ZipFile(io.BytesIO(z)) as zf, open(tmp, "wb") as f:
-        f.write(zf.read(exe))
-    os.chmod(tmp, 0o755)
-    os.replace(tmp, path)
+    with tempfile.TemporaryDirectory(dir=d) as stage:
+        tmp = os.path.join(stage, exe)
+        with zipfile.ZipFile(io.BytesIO(z)) as zf, zf.open(exe) as src, open(tmp, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)
     return path
 
 
@@ -67,6 +75,7 @@ def fetch(hp, url, timeout, ctx=None):
     path = "/" + url.split("/", 3)[3] if url.count("/") >= 3 else "/"
     deadline = time.time() + timeout
     s = socket.create_connection(("127.0.0.1", hp), timeout)
+    t = None
     try:
         s.sendall(("CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n" % (host, host)).encode())
         head = b""
@@ -93,6 +102,8 @@ def fetch(hp, url, timeout, ctx=None):
             raise OSError("страница ответила: " + st.split(b"\r\n", 1)[0].decode("latin-1")[:60])
         return rest.decode("utf-8", "replace")
     finally:
+        if t is not None:
+            t.close()
         s.close()
 
 

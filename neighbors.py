@@ -188,7 +188,8 @@ def _doh_a(url, name):
         q = b"".join(bytes([len(p)]) + p.encode("idna") for p in name.rstrip(".").split(".")) + b"\0"
         rq = urllib.request.Request(url, data=struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0) + q + struct.pack(">HH", 1, 1),
                                     headers={"Content-Type": "application/dns-message", "Accept": "application/dns-message"})
-        b = urllib.request.urlopen(rq, timeout=6).read()
+        with urllib.request.urlopen(rq, timeout=6) as response:
+            b = response.read()
 
         def skip(i):
             while b[i]:
@@ -213,6 +214,9 @@ def _doh_a(url, name):
                 ips.append(socket.inet_ntoa(b[i:i + 4]))
             i += ln
         return ips
+    except urllib.error.HTTPError as e:
+        e.close()
+        return None
     except Exception:  # noqa: BLE001
         return None
 

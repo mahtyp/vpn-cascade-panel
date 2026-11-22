@@ -480,7 +480,8 @@ class Analyst:
                 with opener_open(req, timeout=180) as r:
                     return json.loads(r.read().decode())
             except urllib.error.HTTPError as e:
-                txt = e.read().decode("utf-8", "replace")
+                with e:
+                    txt = e.read().decode("utf-8", "replace")
                 try:
                     msg = json.loads(txt).get("error", {}).get("message") or txt
                 except ValueError:
